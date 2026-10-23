@@ -1,0 +1,34 @@
+{
+  "schemaVersion": 1,
+  "stream": "events",
+  "observedAt": "2026-10-23T20:30:01Z",
+  "source": { "hostId": "t-demo-0", "bootEpoch": "boot-1", "sequenceSpaceId": null },
+  "rows": [
+    { "seq": "3", "rigId": "demo-rig", "nodeId": "n-1", "type": "ticket.closed", "createdAt": "2026-10-23T20:29:40Z" }
+  ],
+  "page": {
+    "requestedAfter": "2",
+    "requestedBefore": null,
+    "lastScanned": "3",
+    "through": "3",
+    "retainedHighWatermark": "3",
+    "hasMore": false,
+    "nextCursor": null,
+    "restartCursor": null,
+    "fetched": 1,
+    "scanned": 1,
+    "filtered": 0,
+    "withheld": 0,
+    "returned": 1,
+    "capReason": null
+  },
+  "coverage": {
+    "status": "retained_window",
+    "historyCompleteness": "unknown",
+    "retainedMinimum": "1",
+    "gaps": [],
+    "gapCount": 0,
+    "gapDetailsTruncated": false,
+    "eventPayloads": "not_read"
+  }
+}

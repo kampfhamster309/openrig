@@ -4,6 +4,7 @@
 #   rig-dispatch start   <ticket> --repo <url> --brief-file <file> [options]
 #   rig-dispatch status  [<ticket>] [--json]
 #   rig-dispatch wait    <ticket> [--timeout <seconds>] [--stall <minutes>]
+#   rig-dispatch archive <ticket> [--dir <root>]
 #   rig-dispatch collect <ticket> [--archive <dir>] [--into <local git repo>]
 #   rig-dispatch answer  <ticket> <qitem> <decision text>
 #   rig-dispatch delete  <ticket>
@@ -15,6 +16,8 @@
 # Environment: KUBECONFIG, KUBECTL (default kubectl), RIG_DISPATCH_NAMESPACE (default openrig),
 # RIG_DISPATCH_IMAGE (default: the image pinned in ../kustomization.yaml), RIG_DISPATCH_HUB_POD
 # (default hub-0; the hub to register teams with. No Ready hub pod there: registration is skipped).
+# Archive: RIG_DISPATCH_ARCHIVE_DIR (default ./tickets, --dir wins), RIG_DISPATCH_QUEUE_LIMIT
+# (default 100000 rows of queue history), RIG_DISPATCH_MAX_PAGES (default 200 pages per paged read).
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -30,7 +33,7 @@ k() { "$KUBECTL" -n "$NS" "$@"; }
 need() { command -v "$1" >/dev/null || die "$1 is required"; }
 need jq; need "$KUBECTL"
 
-usage() { sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
+usage() { sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
 
 # PROJ-123 -> proj-123: a DNS label that is also a valid OpenRig host id (no dots).
 slug_of() {
@@ -510,6 +513,289 @@ cmd_wait() {
   done
 }
 
+# --- archive ---------------------------------------------------------------------------------
+#
+# A team's whole history lives on its own pod volume and is deleted with the pod, so `archive`
+# copies out everything that explains the ticket while the pod is still there. Every part is saved
+# on its own and named in manifest.json with its row count or its error: one unreadable part costs
+# that part, never the archive. Nothing here is swallowed the way `|| true` swallowed a failed
+# usage read -- a part that could not be read is written down as not read.
+#
+# The reads are the daemon's own, over loopback inside the pod: `rig` for the CLI-backed streams,
+# and the same loopback with the pod's own bearer for the audit rows, which have no CLI verb.
+
+ARCHIVE_ROOT_DEFAULT=./tickets
+QUEUE_LIMIT="${RIG_DISPATCH_QUEUE_LIMIT:-100000}"
+MAX_PAGES="${RIG_DISPATCH_MAX_PAGES:-100000}"   # an opt-in ceiling, not a normal failure: termination comes from the cursor contract
+AUDIT_PAGE=200     # the audit browse clamps anything larger to 200 anyway
+TELEMETRY_PAGE=128 # the telemetry v1 contract caps a page at 128 source rows
+
+PARTS='[]'
+SCRATCH=""
+PART_ERR=""
+
+part_ok() { # part_ok <name> <rows> [note]
+  PARTS=$(jq -c --arg n "$1" --argjson r "${2:-null}" --arg note "${3:-}" \
+    '. + [{name: $n, ok: true, rows: $r} + (if $note == "" then {} else {note: $note} end)]' <<<"$PARTS")
+}
+
+part_failed() { # part_failed <name> <error>
+  PARTS=$(jq -c --arg n "$1" --arg e "$2" \
+    '. + [{name: $n, ok: false, rows: null, error: $e}]' <<<"$PARTS")
+}
+
+# Row count whatever shape a payload came in as: a list is its length, an object carrying rows or
+# items is the length of those, and any other single document counts as one row.
+rows_of() {
+  jq -r 'if type == "array" then length
+         elif type == "object" then
+           (if (((.rows? // .items?) // null) | type) == "array" then ((.rows // .items) | length) else 1 end)
+         else 0 end' "$1"
+}
+
+# save_part <name> <dest> <producer> [args...] -- run the producer, keep its stdout only when it is
+# JSON. A failed command or junk output fails the part and leaves no file behind, so the archive
+# never holds a part that looks saved and is not. The failure is recorded in PARTS rather than
+# returned, because one unreadable part must not abort the run: everything else is still saved.
+save_part() {
+  local name=$1 dest=$2 producer=$3; shift 3
+  local out e
+  PART_ERR=""
+  out=$(mktemp "$SCRATCH/part.XXXXXX")
+  if ! "$producer" "$@" >"$out" 2>"$SCRATCH/part-err"; then
+    e=${PART_ERR:-$(head -c 300 "$SCRATCH/part-err" | tr '\n\r' '  ')}
+    part_failed "$name" "${e:-the command exited non-zero with no message}"; rm -f "$out"; return 0
+  fi
+  if ! jq -e . "$out" >/dev/null 2>&1; then
+    part_failed "$name" "output is not JSON: $(head -c 200 "$out" | tr '\n\r' '  ')"; rm -f "$out"; return 0
+  fi
+  mv "$out" "$dest"
+  part_ok "$name" "$(rows_of "$dest")"
+}
+
+# Coverage status across pages, worst seen wins: a later complete page must not hide an earlier
+# partial one, because report reads this field to decide whether the history may be short.
+worst_coverage() { # worst_coverage <current> <new>
+  local rank_a rank_b
+  case "$1" in retained_window) rank_a=0 ;; partial) rank_a=1 ;; *) rank_a=2 ;; esac
+  case "$2" in retained_window) rank_b=0 ;; partial) rank_b=1 ;; *) rank_b=2 ;; esac
+  if [ "$rank_b" -gt "$rank_a" ]; then printf '%s' "$2"; else printf '%s' "$1"; fi
+}
+
+# One telemetry stream, paged to the end. `rig telemetry` reads a single page and prints the cursor
+# rather than following it, so following it here is the only way past 128 source rows. `--start
+# retained` is what makes the first page begin at the retained floor: without it the stream opens at
+# the high watermark and reads no history at all. A cursor that stops advancing is recorded as
+# stalled rather than passed off as the whole history; the page budget sits on top of that as an
+# opt-in limit and names itself when it is what ran out.
+read_telemetry() { # read_telemetry <slug> <events|transitions>
+  local slug=$1 stream=$2 cursor="" pages=0 stalled=false overbudget=false
+  local status="retained_window" last="" next scanned rows_total=0 gapcount=0 watermark="" w
+  : > "$SCRATCH/rows.jsonl"; : > "$SCRATCH/gaps.jsonl"
+  while :; do
+    local -a args=(--limit "$TELEMETRY_PAGE" --json)
+    if [ -n "$cursor" ]; then args+=(--cursor "$cursor"); else args+=(--start retained); fi
+    if ! inpod "$slug" rig telemetry "$stream" "${args[@]}" >"$SCRATCH/page" 2>"$SCRATCH/page-err"; then
+      PART_ERR=$(head -c 300 "$SCRATCH/page-err" | tr '\n\r' '  '); return 1
+    fi
+    if ! jq -e . "$SCRATCH/page" >/dev/null 2>&1; then
+      PART_ERR="page $((pages + 1)) is not JSON: $(head -c 200 "$SCRATCH/page" | tr '\n\r' '  ')"; return 1
+    fi
+    jq -c '.rows[]?' "$SCRATCH/page" >> "$SCRATCH/rows.jsonl"
+    jq -c '.coverage.gaps[]?' "$SCRATCH/page" >> "$SCRATCH/gaps.jsonl"
+    rows_total=$((rows_total + $(jq -c '(.rows // []) | length' "$SCRATCH/page")))
+    # gapCount is the true count; coverage.gaps carries at most 32 detail rows per page.
+    gapcount=$((gapcount + $(jq -r '.coverage.gapCount // 0' "$SCRATCH/page")))
+    status=$(worst_coverage "$status" "$(jq -r '.coverage.status // "unknown"' "$SCRATCH/page")")
+    # R3: `through` is fixed when the window opens and is the last row this read can include, so it is
+    # what the archive actually holds. `retainedHighWatermark` is recomputed per page and can sit past
+    # the last row read when the team writes during a multi-page read.
+    w=$(jq -r '.page.through // ""' "$SCRATCH/page")
+    if [ -n "$w" ]; then watermark=$w; fi
+    pages=$((pages + 1))
+    [ "$(jq -r '.page.hasMore' "$SCRATCH/page")" = true ] || break
+    scanned=$(jq -r '.page.lastScanned // ""' "$SCRATCH/page")
+    next=$(jq -r '.page.nextCursor // ""' "$SCRATCH/page")
+    if [ -z "$next" ] || [ "$next" = "$cursor" ] || [ "$scanned" = "$last" ]; then stalled=true; break; fi
+    cursor=$next; last=$scanned
+    [ "$pages" -lt "$MAX_PAGES" ] || { overbudget=true; break; }
+  done
+  # A stream that would be saved short is not worth saving: a reader cannot tell a truncated history
+  # from a quiet ticket. Fail the part, and name the knob when the knob is what stopped the read.
+  if [ "$overbudget" = true ]; then
+    PART_ERR="the page budget RIG_DISPATCH_MAX_PAGES=$MAX_PAGES ran out after $rows_total $stream rows with more retained; raise it to archive a long ticket"
+    return 1
+  fi
+  if [ "$stalled" = true ]; then
+    PART_ERR="the $stream cursor stopped after $pages page(s) with more retained rows, so the history would be incomplete"
+    return 1
+  fi
+  jq -n --arg stream "$stream" --argjson pages "$pages" --arg status "$status" \
+    --argjson stalled "$stalled" --arg watermark "$watermark" --argjson gapCount "$gapcount" \
+    --slurpfile rows "$SCRATCH/rows.jsonl" --slurpfile gaps "$SCRATCH/gaps.jsonl" \
+    '{stream: $stream, pages: $pages, coverageStatus: $status, stalled: $stalled,
+      through: (if $watermark == "" then null else $watermark end),
+      gapCount: $gapCount, rows: $rows, gaps: $gaps}'
+}
+
+# The mission-control audit rows have no CLI verb, so this is the daemon's own HTTP read over
+# loopback with the bearer the entrypoint left for the CLI -- the same token, the same host check.
+# `before_id` walks the rows backwards, 200 at a time. These rows are the only place a relayed human
+# answer names the host it came from (auditNotes.openrig_relay.from_host), so they are archived whole.
+read_audit() { # read_audit <slug> <qitem>
+  local slug=$1 qitem=$2 before="" pages=0 stalled=false overbudget=false next rows_total=0
+  : > "$SCRATCH/audit-rows.jsonl"
+  while :; do
+    if ! inpod "$slug" sh -c '
+        tok=$(cat "${OPENRIG_HOME:-$HOME/.openrig}/terminal-token" 2>/dev/null)
+        url="http://127.0.0.1:${OPENRIG_PORT:-7433}/api/mission-control/audit?qitem_id=$1&limit=$2"
+        if [ -n "$3" ]; then url="$url&before_id=$3"; fi
+        curl -fsS -H "Authorization: Bearer $tok" "$url"
+      ' sh "$qitem" "$AUDIT_PAGE" "$before" >"$SCRATCH/page" 2>"$SCRATCH/page-err"; then
+      PART_ERR=$(head -c 300 "$SCRATCH/page-err" | tr '\n\r' '  ')
+      [ -n "$PART_ERR" ] || PART_ERR="the audit read failed"
+      return 1
+    fi
+    if ! jq -e . "$SCRATCH/page" >/dev/null 2>&1; then
+      PART_ERR="audit page $((pages + 1)) is not JSON: $(head -c 200 "$SCRATCH/page" | tr '\n\r' '  ')"; return 1
+    fi
+    jq -c '.rows[]?' "$SCRATCH/page" >> "$SCRATCH/audit-rows.jsonl"
+    rows_total=$((rows_total + $(jq -c '(.rows // []) | length' "$SCRATCH/page")))
+    pages=$((pages + 1))
+    [ "$(jq -r '.hasMore' "$SCRATCH/page")" = true ] || break
+    next=$(jq -r '.nextBeforeId // ""' "$SCRATCH/page")
+    if [ -z "$next" ] || [ "$next" = "$before" ]; then stalled=true; break; fi
+    before=$next
+    [ "$pages" -lt "$MAX_PAGES" ] || { overbudget=true; break; }
+  done
+  if [ "$overbudget" = true ]; then
+    PART_ERR="the page budget RIG_DISPATCH_MAX_PAGES=$MAX_PAGES ran out after $rows_total audit rows for $qitem with more retained; raise it to archive a long ticket"
+    return 1
+  fi
+  if [ "$stalled" = true ]; then
+    PART_ERR="the audit cursor for $qitem stopped after $pages page(s) with more rows, so the rows would be incomplete"
+    return 1
+  fi
+  jq -n --arg q "$qitem" --argjson pages "$pages" --argjson stalled "$stalled" \
+    --slurpfile rows "$SCRATCH/audit-rows.jsonl" \
+    '{qitemId: $q, pages: $pages, stalled: $stalled, rows: $rows}'
+}
+
+# Every queue row in the pod, with no 500-row ceiling: the daemon route passes the limit through and
+# the CLI takes any positive integer, so the ceiling was always the dispatcher's own. Nothing is
+# filtered by tag, because a team pod holds ONE ticket's database - which the events and transitions
+# streams already assume - and a review or a human question the team opened itself carries no
+# dispatcher tag, so filtering here would drop exactly the rounds and decisions report is asked for.
+# The dispatcher's own item is named by the StatefulSet's `qitem` annotation, not by a filter.
+ticket_queue() {
+  local slug=$1
+  inpod "$slug" rig queue list -a -A -o json --full --limit "$QUEUE_LIMIT"
+}
+
+# The high watermark a saved telemetry envelope recorded, or empty when the part is not there.
+watermark_of() { if [ -f "$1" ]; then jq -r '.through // ""' "$1" 2>/dev/null || true; fi; }
+
+cmd_archive() {
+  local ticket="" dir=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --dir) dir=$2; shift 2 ;;
+      -*) die "unknown option $1" ;;
+      *) [ -z "$ticket" ] || die "one ticket at a time"; ticket=$1; shift ;;
+    esac
+  done
+  [ -n "$ticket" ] || usage
+  local slug p rig root out old key qitem seat raw complete incarnation watermarks
+  slug=$(slug_of "$ticket")
+  p=$(probe "$slug")
+  jq -e '.ready' >/dev/null <<<"$p" || die "$ticket: the team pod is not Ready, so there is nothing to archive"
+  root=${dir:-${RIG_DISPATCH_ARCHIVE_DIR:-$ARCHIVE_ROOT_DEFAULT}}
+  key=$(jq -r '.ticket // empty' <<<"$p")
+  rig=$(jq -r '.rig // empty' <<<"$p")
+  mkdir -p "$root" || die "cannot create the archive root $root"
+  out="$root/$slug"
+  TMP=$(mktemp -d "$root/.${slug}.partial.XXXXXX") || die "cannot make a temporary directory in $root"
+  trap '[ -n "${TMP:-}" ] && rm -rf "$TMP" || true' EXIT
+  SCRATCH="$TMP/.scratch"; mkdir -p "$SCRATCH"
+  PARTS='[]'
+
+  save_part status "$TMP/status.json" printf '%s\n' "$p"
+  save_part queue "$TMP/queue.json" ticket_queue "$slug"
+  if [ -n "$rig" ]; then
+    save_part nodes "$TMP/nodes.json" inpod "$slug" rig ps --nodes --rig "$rig" --json
+  else
+    part_failed nodes "the StatefulSet has no rig annotation, so the seats cannot be listed"
+  fi
+
+  for seat in $(jq -r '.seats[].session // empty' <<<"$p"); do
+    save_part "usage:$seat" "$TMP/usage-$seat.json" inpod "$slug" rig usage series --seat "$seat" --json
+  done
+  save_part usage-top "$TMP/usage-top.json" inpod "$slug" rig usage top --json
+
+  save_part events "$TMP/events.json" read_telemetry "$slug" events
+  save_part transitions "$TMP/queue-transitions.json" read_telemetry "$slug" transitions
+
+  # One part per queue item: one item whose audit rows will not read costs that item's rows, not the
+  # whole audit, and the manifest then names exactly which item it was.
+  if [ -f "$TMP/queue.json" ]; then
+    for qitem in $(jq -r '.[].qitemId // empty' "$TMP/queue.json"); do
+      save_part "audit:$qitem" "$TMP/audit-$qitem.json" read_audit "$slug" "$qitem"
+    done
+  else
+    part_failed audit "the queue part failed, so the ticket's queue items are unknown and no audit rows could be asked for"
+  fi
+
+  # The raw result.json, not only what the status probe read out of it. Absent is a state of the
+  # ticket, not a failure of the archive, so it is a note rather than an error.
+  if raw=$(inpod "$slug" sh -c "cat $RESULT 2>/dev/null || true"); then
+    if [ -n "$raw" ]; then
+      printf '%s\n' "$raw" > "$TMP/result.json"
+      if jq -e . "$TMP/result.json" >/dev/null 2>&1; then part_ok result 1
+      else part_ok result 1 "the pod's result.json is not valid JSON"; fi
+    else
+      part_ok result 0 "the pod has written no result.json yet"
+    fi
+  else
+    part_failed result "could not read $RESULT from the pod"
+  fi
+
+  rm -rf "$SCRATCH"
+  complete=$(jq -r 'if any(.[]; .ok | not) then "false" else "true" end' <<<"$PARTS")
+  # Two facts the delete guard needs later: WHICH pod this archive describes (a re-dispatched ticket
+  # reuses the slug) and how far the two streams had reached when it was read (a team that kept
+  # working after this run has history this archive does not hold).
+  incarnation=$(jq -r '.created // empty' <<<"$p")
+  watermarks=$(jq -n --arg ev "$(watermark_of "$TMP/events.json")" --arg tr "$(watermark_of "$TMP/queue-transitions.json")" \
+    '{events: (if $ev == "" then null else $ev end), transitions: (if $tr == "" then null else $tr end)}')
+  jq -n --arg slug "$slug" --arg ticket "$key" --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    --arg dir "$out" --argjson parts "$PARTS" --argjson complete "$complete" \
+    --arg inc "${incarnation:-}" --argjson wm "$watermarks" \
+    '{slug: $slug, ticket: $ticket, archivedAt: $at, dir: $dir, complete: $complete,
+      incarnation: (if $inc == "" then null else $inc end), watermarks: $wm, parts: $parts}' \
+    > "$TMP/manifest.json" || die "could not write manifest.json in $TMP"
+
+  # Swap the finished directory in. Two renames, so there is a moment with no $out, but a crash in
+  # that moment leaves the complete previous archive at .<slug>.old: never half-old and half-new,
+  # and never destroyed. A re-run replaces the whole directory, so nothing stale survives it.
+  if [ -d "$out" ]; then
+    old="$root/.${slug}.old.$$"
+    mv "$out" "$old" || die "could not move the previous archive aside; nothing was changed"
+    if ! mv "$TMP" "$out"; then
+      mv "$old" "$out" || log "WARNING: the new archive did not land and the old one would not go back; it is at $old"
+      die "could not move the new archive into $out; the previous archive is unchanged"
+    fi
+    rm -rf "$old"
+  else
+    mv "$TMP" "$out" || die "could not put the archive at $out"
+  fi
+  TMP=""
+
+  jq -r '.parts[] | select(.ok) | "  saved \(.name): \(.rows // 0) rows"' "$out/manifest.json" >&2
+  jq -r '.parts[] | select(.ok | not) | "  FAILED \(.name): \(.error)"' "$out/manifest.json" >&2
+  log "archived $ticket in $out"
+  [ "$complete" = true ] || return 1
+}
+
 # --- collect / answer / delete ---------------------------------------------------------------
 
 cmd_collect() {
@@ -590,6 +876,7 @@ case "$cmd" in
   start) cmd_start "$@" ;;
   status|ls) cmd_status "$@" ;;
   wait) cmd_wait "$@" ;;
+  archive) cmd_archive "$@" ;;
   collect) cmd_collect "$@" ;;
   answer) cmd_answer "$@" ;;
   delete|rm) cmd_delete "$@" ;;

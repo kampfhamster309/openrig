@@ -1,0 +1,121 @@
+#!/usr/bin/env bash
+# fake-kubectl: stands in for a cluster so `rig-dispatch archive` can be tested without one.
+#
+# It serves the recorded responses in ./fixtures and appends every call it receives to $FAKE_CALLS,
+# so a test can assert what the archive actually asked for -- which page of a paged read it requested,
+# what limit it used -- and not only what it wrote to disk. Where the real daemon would refuse a
+# request, the fake refuses it too: a telemetry read that asks for neither a cursor nor
+# `--start retained` would read no history at all, so it is recorded as a failure here.
+#
+# Knobs a test sets: FAKE_FIXTURES, FAKE_CALLS, FAKE_POD_READY, FAKE_FAIL_USAGE_TOP,
+# FAKE_STALL_EVENTS, FAKE_NO_RESULT.
+set -u
+
+: "${FAKE_FIXTURES:?fake-kubectl needs FAKE_FIXTURES}"
+: "${FAKE_CALLS:?fake-kubectl needs FAKE_CALLS}"
+printf '%s\n' "$*" >> "$FAKE_CALLS"
+
+fix() { cat "$FAKE_FIXTURES/$1"; }
+nope() { echo "fake kubectl: no recorded response for [$*]" >&2; exit 1; }
+
+# One telemetry stream. The first page must be opened with `--start retained`; after that the
+# archive follows the cursor. FAKE_STALL_EVENTS hands out page 1 forever, which is the shape of a
+# cursor that stops advancing.
+telemetry() {
+  local stream=$1 cursor="" started=""
+  shift
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --cursor) cursor=${2:-} ;;
+      --start) started=${2:-} ;;
+    esac
+    shift
+  done
+  if [ -z "$cursor" ] && [ "$started" != retained ]; then
+    nope "telemetry $stream opened without --start retained: that reads no history"
+  fi
+  case "$stream:$cursor" in
+    events:) fix events-page1.json ;;
+    events:CURSOR-E1)
+      if [ "${FAKE_STALL_EVENTS:-0}" = 1 ]; then fix events-page1.json; else fix events-page2.json; fi ;;
+    transitions:) fix transitions-page1.json ;;
+    transitions:CURSOR-T1) fix transitions-page2.json ;;
+    *) nope "telemetry $stream cursor $cursor" ;;
+  esac
+}
+
+# A `kubectl exec ... -- sh -c <script> [name] [args...]`. Two shapes reach it: the raw result.json
+# read, and the mission-control audit read, which passes the qitem, the page size and the before_id.
+pod_sh() {
+  [ "${2:-}" = "-c" ] || nope "sh without -c"
+  local script=$3
+  case "$script" in
+    *mission-control/audit*)
+      local qitem=${5:-} before=${7:-}
+      case "$qitem:$before" in
+        qitem-a:) fix audit-qitem-a-p1.json ;;
+        qitem-a:act-2) fix audit-qitem-a-p2.json ;;
+        qitem-b:|qitem-unrelated:|qitem-review-untagged:|qitem-recovery-1f2e3d4c:)
+          fix audit-empty.json ;;
+        *) nope "audit rows for $qitem before $before" ;;
+      esac ;;
+    *result.json*)
+      # `cat ... 2>/dev/null; true` prints nothing when the file is absent, and still exits 0.
+      [ "${FAKE_NO_RESULT:-0}" = 1 ] || fix result.json ;;
+    *) nope "pod shell: $script" ;;
+  esac
+}
+
+serve() {
+  case "${1:-}" in
+    rig)
+      case "${2:-} ${3:-}" in
+        "ps --nodes") fix nodes.json ;;
+        "queue list") fix queue.json ;;
+        "usage series") fix usage-series.json ;;
+        "usage top")
+          if [ "${FAKE_FAIL_USAGE_TOP:-0}" = 1 ]; then
+            echo "rig usage top: the daemon answered 503 usage_unavailable" >&2
+            exit 1
+          fi
+          fix usage-top.json ;;
+        "telemetry events") shift 3; telemetry events "$@" ;;
+        "telemetry transitions") shift 3; telemetry transitions "$@" ;;
+        *) nope "rig $*" ;;
+      esac ;;
+    sh) pod_sh "$@" ;;
+    *) nope "$*" ;;
+  esac
+}
+
+ns=""
+declare -a rest=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -n) ns=${2:-}; shift 2 ;;
+    *) rest+=("$1"); shift ;;
+  esac
+done
+[ -n "$ns" ] || nope "a call with no -n namespace; the dispatcher always passes one"
+
+case "${rest[0]:-}" in
+  get)
+    case "${rest[1]:-}" in
+      statefulset|statefulsets)
+        if [ "${#rest[@]}" -gt 2 ] && [ "${rest[2]}" != "t-demo" ]; then nope "statefulset ${rest[2]}"; fi
+        fix statefulset.json ;;
+      pod)
+        if [ "${FAKE_POD_READY:-1}" = 1 ]; then fix pod-ready.json; else fix pod-not-ready.json; fi ;;
+      *) nope "get $*" ;;
+    esac ;;
+  exec)
+    declare -a cmd=()
+    seen=0
+    for a in "${rest[@]}"; do
+      [ "$seen" = 1 ] && cmd+=("$a")
+      [ "$a" = "--" ] && seen=1
+    done
+    [ "${#cmd[@]}" -gt 0 ] || nope "exec with no command"
+    serve "${cmd[@]}" ;;
+  *) nope "$*" ;;
+esac

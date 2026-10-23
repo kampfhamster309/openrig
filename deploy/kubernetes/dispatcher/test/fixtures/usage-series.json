@@ -1,0 +1,6 @@
+{
+  "rows": [
+    { "capturedAt": "2026-10-23T20:05:00Z", "seatSession": "orch-lead@demo-rig", "lane": "context", "inputTokens": 1200, "outputTokens": 300 },
+    { "capturedAt": "2026-10-23T20:15:00Z", "seatSession": "orch-lead@demo-rig", "lane": "context", "inputTokens": 1400, "outputTokens": 250 }
+  ]
+}

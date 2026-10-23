@@ -1,0 +1,8 @@
+{
+  "windowHours": 1,
+  "totalRankedSeats": 2,
+  "seats": [
+    { "seatSession": "orch-lead@demo-rig", "totalTokens": 2150 },
+    { "seatSession": "dev-build@demo-rig", "totalTokens": 900 }
+  ]
+}
