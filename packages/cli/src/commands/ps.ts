@@ -3,7 +3,7 @@ import stringWidth from "string-width";
 import { resolveEffectiveHost } from "../host-selection.js";
 import { sessionRigOf } from "../session-name.js";
 import { DaemonClient, remoteDaemonClient } from "../client.js";
-import { getDaemonStatus, getDaemonUrl, resolveOriginSelfHostId, type LifecycleDeps , daemonStatusGuard} from "../daemon-lifecycle.js";
+import { getDaemonStatus, getDaemonUrl, resolveOriginSelfHostId, resolveLocalDaemonUrl, type LifecycleDeps , daemonStatusGuard} from "../daemon-lifecycle.js";
 import { realDeps } from "./daemon.js";
 import type { StatusDeps } from "./status.js";
 import { loadHostRegistry, resolveHost, hostDisplayTarget, resolveRemoteBearer, classifyHttpFailedStep, classifyHttpError, type HttpHostEntry } from "../host-registry.js";
@@ -11,6 +11,8 @@ import { runCrossHostCommand, type RunCrossHostCommandOpts } from "../cross-host
 import { emitCrossHostError, emitCrossHostFailure } from "../cross-host-cli-helpers.js";
 import { readOpenRigEnv } from "../openrig-compat.js";
 import type { AggregatedPayload, PerHostStatus } from "../lib/hosts/fanout-contract.js";
+import { fleetSummaryReaderTimeoutMs, FLEET_HOST_TIMEOUT_MS_DEFAULT, FLEET_FANOUT_CONCURRENCY_DEFAULT } from "@openrig/daemon/fleet";
+import { ConfigStore } from "../config-store.js";
 
 interface PsEntry {
   rigId: string;
@@ -1552,6 +1554,195 @@ interface FanOutHostResult {
   error?: string;
 }
 
+// ---------------------------------------------------------------------------
+// The daemon-side fleet summary, as `rig ps --all-hosts` consumes it.
+//
+// Declared locally (the same way this file already carries its own
+// `fanout-contract` types) rather than imported from the daemon: an OLDER daemon
+// that does not serve the route must be a normal miss that falls back, not a
+// type-level coupling. Only the fields this command projects are named.
+// ---------------------------------------------------------------------------
+
+interface FleetSummarySeat {
+  hostId: string;
+  rigId: string;
+  rigName: string;
+  logicalId: string | null;
+  canonicalSessionName: string | null;
+  nodeKind: string | null;
+  sessionStatus: string | null;
+  role: string | null;
+  runtime: string | null;
+  activity: string | null;
+  needsInputReason: string | null;
+  lastActivityAt: string | null;
+  lifecycleState: string | null;
+  startupStatus: string | null;
+}
+
+interface FleetSummaryRig {
+  rigId: string;
+  rigName: string;
+  hostId: string;
+  seatCount: number;
+  attentionCount: number;
+  seatsWithAssignedWork: number;
+  lifecycleState: string | null;
+  /** The origin's own running/status pair, carried so the fleet path can report
+   *  exactly what the CLI-side fan-out reports. */
+  runningCount: number | null;
+  psStatus: string | null;
+  seats: FleetSummarySeat[];
+  progress: {
+    lastQueueTransitionAt: string | null;
+    lastSeatOutputAt: string | null;
+    minutesSinceProgress: number | null;
+    stalled: boolean | null;
+    openWorkCount: number;
+  };
+}
+
+interface FleetSummaryHost {
+  hostId: string;
+  kind: string;
+  reachable: boolean;
+  rigCount: number;
+  seatCount: number;
+  attentionCount: number;
+  openQueueCount: number;
+  progress: {
+    lastQueueTransitionAt: string | null;
+    lastSeatOutputAt: string | null;
+    minutesSinceProgress: number | null;
+    stalled: boolean | null;
+    openWorkCount: number;
+  };
+  rigs: FleetSummaryRig[];
+}
+
+interface FleetSummaryPayload {
+  items: FleetSummaryHost[];
+  hosts: PerHostStatus[];
+  stallThresholdMinutes?: number;
+  enabledProgressSources?: string[];
+}
+
+/** The per-host status the daemon already composed, mapped onto the CLI's own
+ *  result shape so every downstream projection (filters, --fields, --summary,
+ *  the text renderer) is UNCHANGED by where the data came from. */
+function fleetResultsFromSummary(
+  payload: FleetSummaryPayload,
+  wantNodes: boolean,
+): FanOutHostResult[] {
+  const byHost = new Map(payload.items.map((h) => [h.hostId, h]));
+  return payload.hosts.map((status): FanOutHostResult => {
+    const host = byHost.get(status.hostId);
+    if (!host) {
+      const failedStep = status.status === "unsupported-transport"
+        ? "unsupported-transport" as const
+        : status.status === "auth-failed" ? "permission-gate" as const : "remote-daemon-unreachable" as const;
+      return { host: status.hostId, ok: false, failedStep, ...(status.error ? { error: status.error } : {}) };
+    }
+    const data = wantNodes
+      ? host.rigs.flatMap((rig) => rig.seats.map((seat) => ({
+          rigId: rig.rigId,
+          rigName: rig.rigName,
+          logicalId: seat.logicalId,
+          canonicalSessionName: seat.canonicalSessionName,
+          // Carried, never invented. `nodeKind` is what separates an agent seat from
+          // an infrastructure one, and `sessionStatus` is the field `--filter status=`
+          // reads — a different vocabulary from `lifecycleState`, so substituting one
+          // for the other makes the filter silently read the wrong column.
+          nodeKind: seat.nodeKind,
+          runtime: seat.runtime,
+          sessionStatus: seat.sessionStatus,
+          startupStatus: seat.startupStatus,
+          hostId: host.hostId,
+          // The fleet read's own additions, carried so the fleet stall signal is
+          // visible at the seat level too.
+          activity: seat.activity,
+          needsInputReason: seat.needsInputReason,
+          lastActivityAt: seat.lastActivityAt,
+        })))
+      : host.rigs.map((rig) => ({
+          rigId: rig.rigId,
+          name: rig.rigName,
+          rigName: rig.rigName,
+          nodeCount: rig.seatCount,
+          // The origin's own running/status pair, VERBATIM. Deriving these from a seat
+          // count made a rig with declared-but-stopped seats read as fully running and
+          // made `partial` unreachable — the old path reported all three faithfully, and
+          // a reader must not be able to tell which path produced the row.
+          runningCount: rig.runningCount,
+          hasWorkCount: rig.seatsWithAssignedWork,
+          attentionCount: rig.attentionCount,
+          status: rig.psStatus,
+          lifecycleState: rig.lifecycleState,
+          hostId: host.hostId,
+          // The stall verdict rides the rig row: this is the signal that did not
+          // exist before, so a reader must not have to fetch it separately.
+          stalled: rig.progress.stalled,
+          minutesSinceProgress: rig.progress.minutesSinceProgress,
+          lastQueueTransitionAt: rig.progress.lastQueueTransitionAt,
+          lastSeatOutputAt: rig.progress.lastSeatOutputAt,
+          openWorkCount: rig.progress.openWorkCount,
+        }));
+    return { host: host.hostId, ok: true, failedStep: "none", data };
+  });
+}
+
+/** One opportunistic read of the daemon-side fleet summary. ANY failure — no
+ *  daemon, an older daemon that 404s the route, a malformed body, a timeout —
+ *  returns null and the caller uses today's CLI-side fan-out. The fallback is the
+ *  contract for an old local daemon, not an error.
+ *
+ *  The timeout is the shared rule, not the client default. The route answers only
+ *  after EVERY host leg finishes, so a reader on the 5 s default would abandon a
+ *  healthy fan-out whenever one host is slow or the concurrency cap queues legs up —
+ *  and then pay for a SECOND fan-out in the fallback. That is the exact cost this
+ *  read exists to remove, so the reader must outlast the work it is waiting for. */
+/** The operator's own fan-out budget, read from the SAME settings file the daemon
+ *  reads. F7 made `fleet.host_timeout_ms` and `fleet.fanout_concurrency` operator
+ *  settings, and the route applies them — so a reader that still assumes the compiled
+ *  defaults is wrong under exactly the configuration this change introduced. Five hosts
+ *  at a 15 s budget is two waves, about 30 s of fan-out; a reader computing its wait
+ *  from a 5 s default gives up at 20 s and pays for a second fan-out in its fallback.
+ *
+ *  A missing or unreadable store is not an error: the defaults are what the daemon would
+ *  have used anyway. */
+function fleetReaderBudget(): { hostTimeoutMs: number; concurrency: number } {
+  try {
+    const store = new ConfigStore();
+    const hostTimeoutMs = store.get("fleet.host_timeout_ms");
+    const concurrency = store.get("fleet.fanout_concurrency");
+    return {
+      hostTimeoutMs: typeof hostTimeoutMs === "number" && hostTimeoutMs > 0 ? hostTimeoutMs : FLEET_HOST_TIMEOUT_MS_DEFAULT,
+      concurrency: typeof concurrency === "number" && concurrency > 0 ? concurrency : FLEET_FANOUT_CONCURRENCY_DEFAULT,
+    };
+  } catch {
+    return { hostTimeoutMs: FLEET_HOST_TIMEOUT_MS_DEFAULT, concurrency: FLEET_FANOUT_CONCURRENCY_DEFAULT };
+  }
+}
+
+async function tryFleetSummary(
+  deps: PsDeps,
+  hostCount: number,
+  budget = fleetReaderBudget(),
+): Promise<FleetSummaryPayload | null> {
+  try {
+    const client = deps.clientFactory(resolveLocalDaemonUrl());
+    const res = await client.get<FleetSummaryPayload>("/api/fleet/summary", {
+      timeoutMs: fleetSummaryReaderTimeoutMs(hostCount, budget.hostTimeoutMs, budget.concurrency),
+    });
+    if (res.status < 200 || res.status >= 300) return null;
+    const payload = res.data as FleetSummaryPayload | undefined;
+    if (!payload || !Array.isArray(payload.items) || !Array.isArray(payload.hosts)) return null;
+    return payload;
+  } catch {
+    return null;
+  }
+}
+
 /** OPR.0.4.4.21 FR-5 — adapter to the intra-P4 shared contract
  *  (fanout-contract.ts, slice 15 first-lander at 0ecd329b; the closed
  *  status enum is THE contract, failedStep rides as additive detail). */
@@ -1600,6 +1791,37 @@ async function runFanOutPs(
   // A4: resolve the origin triple ONCE (it is THIS host's id, identical for every fan-out leg), then
   // stamp it on each remote client — fail-open to 2-part when the local selfHostId is unavailable.
   const originSelfHostId = await resolveOriginSelfHostId(deps.lifecycleDeps);
+
+  // ONE fan-out serves every reader: when the LOCAL daemon answers the fleet
+  // summary, use it instead of dialing every host from here. That read has a
+  // per-host deadline, bounded concurrency and a short cache, so N readers cost
+  // one fan-out instead of N — and a slow team is no longer reported unreachable
+  // because a shared deadline ran out. An older local daemon 404s the route and
+  // the CLI-side fan-out below runs unchanged; that fallback is the contract.
+  // The hub's fan-out covers the registered hosts AND its own local leg, so the wave
+  // count must count both. Leaving the local host out under-waits by exactly one wave,
+  // which is the gap this read exists to close.
+  const summary = await tryFleetSummary(deps, targetIds.length + 1);
+  if (summary) {
+    const wanted = new Set(targetIds);
+    // F8: the hub's registry and this CLI's are different files. If the hub did not
+    // answer for a host I explicitly targeted, projecting its answer alone would drop
+    // that host from BOTH items and hosts — the silently thinner fleet this read is
+    // supposed to prevent. So an untargeted-by-the-hub host sends us to the fan-out,
+    // which dials it itself and reports honestly if it is down.
+    const answered = new Set(summary.hosts.map((h) => h.hostId));
+    const missing = targetIds.filter((id) => !answered.has(id));
+    if (missing.length === 0) {
+      const scoped: FleetSummaryPayload = {
+        ...summary,
+        items: summary.items.filter((h) => wanted.has(h.hostId)),
+        hosts: summary.hosts.filter((h) => wanted.has(h.hostId)),
+      };
+      renderFanOutResults(fleetResultsFromSummary(scoped, !!opts.nodes), opts, shaping, "fleet-summary");
+      return;
+    }
+  }
+
   const results: FanOutHostResult[] = await Promise.all(
     targetIds.map(async (id): Promise<FanOutHostResult> => {
       const host = allHosts.find((h) => h.id === id);
@@ -1651,6 +1873,20 @@ async function runFanOutPs(
     }),
   );
 
+  renderFanOutResults(results, opts, shaping, "cli-fanout");
+}
+
+/** The ONE renderer for a completed fan-out, whether the rows came from the
+ *  daemon-side fleet summary or from this command dialing every host itself. A
+ *  reader must not be able to tell which path produced the output except through
+ *  the data itself — same filters, same --fields, same --summary, same exit code,
+ *  same `{items, hosts}` contract. */
+function renderFanOutResults(
+  results: FanOutHostResult[],
+  opts: PsCliOptions,
+  shaping: { parsedFilter: ParsedFilter | null; limit: number | null; fields: string[] | null },
+  _source: "fleet-summary" | "cli-fanout",
+): void {
   const hasFailure = results.some((r) => !r.ok);
 
   if (opts.json) {

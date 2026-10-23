@@ -99,6 +99,13 @@ Keys:
                            without a human registry, explicit-only posts everything, as always does)
   retention.*            enabled, transitions_days, watchdog_days,
                          watchdog_keep_per_job, batch_size
+  fleet.stall_threshold_minutes
+                         minutes a team may hold open work with no queue progress before the hub
+                         calls it stalled (default 30; a seat posting a note keeps its row live)
+  fleet.host_timeout_ms  per-host deadline for one fan-out leg; a host that misses it is reported
+                         failed on its own, never as the whole fleet (default 5000)
+  fleet.fanout_concurrency how many hosts the hub dials at once; raise it for a large fleet, lower
+                         it when the hub's own machine is the bottleneck (default 4)
   launch.non_interruptive  accept harness first-launch warnings at full bypass for new rigs (default off)
   terminal.status_bar    show the inner tmux status bar on launch (default off)
   output.compact         short default output for queue writes; --full restores the whole row (default off)

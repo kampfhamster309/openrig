@@ -110,7 +110,15 @@ describe("config routes (User Settings v0)", () => {
     // + 1 launch.non_interruptive (new-rig launch default; default off).
     // + 1 queue.wake_human_rung (#811; default "always").
     // + 1 output.compact (slice 15 compact command-output switch; default off).
-    expect(Object.keys(body.settings).length).toBe(74);
+    // + 1 fleet.stall_threshold_minutes (the fleet read's stall threshold).
+    // + 1 fleet.host_timeout_ms (the fleet read's per-host deadline).
+    // + 1 fleet.fanout_concurrency (how many hosts the hub dials at once).
+    expect(Object.keys(body.settings).length).toBe(77);
+    // Named as well as counted: a bare tally would pass for a key that exists but has
+    // no default, which is the exact shape that makes a key unwritable.
+    expect(body.settings["fleet.stall_threshold_minutes"]).toMatchObject({ value: 30, source: "default" });
+    expect(body.settings["fleet.host_timeout_ms"]).toMatchObject({ value: 5000, source: "default" });
+    expect(body.settings["fleet.fanout_concurrency"]).toMatchObject({ value: 4, source: "default" });
     expect(body.settings["launch.non_interruptive"]).toMatchObject({ value: false, source: "default" });
     expect(body.settings["runtime.readiness_timeout_seconds"]).toMatchObject({ value: 30, source: "default" });
     expect(body.settings["ui.enabled"]).toMatchObject({ value: false, source: "default" });

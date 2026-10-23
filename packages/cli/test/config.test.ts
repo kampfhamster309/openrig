@@ -112,6 +112,47 @@ describe("ConfigStore", () => {
     expect(raw.daemon.port).toBe(7434);
   });
 
+  // Test 5b
+  // The live proof caught this: a settings key added to VALID_KEYS, ENV_MAP, KEY_TO_PATH
+  // and KEY_CONSTRAINTS but NOT to the defaults table is unwritable. coerceValue decides
+  // number-vs-string from the DEFAULT, so with no default the raw "3" stays a string, the
+  // positive-integer constraint rejects it for not being a number, and `rig config set
+  // fleet.stall_threshold_minutes 3` fails on a perfectly valid integer. The four maps
+  // passing is exactly what makes this easy to miss; the round-trip is the test.
+  it("fleet.host_timeout_ms and fleet.fanout_concurrency round-trip as integers", () => {
+    // Same trap as the stall threshold: a key present in VALID_KEYS/ENV_MAP/KEY_TO_PATH
+    // but missing from the defaults is UNWRITABLE, because coercion decides
+    // number-vs-string from the default. These two are the fan-out's own budget, so an
+    // operator who cannot set them cannot widen a deadline that is too tight for their
+    // network — and would see a live team reported as unreachable.
+    const configPath = join(tmpDir, "fleet-budget-config.json");
+    const store = new ConfigStore(configPath);
+    expect(store.get("fleet.host_timeout_ms")).toBe(5000);
+    expect(store.get("fleet.fanout_concurrency")).toBe(4);
+    store.set("fleet.host_timeout_ms", "12000");
+    store.set("fleet.fanout_concurrency", "8");
+    expect(store.get("fleet.host_timeout_ms")).toBe(12000);
+    expect(store.get("fleet.fanout_concurrency")).toBe(8);
+    const raw = JSON.parse(readFileSync(configPath, "utf-8"));
+    expect(raw.fleet.hostTimeoutMs).toBe(12000);
+    expect(raw.fleet.fanoutConcurrency).toBe(8);
+    expect(() => store.set("fleet.host_timeout_ms", "0")).toThrow(/positive integer/i);
+    expect(() => store.set("fleet.fanout_concurrency", "0")).toThrow(/positive integer/i);
+  });
+
+  it("fleet.stall_threshold_minutes is settable as an integer and reads back as a number", () => {
+    const configPath = join(tmpDir, "fleet-stall-config.json");
+    const store = new ConfigStore(configPath);
+    expect(store.get("fleet.stall_threshold_minutes")).toBe(30); // the documented default
+    store.set("fleet.stall_threshold_minutes", "3");
+    expect(store.get("fleet.stall_threshold_minutes")).toBe(3);
+    const raw = JSON.parse(readFileSync(configPath, "utf-8"));
+    expect(raw.fleet.stallThresholdMinutes).toBe(3);
+    // And it is still a positive integer, not a stringified one.
+    expect(() => store.set("fleet.stall_threshold_minutes", "0")).toThrow(/positive integer/i);
+    expect(() => store.set("fleet.stall_threshold_minutes", "ten")).toThrow();
+  });
+
   // Test 6
   it("set() with invalid key throws listing valid keys", () => {
     const store = new ConfigStore(join(tmpDir, "config.json"));

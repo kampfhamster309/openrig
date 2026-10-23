@@ -190,6 +190,14 @@ export interface RiggedConfig {
     wakeSwapGraceSeconds: number;
     wakeHumanRung: string;
   };
+  // The hub-side fleet read: how long a team may hold open work with no progress
+  // before the hub calls it stalled, plus the fan-out's own transport budget
+  // (twins of the daemon settings-store defaults).
+  fleet: {
+    stallThresholdMinutes: number;
+    hostTimeoutMs: number;
+    fanoutConcurrency: number;
+  };
 }
 
 const DEFAULT_WORKSPACE_ROOT = getDefaultOpenRigPath("workspace");
@@ -341,6 +349,11 @@ const DEFAULTS = {
     wakeSwapGraceSeconds: 180,
     wakeHumanRung: "always",
   },
+  fleet: {
+    stallThresholdMinutes: 30,
+    hostTimeoutMs: 5000,
+    fanoutConcurrency: 4,
+  },
 } as const;
 
 export const VALID_KEYS = [
@@ -458,6 +471,11 @@ export const VALID_KEYS = [
   // Under explicit-only, an ask that needs a person must be addressed to the person;
   // without a human registry, explicit-only posts everything, as always does.
   "queue.wake_human_rung",
+  // The fleet read: how long a team may have open work and no progress before the
+  // hub calls it stalled. Lockstep with the daemon settings-store twin.
+  "fleet.stall_threshold_minutes",
+  "fleet.host_timeout_ms",
+  "fleet.fanout_concurrency",
 ] as const;
 
 export type ValidKey = typeof VALID_KEYS[number];
@@ -547,6 +565,9 @@ export const ENV_MAP: Record<ValidKey, { primary: string; legacy?: string }> = {
   "queue.wake_retry_cap": { primary: "OPENRIG_QUEUE_WAKE_RETRY_CAP" },
   "queue.wake_unconfirmed_window_minutes": { primary: "OPENRIG_QUEUE_WAKE_UNCONFIRMED_WINDOW_MINUTES" },
   "queue.wake_swap_grace_seconds": { primary: "OPENRIG_QUEUE_WAKE_SWAP_GRACE_SECONDS" },
+  "fleet.stall_threshold_minutes": { primary: "OPENRIG_FLEET_STALL_THRESHOLD_MINUTES" },
+  "fleet.host_timeout_ms": { primary: "OPENRIG_FLEET_HOST_TIMEOUT_MS" },
+  "fleet.fanout_concurrency": { primary: "OPENRIG_FLEET_FANOUT_CONCURRENCY" },
   "queue.wake_human_rung": { primary: "OPENRIG_QUEUE_WAKE_HUMAN_RUNG" },
 };
 
@@ -626,6 +647,9 @@ const KEY_TO_PATH: Record<ValidKey, string[]> = {
   "queue.wake_retry_cap": ["queue", "wakeRetryCap"],
   "queue.wake_unconfirmed_window_minutes": ["queue", "wakeUnconfirmedWindowMinutes"],
   "queue.wake_swap_grace_seconds": ["queue", "wakeSwapGraceSeconds"],
+  "fleet.stall_threshold_minutes": ["fleet", "stallThresholdMinutes"],
+  "fleet.host_timeout_ms": ["fleet", "hostTimeoutMs"],
+  "fleet.fanout_concurrency": ["fleet", "fanoutConcurrency"],
   "queue.wake_human_rung": ["queue", "wakeHumanRung"],
 };
 
@@ -937,6 +961,9 @@ const KEY_CONSTRAINTS: Partial<Record<ValidKey, (raw: string, coerced: string | 
   "queue.wake_retry_cap": positiveIntegerConstraint("queue.wake_retry_cap"),
   "queue.wake_unconfirmed_window_minutes": positiveIntegerConstraint("queue.wake_unconfirmed_window_minutes"),
   "queue.wake_swap_grace_seconds": positiveIntegerConstraint("queue.wake_swap_grace_seconds"),
+  "fleet.stall_threshold_minutes": positiveIntegerConstraint("fleet.stall_threshold_minutes"),
+  "fleet.host_timeout_ms": positiveIntegerConstraint("fleet.host_timeout_ms"),
+  "fleet.fanout_concurrency": positiveIntegerConstraint("fleet.fanout_concurrency"),
   "queue.wake_human_rung": wakeHumanRungConstraint,
 };
 
@@ -1162,6 +1189,11 @@ export class ConfigStore {
         wakeUnconfirmedWindowMinutes: v("queue.wake_unconfirmed_window_minutes") as number,
         wakeSwapGraceSeconds: v("queue.wake_swap_grace_seconds") as number,
         wakeHumanRung: v("queue.wake_human_rung") as string,
+      },
+      fleet: {
+        stallThresholdMinutes: v("fleet.stall_threshold_minutes") as number,
+        hostTimeoutMs: v("fleet.host_timeout_ms") as number,
+        fanoutConcurrency: v("fleet.fanout_concurrency") as number,
       },
     };
   }

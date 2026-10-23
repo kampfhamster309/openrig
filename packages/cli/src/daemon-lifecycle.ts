@@ -1,5 +1,5 @@
 import path from "node:path";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import type { ChildProcess } from "node:child_process";
 import { connectionErrorCode, formatDaemonHostForUrl } from "./client.js";
 import { blockedConnectionGuidance, isBlockedConnectionCode } from "./daemon-reachability.js";
@@ -422,6 +422,37 @@ function resolveConfiguredDaemonTarget(): { host: string; port: number } {
       port: DEFAULT_PORT,
     };
   }
+}
+
+/** The LOCAL daemon's base URL, resolved from configuration only — NO health
+ *  probe. `getDaemonStatus` deliberately settles/retries for up to ~5s so a
+ *  restarting daemon is not called down; a caller that wants to make ONE
+ *  opportunistic read and fall straight back on any failure must not pay that.
+ *  `OPENRIG_URL` wins, exactly as the status probe honours it.
+ *
+ *  Exported for `rig ps --all-hosts`, which tries the daemon-side fleet summary
+ *  first and uses its own per-host fan-out when the daemon does not serve it. */
+export function resolveLocalDaemonUrl(): string {
+  const openrigUrl = readOpenRigEnv("OPENRIG_URL", "RIGGED_URL");
+  if (openrigUrl) return openrigUrl.replace(/\/$/, "");
+  // The RUNNING daemon's own recorded address wins. A daemon started with `--port`
+  // (or any flag that overrides the configured port) records the address it actually
+  // bound, and config.json still says the default — resolving from config alone made
+  // the CLI talk to a port nothing was listening on, and the fleet read silently fell
+  // back to the per-host fan-out. This is the same source every other daemon-dependent
+  // verb uses; deliberately no health probe here, so a stopped daemon fails open fast.
+  for (const file of [STATE_FILE, LEGACY_STATE_FILE]) {
+    try {
+      const state = JSON.parse(readFileSync(file, "utf8")) as Partial<DaemonState>;
+      if (typeof state.port === "number" && state.port > 0) {
+        return `http://${formatDaemonHostForUrl(state.host ?? DEFAULT_HOST)}:${state.port}`;
+      }
+    } catch {
+      // No state file (or an unreadable one) — the daemon is not running from here.
+    }
+  }
+  const configured = resolveConfiguredDaemonTarget();
+  return `http://${formatDaemonHostForUrl(configured.host)}:${configured.port}`;
 }
 
 /**

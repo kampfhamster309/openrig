@@ -103,6 +103,7 @@ import { workflowRoutes } from "./routes/workflow.js";
 import { missionControlRoutes } from "./routes/mission-control.js";
 import { slicesRoutes } from "./routes/slices.js";
 import { reviewRoutes } from "./routes/review.js";
+import { fleetRoutes } from "./routes/fleet.js";
 import { rigModeRoutes } from "./routes/rig-mode.js";
 import { missionsRoutes } from "./routes/missions.js";
 import { rigCmuxRoutes } from "./routes/rig-cmux.js";
@@ -545,6 +546,11 @@ export function createApp(deps: AppDeps): Hono {
     c.set("rigExpansionService" as never, deps.rigExpansionService);
     c.set("rigLifecycleService" as never, deps.rigLifecycleService);
     c.set("psProjectionService" as never, deps.psProjectionService);
+    // The fleet summary read carries the stuck sweep's heartbeat for the LOCAL
+    // host, the same additive snapshot /healthz publishes. Absent = a daemon
+    // built without the sweep, which the payload reports as null, never as a
+    // clean sweep.
+    c.set("stuckSweepStatus" as never, deps.stuckSweepStatus);
     c.set("upRouter" as never, deps.upRouter);
     c.set("teardownOrchestrator" as never, deps.teardownOrchestrator);
     c.set("podInstantiator" as never, deps.podInstantiator);
@@ -803,6 +809,10 @@ export function createApp(deps: AppDeps): Hono {
   app.route("/api/slices", slicesRoutes());
   // Living Notes Packet 2 (OPR.0.4.4.20) — composed-review read contract.
   app.route("/api/review", reviewRoutes());
+  // The ONE fleet read: per-host reachability, rigs, seats, open queue items in
+  // every open state, and the progress/stall verdict. Composed only from routes
+  // an older remote daemon already serves.
+  app.route("/api/fleet", fleetRoutes());
   // OPR.0.4.6.02 C3 — the canonical non-rig-scoped terminal composer + the
   // rig-scoped thin alias (composes view=rig:<rigId>, delegates to the same
   // TerminalService; arch R1 / guard b1).
