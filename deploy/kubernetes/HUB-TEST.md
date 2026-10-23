@@ -5,8 +5,8 @@ rigs, whose `hosts.yaml` lists every team pod, so one point of truth shows every
 [`hub/`](hub/), wired into [`dispatcher/rig-dispatch`](dispatcher/rig-dispatch), network rules in
 [`manifests/networkpolicy-hub.yaml`](manifests/networkpolicy-hub.yaml).
 
-This file records what was **observed**, not what the design expects. Each row says yes, partly or
-no, with the command and the output that decided it. Two of the proposal's expectations did not
+This file records what was **observed**, not what the design expects. Each row says yes or no, with
+the command and the output that decided it. Two of the proposal's expectations did not
 hold; they are recorded as no with the reason.
 
 ## Environment
@@ -55,9 +55,9 @@ with `curl` exit 7 means the connection never completed, i.e. refused or dropped
 | `start` registers the team after its pod is Ready | yes, after two fixes | `[rig-dispatch] registered t-hubtest-a with the hub at http://t-hubtest-a-0.teams.openrig.svc:7433`; `hosts.yaml` then carries `id: t-hubtest-a`, `transport: http`, `bearer_file: …/t-hubtest-a.bearer`, `notes: ticket HUBTEST-A, rig claude-pi-k8s` |
 | Bearer file mode 0600, absolute path | yes | `ls -l` in `hub-0`: `-rw------- 1 openrig openrig 64 … t-hubtest-a.bearer`. It is written on stdin, so the bearer never appears in a command line |
 | `feed.subscriptions.t-<slug>.enabled true` | yes | `config.json`: `{"feed":{"subscriptions":{"t-hubtest-a":{"enabled":true}, …}}}` |
-| `delete` unregisters | yes | `[rig-dispatch] unregistered t-hubtest-a from the hub`, then after both deletes: `hosts.yaml` = `hosts: []`, `hosts.d/` empty, `config.json` = `{"feed":{"subscriptions":{}}}` |
+| `delete` unregisters | yes | `[rig-dispatch] unregistered t-hubtest-a from the hub`, then after both deletes: `hosts.yaml` = `hosts: []`, `hosts.d/` empty, `config.json` = `{"feed":{"subscriptions":{}}}`, and `host-bindings.json` = `{"version":1,"bindings":{}}` |
 | Idempotent | yes | A second `start` logged `hub already has host t-hubtest-a` and changed nothing; a second `delete HUBTEST-A` on a gone ticket succeeded; the remove mode prints `absent` and exits 0 |
-| Without a hub the dispatcher works as before | yes | Before the hub existed the same `start` logged `no Ready hub pod hub-0; hubtest-a is not registered with any hub` and still created the pod, brought the rig up and handed over the ticket |
+| Without a hub the dispatcher works as before | yes | Before the hub existed the same `start` logged `no Ready hub pod hub-0; hubtest-a is not registered with any hub` (wording since widened into the M1 warning) and still created the pod, brought the rig up and handed over the ticket |
 | No restart needed to pick up a host | yes | `rig host list` in the hub showed both teams `reachable` with no daemon restart; `hosts.yaml` and `config.json` are re-read per request |
 
 Two deviations from the brief, both improvements found on the way:
@@ -83,13 +83,13 @@ moment. Two rows came out **no**.
 
 | Proposal expected | Obs. | Evidence |
 |---|---|---|
-| NEEDS YOU across all teams, each item labelled with its team's host id (`/api/review/fleet`) | **partly** — the daemon read yes, the TUI no | `GET /api/review/fleet` on the hub returned `{"hostId":"t-hubtest-b","summary":"HUBTEST-B: should HUBTEST-B.md become NOTES.md or HUBTEST-NOTES.md?","leg":"park-on-human","qitemId":"qitem-…7ed2c7733cf4eaa0"}` while team A showed none. In the TUI at 13:23:56, with a live `t-hubtest-a` needs-you item already in the same fleet read, FEED ▸ Human requests said `No current items in the available source window`. Three reasons, all TUI-side: PULSE's ▲ NEEDS YOU is built by `pulse/pulse-model.ts:needsRows()` from `client.queueAttention()` — the **hub's own** queue, empty on a daemon that runs no rigs; the fleet read lands in `snap.needs`, which `render.ts:256` uses only filtered to `item.target === session`, i.e. inside a seat's drill-in, and a remote host has no seats in the tree to drill into; and `render.ts:needsLine()`, the only code that formats the `[hostId]` label, is defined and **never called** |
-| Every team as a host in the topology, reachable or not, and down hosts in the hosts-down list | **partly** — the reads yes, the TUI no | The aggregate reads are right: `/api/review/fleet` and `/api/queue/attention-aggregate` both returned `local`, `t-hubtest-a`, `t-hubtest-b` with `status: ok`. The TUI tree showed `hub-0` only. `tui/src/hydrate.ts` still builds remote hosts with `rigs: []`, and `snap.hostsDown` — populated at `hydrate.ts:715` from any host whose status is not `ok` — is never read by `render.ts` |
+| NEEDS YOU across all teams, each item labelled with its team's host id (`/api/review/fleet`) | **no** in the TUI; the daemon read is yes | The daemon read was right twice. At 13:17 `GET /api/review/fleet` returned `{"hostId":"t-hubtest-b","summary":"HUBTEST-B: should HUBTEST-B.md become NOTES.md or HUBTEST-NOTES.md?","leg":"park-on-human","qitemId":"qitem-…7ed2c7733cf4eaa0"}` — team B's parked item, team A had none then. After that one was answered, a second needs-you item was parked on **team A** at 13:23:24 purely to test the TUI, and the fleet read returned it as `hostId: t-hubtest-a`. At 13:23:56, with that item live, the TUI's FEED ▸ Human requests said `No current items in the available source window`. Three reasons, all TUI-side: PULSE's ▲ NEEDS YOU is built by `pulse/pulse-model.ts:needsRows()` from `client.queueAttention()` — the **hub's own** queue, empty on a daemon that runs no rigs; the fleet read lands in `snap.needs`, which `render.ts:256` uses only filtered to `item.target === session`, i.e. inside a seat's drill-in, and a remote host has no seats in the tree to drill into; and `render.ts:needsLine()`, the only code that formats the `[hostId]` label, is defined and **never called** |
+| Every team as a host in the topology, reachable or not, and down hosts in the hosts-down list | **no** in the TUI; the aggregate reads are yes | The aggregate reads are right: `/api/review/fleet` and `/api/queue/attention-aggregate` both returned `local`, `t-hubtest-a`, `t-hubtest-b` with `status: ok`. The TUI tree showed `hub-0` only. `tui/src/hydrate.ts` still builds remote hosts with `rigs: []`, and `snap.hostsDown` — populated at `hydrate.ts:715` from any host whose status is not `ok` — is never read by `render.ts` |
 | From a shell in the hub, `rig ps --all-hosts --nodes -A` for every seat of every team | yes | In `hub-0`, the command returned `[host=t-hubtest-a]` and `[host=t-hubtest-b]` blocks with all three seats each: `orch.lead running idle`, `dev.build running idle`, `review.r1 running idle` |
 | `rig capture\|send <seat>@<rig>@t-<slug>` for any seat | yes | In `hub-0`: `rig capture review-r1@claude-pi-k8s@t-hubtest-b --lines 6` → `[via host=t-hubtest-b (http://t-hubtest-b-0.teams.openrig.svc:7433)]` followed by the rendered pane |
 | It does **not** show the teams' rigs and seats in the TUI tree, their blocked and in-progress items, or usage | yes, confirmed absent | Same cause as the two rows above. The blocked item was visible in `/api/queue/attention-aggregate` (`{"hostId":"t-hubtest-b","state":"blocked"}`) and in `rig ps`, never in the TUI |
 
-The two **partly** rows are the proposal's own stage 3.1 and 3.2 (remote rigs in the TUI through the
+The two **no** rows are the proposal's own stage 3.1 and 3.2 (remote rigs in the TUI through the
 read-through, cross-host queue state in the TUI). The daemon side of stage 2 is enough; the TUI side
 is not there yet, and the operator's one point of truth today is `rig ps` and the fan-out routes in a
 shell inside `hub-0`, not the TUI tree. Fixing the first row needs no new daemon work: the fleet read
@@ -121,6 +121,39 @@ already returns the items and their `hostId`, so 3.2 is a TUI change to feed ▲
    `</dev/null`, and re-reading `hosts.yaml` after the add.
 3. `rig-dispatch answer` failed with `--actor is required`; it now names the ticket's lead session.
 
+## Round 2: the review fixes, verified
+
+The review found no blocking issue; two medium and two low findings were about failure paths and
+wording. M2, M1, L1, L2 and D3 are code, D1, D2 and D4 are docs. All are fixed.
+
+- **M2** — `hub_register` now runs after the queue handover, so a Ready-but-failing hub can no longer
+  strand a team with a running rig and no ticket. The log order shows it: `handed HUBTEST-C to
+  orch-lead@claude-pi-k8s as qitem-…045161190b8e72c8` is printed **before** `registered t-hubtest-c
+  with the hub at http://t-hubtest-c-0.teams.openrig.svc:7433`. The failure is still `die`, so `start`
+  still exits non-zero.
+- **M1** — both not-Ready paths now log a warning naming what was left behind. Register: `no hosts.yaml
+  entry, no bearer file /home/openrig/.openrig/hosts.d/t-<slug>.bearer, no
+  feed.subscriptions.t-<slug>.enabled`, plus `re-run start <ticket>`. Unregister: names the host and
+  gives the three hand commands. No `hub-sync` was built; it is listed under Next.
+- **L1** — the rewrite goes through `writeAtomic` (tmp file + `renameSync`, mode 0600) for both
+  `hosts.yaml` and `host-bindings.json`. After a full register/delete cycle `ls -A ~/.openrig/` shows
+  no leftover `*.tmp-*`. The concurrent `start`/`delete` lost-update is documented in the README and
+  under Not tested; it is not fixed here.
+- **L2** — `unregistered $host from the hub` is logged only when all three steps succeeded, otherwise
+  `WARNING: $host is only partly unregistered; check hosts.yaml, … by hand`. A failed subscription set
+  is now a `die`, like a failed add.
+- **D3** — `hub_registry remove` also drops the alias from `host-bindings.json`, matching on the key
+  or on `bindings[*].hostId`, and tolerates the file being absent or unreadable.
+
+Verified with one tiny ticket, `HUBTEST-C`, end to end on the cluster:
+
+| Step | Observed |
+|---|---|
+| `start` hands over **and** registers | `handed HUBTEST-C to orch-lead@claude-pi-k8s as qitem-…045161190b8e72c8`, then `registered t-hubtest-c with the hub at http://t-hubtest-c-0.teams.openrig.svc:7433`; `hosts.yaml` gained the entry, `hosts.d/t-hubtest-c.bearer` was `-rw-------`, `config.json` had `"t-hubtest-c": {"enabled": true}`, and `/api/queue/attention-aggregate` returned `local` + `t-hubtest-c`, both `ok` |
+| the identity binding is learned | `rig host doctor t-hubtest-c` → `✓ host-identity-binding: learned host identity 't-hubtest-c' (first contact)`, and `host-bindings.json` then held `bindings["t-hubtest-c"]` |
+| `delete` forgets all four | `hosts.yaml` → `hosts: []`; `hosts.d/` empty; `config.json` → `{"feed":{"subscriptions":{}}}`; `host-bindings.json` → `{"version":1,"bindings":{}}`; `rig host list` → `No hosts registered in /home/openrig/.openrig/hosts.yaml` |
+| no temp files, no cluster residue | no `*.tmp-*` in `~/.openrig`; only `hub-0` and `pvc/home-hub-0` left in the namespace |
+
 ## Reproducing
 
 ```bash
@@ -150,6 +183,21 @@ kubectl -n openrig exec -i hub-0 -c daemon -- rig host list
 - Hub restart and volume survival across a reschedule. `local-path` ties the pod to one node, and
   only one node exists here.
 - Anything that needs a second namespace or a second cluster.
-- The `0.6.10` TUI against a port-forward from the operator machine. The TUI runs observed above
-  were `0.6.8` locally (which does not call `/api/review/fleet` at all) and `0.6.10` inside `hub-0`.
-  The rendering conclusions come from the `0.6.10` source plus the `0.6.10` TUI in the pod.
+- A hub that is down or Ready-but-failing at `start` or `delete` time. The code now logs a warning
+  naming exactly what was left behind and the commands to clean it, and `start` hands the ticket over
+  before it registers so a failing hub cannot strand a team. Neither path was forced on the cluster.
+- Concurrent `start` and `delete` for different tickets. `rig host add` is last-write-wins, so a
+  concurrent pair can drop one host entry; the unregister rewrite is atomic (tmp + rename), so the
+  daemon never sees a half-written file, but the lost update is real and only a re-run repairs it.
+- The `0.6.10` TUI over a port-forward from the operator's own machine. The TUI runs above were
+  `0.6.8` locally (which never calls `/api/review/fleet`) and `0.6.10` inside `hub-0`; the rendering
+  conclusions come from the `0.6.10` source plus the `0.6.10` TUI in the pod.
+
+## Next
+
+- **`rig-dispatch hub-sync`.** A reconcile that registers every team StatefulSet the hub does not know
+  and forgets every `t-*` host with no StatefulSet, run at the end of `start` and `delete`. It is the
+  real fix for both the down-hub residue and the concurrent-update race above, and it is deliberately
+  out of this ticket.
+- Stage 3.1 and 3.2, which turn the two **no** rows above into yes. 3.2 needs no daemon change: the
+  fleet read already returns the items and their `hostId`.
