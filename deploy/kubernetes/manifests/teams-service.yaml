@@ -1,0 +1,14 @@
+# Governing Service for the per-ticket team StatefulSets the dispatcher creates: each team pod is
+# t-<slug>-0.teams.openrig.svc. Headless and cluster-internal; the NetworkPolicy decides who may
+# connect.
+apiVersion: v1
+kind: Service
+metadata:
+  name: teams
+spec:
+  clusterIP: None
+  selector:
+    openrig.dev/role: team
+  ports:
+    - name: daemon
+      port: 7433
