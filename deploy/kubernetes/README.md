@@ -116,18 +116,46 @@ kubectl -n openrig exec -i hub-0 -c daemon -- rig host list
 - **The dispatcher keeps it in step.** `start` registers a team once its pod is Ready (bearer file at
   0600 and an absolute path, `rig host add --transport http`, and
   `feed.subscriptions.t-<slug>.enabled true`, so the hub reads the team's queue state and not just
-  its reachability); `delete` unregisters it, with `rig config reset` as the unset. Both are
-  idempotent, and with no Ready hub pod in the namespace they are no-ops, so the dispatcher works
-  exactly as before.
+  its reachability); `delete` unregisters it, with `rig config reset` as the unset, and drops the
+  team's alias from `host-bindings.json` too. Both are idempotent, and with no Ready hub pod in the
+  namespace they are no-ops, so the dispatcher works exactly as before.
+- **Registration happens after the ticket is handed over, on purpose.** The hub is view-only, so a hub
+  that is Ready but failing (no `pods/exec` RBAC, a full volume, a `hosts.yaml` that `rig host add`
+  refuses) must never leave a team running with no ticket. `start` hands the ticket over first and
+  then registers, and still exits non-zero with a loud error if registration fails.
+- **A hub that is down at the wrong time leaves residue, and nothing repairs it yet.** If the hub is
+  not Ready when `start` runs, the team is simply not registered; re-run `start <ticket>` once the hub
+  is Ready — it resumes and does not hand the ticket over twice. If the hub is not Ready when `delete`
+  runs, the team pod is gone but the hub keeps its host, bearer file and subscription; both cases log
+  a warning naming exactly what is left and the commands to clean it. There is no `hub-sync` reconcile
+  yet, so a stale host after a `delete` is removed by hand:
+
+  ```bash
+  kubectl -n openrig exec -i hub-0 -c daemon -- rig config reset feed.subscriptions.t-<slug>.enabled
+  kubectl -n openrig exec -i hub-0 -c daemon -- rm -f ~/.openrig/hosts.d/t-<slug>.bearer
+  # then drop the t-<slug> entry from ~/.openrig/hosts.yaml (there is no `rig host remove`)
+  ```
+
+- **Do not run `start` and `delete` for different tickets at the same moment.** `rig host add` is
+  last-write-wins and the unregister reads the whole file, rewrites it and renames it into place, so a
+  concurrent pair can drop one entry. The rewrite is atomic (tmp + rename), so the daemon never sees a
+  half-written file, but the lost update is real. Re-running `start <ticket>` repairs it.
+- **`answer` records the team's lead as the resolver**, not the human: `rig queue resolve` takes its
+  actor from the seat env, and a bare `kubectl exec` shell has no human identity to offer. The
+  decision text you supply is stored verbatim in the transition log either way.
 - **It binds loopback.** Nothing in the cluster dials the hub, and the operator comes in through
   `kubectl port-forward`, which connects inside the pod. A loopback bind needs no bearer, so reaching
-  the hub is exactly having `pods/portforward` on the namespace. Its readiness probe is therefore an
+  the hub is exactly having `pods/portforward` or `pods/exec` on the namespace — the same access, and
+  the reads below use the second one. Its readiness probe is therefore an
   `exec` curl, not `httpGet`: the kubelet probes the pod IP, where a loopback bind has no listener.
 - **What it shows, and what it does not.** The daemon-side fan-outs work: `/api/review/fleet` stamps
   every needs-you item with its team's `hostId`, the attention aggregate reports each team's status,
-  and `rig ps --all-hosts --nodes -A` lists every seat. The TUI does not render those yet: it shows
-  `hub-0` only, because remote hosts still hydrate with `rigs: []` and nothing reads the hosts-down
-  list. That gap is stage 3.1 and 3.2, and HUB-TEST.md records the evidence.
+  and `rig ps --all-hosts --nodes -A` lists every seat. **The TUI does not show any of it, on any
+  version**: it renders `hub-0` alone, because remote hosts still hydrate with `rigs: []`, nothing
+  reads the hosts-down list, and its NEEDS YOU comes from the hub's own empty queue rather than the
+  fleet read. That gap is stage 3.1 and 3.2, and [HUB-TEST.md](HUB-TEST.md) records the evidence. Use
+  the `kubectl exec` reads below for the teams; the TUI is for the hub itself. The TUI must be no older
+  than the hub's daemon in any case — an old one does not call `/api/review/fleet` at all.
 
 ## How the pieces fit
 
