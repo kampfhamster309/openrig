@@ -213,12 +213,30 @@ export function hostLabel(hostId: string): string {
  *   human seat) and nothing else; the fleet read also serves `human-routed` pending
  *   rows and derived exceptions, which have nothing to resolve. Those get the honest
  *   non-mutating read instead.
- * `resolve` derives its actor from the seat environment of the daemon it runs
- * against, so the host is named: the command belongs on the host that owns the row. */
+ *
+ * On the park-on-human leg the TUI can answer the row itself
+ * (`answer <qitem-id> <decision>`, routed to this row's host), so the row points at the action
+ * this surface can actually take instead of at a command to type somewhere else. The other legs
+ * keep the address, exactly as before — the hint only ever names something the operator cannot do
+ * from here. NO QUOTES around the decision: the grammar takes the rest of the line
+ * literally, so a printed pair of quotes would land in the team's transition note. */
 function remoteHint(kind: string, hostId: string, qitemId: string): string {
   return kind === "park-on-human"
-    ? ` → on ${hostId}: rig queue resolve ${qitemId} --decision "<answer>"`
+    ? ` → answer here: answer ${qitemId} <decision> (routes to ${hostId})`
     : ` → on ${hostId}: rig queue show ${qitemId}`;
+}
+
+/** The host that OWNS a NEEDS YOU row, as the fleet reads served it. `answer` routes on this
+ *  instead of guessing: a row this hub has only ever seen from another host belongs to that host,
+ *  and anything else is the hub's own. Returns undefined for a local row (the `local` sentinel) and
+ *  for an id no served row carries — the daemon then answers honestly with qitem_not_found rather
+ *  than the TUI inventing a destination. */
+export function remoteHostForQitem(snap: FleetSnapshot, qitemId: string): string | undefined {
+  const remote = (hostId: string | null | undefined): string | undefined =>
+    (hostId && hostId !== LOCAL_HOST_ID_SENTINEL ? hostId : undefined);
+  for (const item of snap.needs) if (item.qitemId === qitemId) { const hit = remote(item.hostId); if (hit) return hit; }
+  for (const row of snap.fleetQueue) if (row.qitemId === qitemId) { const hit = remote(row.hostId); if (hit) return hit; }
+  return undefined;
 }
 
 /** ▲ NEEDS YOU rows for the FLEET leg — the `/api/review/fleet` items whose host is

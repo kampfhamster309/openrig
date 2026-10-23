@@ -53,6 +53,28 @@ export interface LaunchNodeResult {
   warnings?: string[];
 }
 
+/** The `resolve` verb's reply, as far as this surface reads it. The unparked row rides back
+ *  verbatim from whichever daemon owns it (the hub forwards and passes the origin's answer through). */
+export interface ResolveQitemResult {
+  actionId?: string;
+  verb?: string;
+  qitemId?: string;
+  closedQitem?: { state?: string; qitemId?: string } | null;
+  notifyAttempted?: boolean;
+  notifyResult?: string | null;
+  error?: string;
+  detail?: string;
+  hostId?: string;
+  failureClass?: string;
+}
+
+/** The actor a SEATLESS operator surface declares for a resolve. Mirrors the CLI's
+ *  `REMOTE_HUMAN_ACTOR` (packages/cli/src/commands/queue.ts) and the browser surfaces'
+ *  `SURFACE_ACTOR` — same meaning, same spelling, three packages that do not cross-import. Human-CLASS
+ *  by the shipped session-name contract, so a remote team's row says a human answered instead of
+ *  inventing one of its own seats. */
+export const REMOTE_HUMAN_ACTOR = "human@host";
+
 /** The `?host=<id>` read-through envelope (daemon `domain/hosts/read-through.ts`).
  * Absent or empty means a LOCAL read, which is every existing call site unchanged.
  * The daemon edge consumes the param, strips it from the forwarded request, and
@@ -67,6 +89,18 @@ export function launchNodeNotice(agent: string, result: LaunchNodeResult): strin
     ? `agent already running: ${agent}`
     : `agent run requested: ${agent}`;
   return [notice, ...(result.warnings ?? [])].join("\n");
+}
+
+/** What an `answer` did, in the operator's terms. The row's state is read back from the reply the
+ *  OWNING daemon sent (the hub passes the origin's answer through verbatim), so a remote answer
+ *  reports the remote row's truth rather than a local guess. */
+export function resolveQitemNotice(qitemId: string, hostId: string | null | undefined, result: ResolveQitemResult): string {
+  const where = hostId ? `host ${hostId}` : "this daemon";
+  if (result && typeof result.error === "string") {
+    return `answer NOT recorded for ${qitemId} (${result.error}${result.hostId ? ` on host ${result.hostId}` : ""})${result.detail ? `\n${result.detail}` : ""}`;
+  }
+  const state = result?.closedQitem?.state;
+  return `answered ${qitemId} on ${where}${state ? ` — row is now ${state}` : " — unparked"}`;
 }
 
 export class DaemonClient {
@@ -130,17 +164,28 @@ export class DaemonClient {
   }
 
   private async post(route: string, body: unknown): Promise<unknown> {
+    const res = await this.postSettled(route, body);
+    if (!res.ok) {
+      const detail = res.errorText ? ` — ${res.errorText}` : "";
+      throw new Error(`daemon write failed: POST ${route} → ${res.status}${detail}`);
+    }
+    return res.data;
+  }
+
+  /** The write transport that does NOT throw: a caller that must show the operator WHY a write
+   *  failed reads the daemon's own structured error off this. `errorText` is the payload's `error`
+   *  field when it has one, which is what the cross-host forward's `remote_action_failed` carries. */
+  private async postSettled(route: string, body: unknown): Promise<{ ok: boolean; status: number; data: unknown; errorText?: string }> {
     const res = await this.fetchImpl(`${this.baseUrl}${route}`, {
       method: "POST",
       headers: { ...this.headers, "Content-Type": "application/json" },
       body: JSON.stringify(body),
     });
     const parsed = await res.json().catch(() => null);
-    if (!res.ok) {
-      const detail = parsed && typeof parsed === "object" && "error" in parsed ? ` — ${(parsed as { error: unknown }).error}` : "";
-      throw new Error(`daemon write failed: POST ${route} → ${res.status}${detail}`);
-    }
-    return parsed;
+    const errorText = parsed && typeof parsed === "object" && "error" in parsed
+      ? String((parsed as { error: unknown }).error)
+      : undefined;
+    return { ok: res.ok, status: res.status, data: parsed, ...(errorText !== undefined ? { errorText } : {}) };
   }
 
   /** Running daemon identity. `selfHostId` may be absent on an older daemon. */
@@ -361,6 +406,36 @@ export class DaemonClient {
   /** the `rig launch` per-seat contract */
   async launchNode(rigId: string, logicalId: string): Promise<LaunchNodeResult> {
     return (await this.post(`/api/rigs/${encodeURIComponent(rigId)}/nodes/${encodeURIComponent(logicalId)}/launch`, {})) as LaunchNodeResult;
+  }
+
+  /**
+   * Answer a parked qitem from this surface, on the ONE resolve write path
+   * the CLI already uses (POST /api/mission-control/action, verb=resolve). `hostId` is the
+   * out-of-band envelope the hub forwards on (OPR.0.4.4.15 FR-4); absent means this daemon, so a
+   * local answer is byte-identical to before.
+   *
+   * The actor is ALWAYS a body claim here, unlike the CLI: this client sends no `X-OpenRig-Session`
+   * header (its only headers are the terminal bearer), so leaving the actor out would give a
+   * 400 actor_required and the operator would watch their answer fail. A seat's TUI declares its own
+   * seat name; a seatless one declares the human ref. Either way the hub records it under the honest
+   * `claimed:v1` era-stamp and stamps its own host id into the audit row.
+   */
+  async resolveQitem(qitemId: string, decision: string, hostId?: string | null): Promise<ResolveQitemResult> {
+    const seat = process.env["OPENRIG_SESSION_NAME"]?.trim();
+    const result = await this.postSettled("/api/mission-control/action", {
+      verb: "resolve",
+      qitemId,
+      decision,
+      actorSession: seat && seat.length > 0 ? seat : REMOTE_HUMAN_ACTOR,
+      ...(hostId ? { hostId } : {}),
+    });
+    // A refused write comes back as the daemon's own structured error (a cross-host refusal passes
+    // the origin's through verbatim), so the operator reads the reason rather than a bare status.
+    if (!result.ok) {
+      const payload = (result.data ?? {}) as Record<string, unknown>;
+      return { ...payload, error: String(payload.error ?? result.errorText ?? `daemon write failed: HTTP ${result.status}`) };
+    }
+    return result.data as ResolveQitemResult;
   }
 
   async startupRequest<T>(route: string, body?: unknown): Promise<T> {

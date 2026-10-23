@@ -114,6 +114,16 @@ export const COMMAND_REGISTRY: readonly CommandEntry[] = [
   { name: "source", aliases: [], args: "", description: "read the selected project, mission or slice source", context: "standard", sample: "source", build: () => ({ type: "project-source" }) },
   { name: "mission", aliases: [], args: "<name>", description: "open a mission's work and workflows", context: "standard", sample: "mission release-demo", complete: ({ snapshot }) => (snapshot.scopes ?? []).map((m) => m.mission), build: (name) => name ? { type: "scopes-mission-open", mission: name } : { type: "error", message: "mission needs a name" } },
   { name: "workflow", aliases: [], args: "<instance-id>", description: "open a workflow in the selected mission", context: "standard", sample: "workflow example", complete: (ctx) => workflowArgs(ctx, false), build: (name) => name ? { type: "execution-open", key: `workflow:${name}` } : { type: "error", message: "workflow needs an instance id" } },
+  { name: "answer", aliases: ["ans"], args: "<qitem-id> <decision>", description: "answer a NEEDS YOU park with the operator's decision; a row the fleet read showed on another host is routed there", context: "standard", sample: "answer qitem-1 ship it", build: (rest) => {
+      // The decision is the REST of the line, spaces literal (same shape as launch-folder): a
+      // decision is prose, and making an operator quote it would be a worse answer than typing it.
+      const sep = rest.search(/\s/);
+      const qitemId = sep < 0 ? "" : rest.slice(0, sep);
+      const decision = sep < 0 ? "" : rest.slice(sep + 1).trim();
+      if (!qitemId) return { type: "error", message: 'answer needs a queue id (e.g. "answer <qitem-id> <decision>")' };
+      if (!decision) return { type: "error", message: "answer needs the decision text after the queue id — the daemon records it verbatim and refuses an empty one" };
+      return { type: "act", act: "resolve-qitem", qitemId, decision };
+    } },
   { name: "packet", aliases: [], args: "<qitem-id>", description: "open current workflow work in the selected mission", context: "standard", sample: "packet example", complete: (ctx) => workflowArgs(ctx, true), build: (name) => name ? { type: "execution-open", key: `packet:${name}` } : { type: "error", message: "packet needs a queue id" } },
   {
     name: ":",

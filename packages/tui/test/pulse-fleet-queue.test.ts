@@ -111,16 +111,21 @@ describe("▲ NEEDS YOU across hosts", () => {
   });
 });
 
-describe("a remote row offers the address instead of an action", () => {
-  it("park-on-human: prints a resolve command that RUNS AS PRINTED, on the owning host", () => {
-    // `--decision` is a requiredOption on the CLI, so an address without it fails in
-    // commander before it ever reaches the daemon.
+describe("a remote row names its host and what can be done from here", () => {
+  it("park-on-human: prints the answer this surface can now take, naming the owning host", () => {
+    // On this leg the printed CLI address is gone: the TUI can answer a remote park
+    // itself (`answer <qitem-id> <decision>`, routed to the row's host), so the row
+    // points at the action available here rather than at a command to type elsewhere.
+    // The host is still named, because the row's owner is the fact the operator needs.
     const model = buildPulseModel(quietSnap({
       needs: [fleetNeed({ kind: "park-on-human", qitemId: "qitem-20261023131724-7ed2c7733cf4eaa0" })],
     }), NOW);
     const lines = renderExceptionSection(section(model, "NEEDS YOU")!).map((l) => l.text);
-    expect(lines.length).toBe(3); // header + the row + its address line
-    expect(lines[2]).toContain('on t-hubtest-b: rig queue resolve qitem-20261023131724-7ed2c7733cf4eaa0 --decision "<answer>"');
+    expect(lines.length).toBe(3); // header + the row + its action line
+    expect(lines[2]).toContain('answer here: answer qitem-20261023131724-7ed2c7733cf4eaa0 <decision> (routes to t-hubtest-b)');
+    expect(lines[2]).not.toContain("rig queue resolve");
+    // F7: no quotes in the printed form, because the grammar takes the rest literally.
+    expect(lines[2]).not.toContain('"');
   });
 
   it("human-routed: prints the non-mutating read, because there is nothing to resolve", () => {

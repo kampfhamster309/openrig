@@ -577,6 +577,9 @@ export type Action =
   | { type: "act"; act: "launch-spec" }
   | { type: "act"; act: "open-terminal"; view: string; expectedPlan?: string }
   | { type: "act"; act: "run"; rigId: string; agent: string }
+  /** Answer a parked qitem from PULSE. `hostId` names the host that OWNS the
+   * row (carried from the served NEEDS YOU row, never guessed); absent means this daemon. */
+  | { type: "act"; act: "resolve-qitem"; qitemId: string; decision: string; hostId?: string }
   | { type: "notice"; message: string };
 
 /** FR-12: the section set is ONE in-code registry — adding a section is a

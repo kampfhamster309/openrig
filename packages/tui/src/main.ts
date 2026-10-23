@@ -18,7 +18,8 @@ import { createStyle, detectColorMode } from "./theme.js";
 import { stylizeLines } from "./stylize.js";
 import { createControlSocket, defaultSocketPath } from "./socket-server.js";
 import { demoSnapshot } from "./demo-data.js";
-import { DaemonClient, launchNodeNotice } from "./daemon-client.js";
+import { DaemonClient, launchNodeNotice, resolveQitemNotice } from "./daemon-client.js";
+import { remoteHostForQitem } from "./pulse/pulse-model.js";
 import { hydrateSnapshot } from "./hydrate.js";
 import { createLiveRefresh } from "./live.js";
 import { resolvePendingAddress } from "./pending-address.js";
@@ -416,6 +417,12 @@ async function run(): Promise<void> {
       } else if (action.act === "run") {
         const result = await client.launchNode(action.rigId, action.agent);
         view.dispatch({ type: "notice", message: launchNodeNotice(action.agent, result) });
+      } else if (action.act === "resolve-qitem") {
+        // Route by the host the fleet read served for THIS row; an id no remote row carries is the
+        // hub's own and the daemon answers honestly if that is wrong. Never a guessed host.
+        const hostId = remoteHostForQitem(snapshot, action.qitemId);
+        const result = await client.resolveQitem(action.qitemId, action.decision, hostId);
+        view.dispatch({ type: "notice", message: resolveQitemNotice(action.qitemId, hostId, result) });
       }
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
