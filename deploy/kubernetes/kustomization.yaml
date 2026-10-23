@@ -7,6 +7,7 @@ namespace: openrig
 resources:
   - manifests/namespace.yaml
   - manifests/networkpolicy.yaml
+  - manifests/networkpolicy-hub.yaml
   - manifests/teams-service.yaml
 # The image new team pods get (rig-dispatch reads this pin; RIG_DISPATCH_IMAGE overrides it).
 images:
