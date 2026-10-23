@@ -17,6 +17,7 @@ OpenAI-compatible model, and a Claude Code reviewer.
 | `build-image.sh` | Builds the image (`--push` to push). Prints the tag, `<version>-<commit>`. |
 | `create-secrets.sh` | Creates the three Secrets, prompting for each token. |
 | `dispatcher/` | `rig-dispatch`: one team pod per ticket (see below), and `team.env`, the env every team pod gets. |
+| `dispatcher/test/` | `archive-test.sh`: runs the dispatcher's archive, report, delete guard and answer paths against a fake `kubectl` serving recorded responses. No cluster needed: `bash dispatcher/test/archive-test.sh`. |
 | `hub/` | The hub: one more daemon from the same image, no rigs, whose `hosts.yaml` lists every team pod (see below). |
 | `HUB-TEST.md` | What the hub was observed to do on a real cluster, item by item, with the evidence. |
 | `manifests/` | Shared objects: namespace, the `teams` Service the team pods join, NetworkPolicy. |
@@ -77,8 +78,10 @@ $D start PROJ-123 --repo https://github.com/org/repo.git --ref main --brief-file
 $D status                      # every ticket: phase, seat activity, open queue items, result summary
 $D wait PROJ-123               # exit 0 done, 1 failed, 3 needs-human, 4 timeout
 $D answer PROJ-123 <qitem> "Use the existing retry helper."
-$D collect PROJ-123 --into ~/src/repo   # archive to ./tickets/proj-123, fetch refs/tickets/proj-123
-$D delete PROJ-123
+$D archive PROJ-123            # copy the ticket's history out to ./tickets/proj-123
+$D collect PROJ-123 --into ~/src/repo   # archive, then bundle the result branch and fetch it
+$D report PROJ-123             # figures from the archive alone; --all, --json
+$D delete PROJ-123             # refuses unless the ticket has a complete archive; --force to override
 ```
 
 - **Objects:** per ticket a Secret and a one-replica StatefulSet `t-<slug>` (pod `t-<slug>-0`, labels
@@ -93,6 +96,91 @@ $D delete PROJ-123
   can be repeated. `start` on an existing ticket resumes; `wait` restores the rig if the pod restarted.
 - **Defaults:** `dispatcher/team.env` holds env every team pod gets; `--env NAME=VALUE` adds per ticket.
   The image defaults to the tag in `kustomization.yaml`; `RIG_DISPATCH_IMAGE` or `--image` overrides it.
+
+## Keeping a ticket after its pod is gone: the archive
+
+A team's whole history lives on its own pod volume, and `delete` takes that volume with it. `archive`
+copies out everything that explains the ticket while the pod is still there, so `report` can answer
+afterwards how long the ticket took, how many review rounds and handoffs it needed, who made each human
+decision and from which host, and what it used.
+
+```bash
+$D archive PROJ-123 [--dir <root>]   # default root: ./tickets, or $RIG_DISPATCH_ARCHIVE_DIR
+$D report PROJ-123 | --all [--dir <root>] [--json]
+```
+
+One directory per ticket, `<root>/<slug>/`:
+
+| File | What it holds |
+|---|---|
+| `manifest.json` | every part with `ok`/`failed`, its row count and its error, plus `complete` |
+| `status.json` | what `status` sees: phase, seats, open queue items, the result |
+| `queue.json` | every queue row in the team's pod, complete fields, no row cap |
+| `nodes.json` | the seats and their state |
+| `events.json` | the v1 event stream, paged to the end, with the coverage gaps the daemon reported |
+| `queue-transitions.json` | the v1 queue-transition stream, paged to the end |
+| `audit-<qitem>.json` | the mission-control audit rows for each of the ticket's queue items |
+| `usage-<seat>.json`, `usage-top.json` | the usage samples per seat, and the daemon's top-burn window |
+| `result.json` | the pod's `result.json`, verbatim |
+| `result.bundle` | only from `collect`: the commits the remote does not have |
+
+- **A failed part costs that part, not the archive.** Everything that could be read is written, the part
+  that failed is named in the manifest with its error, and `archive` exits non-zero. A paged read whose
+  cursor stops advancing fails its part rather than writing a truncated history as if it were the whole
+  one, because a reader cannot otherwise tell a short history from a quiet ticket.
+- **Re-running replaces the directory whole.** It is built in a temporary directory beside the target and
+  swapped in, so a run never leaves a half-old, half-new mix; a crash mid-swap leaves the complete
+  previous archive at `.<slug>.old.*` rather than nothing. One consequence worth knowing: a re-run whose
+  part fails replaces an archive that had read that part successfully, so the older copy of that part is
+  gone. The pod is still there (the delete guard insists on it), so running `archive` again recovers it.
+- **`collect` archives first, then bundles.** The order is deliberate: the history is the part that cannot
+  be recovered afterwards. A failed `git bundle`, or a failed `--into` fetch, is recorded as a `bundle`
+  part, reported, and makes `collect` exit non-zero — it never discards what was already archived, and no
+  half-written bundle is left behind. A ticket with no result branch yet, or with a branch that has no
+  commit the remote lacks, is a state of the ticket rather than a failure: the part is recorded with a
+  note and `collect` exits 0, so `delete` is never blocked by a ticket that had nothing to bundle, and no
+  zero-byte `result.bundle` is left behind.
+- **`delete` refuses without a complete archive**, and says which parts failed or are not usable on disk
+  (a zero-byte or truncated file, or one holding fewer rows than the manifest counted). It also refuses an
+  archive that is no longer current: one taken from an earlier pod under the same ticket name, or one the
+  team has written past since — the guard compares the pod's creation time and each telemetry stream's
+  current high watermark against the `through` the archive recorded, which is the last row that read could
+  include rather than the id the daemon had reached when its last page was produced. The guard runs before anything is touched, so a refused
+  delete leaves the team, its hub entry and its volume untouched. `--force` deletes anyway and says so
+  loudly.
+
+### What each report figure means, and what it cannot tell
+
+- **duration** — the span from the first to the last archived event; not the pod's lifetime, since nothing
+  before the first event is recorded, and when the archive reports coverage gaps it is a floor.
+- **reviewRounds** — how many queue rows addressed to a review seat the archive holds, which depends
+  on review seats being named `review*`; a review that found nothing still counts as a round, a review
+  done inside one seat's own turn without a queue item is invisible here, and a stuck-sweep recovery row
+  addressed to a review seat is excluded because it is not a review.
+- **handoffs** — how many archived queue-transitions closed a handoff, whether the row closed as
+  `handed-off` or as `done` with a `handed_off_to` reason; a handoff made outside the queue leaves nothing
+  to count.
+- **humanDecisions** — how many archived audit rows are a `resolve`, each with who gave it and, for an
+  answer relayed through the hub, the host it came from (`auditNotes.openrig_relay.from_host`); an answer
+  typed inside the team's own pod records no origin host, and report says so instead of inventing one.
+- **usage** — per seat, the sum of positive per-node token deltas across the archived samples, the same
+  rule the daemon's own top-burn uses; these are periodic samples of cumulative counters and **not exact
+  token accounting**, so a quiet stretch between two samples is invisible and a counter that goes down is
+  counted as a reset rather than subtracted. `usage-top` is a snapshot of the hour before the archive ran,
+  so it is reported as a window and never summed into the total.
+
+### Later: the archive root in object storage
+
+Nothing here needs changing to move the archives off the operator machine: the archive is a plain directory
+of small files, so the sync is a bucket copy of `<root>` — `aws s3 sync <root> s3://bucket/tickets/
+--exclude '.*'` (or `rclone copy <root> remote:tickets/ --exclude '.*/**'`, or `gsutil -m rsync -r -x
+'/\..*'`) — run after each `collect` has returned, or on a cron or a Job that walks the tickets the
+dispatcher knows about. The exclude matters: while a run is in flight the scratch directory
+`.<slug>.partial.*` sits inside `<root>`, and a sync that copies it (or the `.<slug>.old.*` beside a swap
+that did not finish) puts a partial archive in the bucket. Because a re-run writes the whole directory and
+swaps it in, a sync that skips the dot-directories never sees a half-written archive, and `report --dir`
+reads a synced copy unchanged. What is deliberately not built: retention rules, per-ticket versioning in
+the bucket, and server-side `report`.
 
 ## The hub: one point of truth for every team
 
@@ -140,9 +228,29 @@ kubectl -n openrig exec -i hub-0 -c daemon -- rig host list
   last-write-wins and the unregister reads the whole file, rewrites it and renames it into place, so a
   concurrent pair can drop one entry. The rewrite is atomic (tmp + rename), so the daemon never sees a
   half-written file, but the lost update is real. Re-running `start <ticket>` repairs it.
-- **`answer` records the team's lead as the resolver**, not the human: `rig queue resolve` takes its
-  actor from the seat env, and a bare `kubectl exec` shell has no human identity to offer. The
-  decision text you supply is stored verbatim in the transition log either way.
+- **`answer` goes through the hub, so a human is recorded as a human.** The dispatcher runs
+  `rig queue resolve --host t-<slug> <qitem> --decision ...` in the hub pod with no seat in its
+  environment, which is the case the CLI already handles: it sends the seatless human actor in the request
+  body and the team records that at the provenance the CLI claims for it. Setting a seat name instead
+  would send a header, the hub would treat it as transport-proven, and the team would file the answer at a
+  strength nothing verified. The hub composes `auditNotes.openrig_relay.from_host` from its own host id as
+  it forwards, and the team stores it — that is what lets the archive say who answered and from where.
+  Naming an individual human
+  (`human-alice@host`) needs the hub's own human registry, which is a later step; until then every answer
+  is recorded as the seatless human. It falls back to resolving inside the team pod as its lead only when
+  the hub could not do it: no Ready hub pod, the team not registered on the hub, or a hub-side failure. The
+  one failure that never falls back is a refusal the team made itself — `remote_action_failed` with
+  `failureClass: remote-error` — which is reported and exits 1 rather than re-issued under a seat's
+  name. Every other failure could still have reached the team (a request timeout, a body that timed out
+  after the headers, an indeterminate network error), so the row is read in the pod first: still parked on
+  a human means the write never landed and the fallback runs. A row that is **not** parked is not proof of
+  a landing — anything that unparks a row looks the same — so the team's own audit rows decide: `answer`
+  exits 0 only when they carry a `resolve` whose reason is this decision and whose
+  `auditNotes.openrig_relay.from_host` is set. A row that cannot be read (including `blocked` with no
+  `blockedOn`), or a row that moved without such an audit row, exits **5**: the answer is not confirmed,
+  and nothing was re-issued. A caller can tell 5 (not confirmed) from 1 (the team refused).
+  The fallback logs why, and records the team's lead rather than the
+  human, because a bare `kubectl exec` shell has no human identity to offer.
 - **It binds loopback.** Nothing in the cluster dials the hub, and the operator comes in through
   `kubectl port-forward`, which connects inside the pod. A loopback bind needs no bearer, so reaching
   the hub is exactly having `pods/portforward` or `pods/exec` on the namespace — the same access, and

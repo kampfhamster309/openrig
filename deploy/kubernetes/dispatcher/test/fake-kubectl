@@ -8,7 +8,8 @@
 # `--start retained` would read no history at all, so it is recorded as a failure here.
 #
 # Knobs a test sets: FAKE_FIXTURES, FAKE_CALLS, FAKE_POD_READY, FAKE_FAIL_USAGE_TOP,
-# FAKE_STALL_EVENTS, FAKE_NO_RESULT, FAKE_EMPTY_BUNDLE, FAKE_FAIL_BUNDLE,
+# FAKE_STALL_EVENTS, FAKE_NO_RESULT, FAKE_ANSWER, FAKE_NO_HUB, FAKE_NOT_REGISTERED,
+# FAKE_EMPTY_BUNDLE, FAKE_FAIL_BUNDLE, FAKE_SHOW_STATE, FAKE_SHOW_BLOCKED,
 # FAKE_WATERMARK_EVENTS, FAKE_WATERMARK_TRANSITIONS, FAKE_STS_CREATED.
 set -u
 
@@ -18,6 +19,10 @@ printf '%s\n' "$*" >> "$FAKE_CALLS"
 
 fix() { cat "$FAKE_FIXTURES/$1"; }
 nope() { echo "fake kubectl: no recorded response for [$*]" >&2; exit 1; }
+# Real `kubectl exec` writes this to ITS OWN stderr when the remote command exits non-zero, so a
+# caller that merges the two streams sees it beside the command's JSON. The dispatcher has to parse
+# around it; without this line the fake is more polite than kubectl and hides that.
+kfail() { printf 'command terminated with exit code %s\n' "$1" >&2; exit "$1"; }
 
 # One telemetry stream. The archive opens a history with `--start retained` and then follows the
 # cursor. A read with neither asks for the CURRENT window and gets no rows back, which is exactly how
@@ -80,7 +85,10 @@ pod_sh() {
     *mission-control/audit*)
       local qitem=${5:-} before=${7:-}
       case "$qitem:$before" in
-        qitem-a:) fix audit-qitem-a-p1.json ;;
+        qitem-a:)
+          # FAKE_AUDIT_A swaps in a different first page, e.g. one whose resolve carries some other
+          # decision, which is how a test says "the row moved but not because of this answer".
+          if [ -n "${FAKE_AUDIT_A:-}" ]; then fix "$FAKE_AUDIT_A"; else fix audit-qitem-a-p1.json; fi ;;
         qitem-a:act-2) fix audit-qitem-a-p2.json ;;
         qitem-b:|qitem-unrelated:|qitem-review-untagged:|qitem-recovery-1f2e3d4c:)
           fix audit-empty.json ;;
@@ -100,6 +108,53 @@ serve() {
       case "${2:-} ${3:-}" in
         "ps --nodes") fix nodes.json ;;
         "queue list") fix queue.json ;;
+        "queue show")
+          # What the team's own daemon says about the row, which is how `answer` learns whether a
+          # write the hub reported as failed had in fact landed. Default: still parked on a human.
+          # FAKE_SHOW_UNREADABLE stands for a pod that cannot be reached or answers nonsense, which is
+          # a different thing from a row that moved, and `answer` must not treat it as one.
+          if [ "${FAKE_SHOW_UNREADABLE:-0}" = 1 ]; then
+            echo "rig queue show: the daemon did not answer" >&2
+            exit 1
+          fi
+          local blocked=${FAKE_SHOW_BLOCKED-human@host}
+          printf '{"qitemId":"qitem-a","state":"%s","blockedOn":%s}\n' \
+            "${FAKE_SHOW_STATE:-blocked}" \
+            "$(if [ -n "$blocked" ]; then printf '"%s"' "$blocked"; else printf 'null'; fi)" ;;
+        "queue resolve")
+          # The hub's forwarded answer, or the team pod's own. FAKE_ANSWER picks which outcome the
+          # test is exercising: ok, a routing failure only the hub can hit (it is the one passing
+          # --host), a refusal by the team that the dispatcher must NOT fall back on, a failure that
+          # reached the team anyway, or a failure of the hub's own.
+          hub=0
+          for a in "$@"; do [ "$a" = "--host" ] && hub=1; done
+          outcome=${FAKE_ANSWER:-ok}
+          # A hub-side outcome belongs to the hub leg only; the team pod never passes --host, so the
+          # fallback after such a failure must still succeed.
+          if [ "$hub" = 0 ]; then
+            case "$outcome" in unroutable|unreachable-landed|hub401) outcome=ok ;; esac
+          fi
+          case "$outcome" in
+            ok) printf '{"qitemId":"qitem-a","state":"in-progress","resolvedBy":"human@host"}\n' ;;
+            unroutable)
+              printf '{"error":"remote_action_failed","hostId":"t-demo","failureClass":"unknown-host","detail":"host not in hosts.yaml"}\n'
+              kfail 2 ;;
+            unreachable-landed)
+              printf '{"error":"remote_action_failed","hostId":"t-demo","failureClass":"unreachable","detail":"request timed out after the team had the write"}\n'
+              kfail 2 ;;
+            hub401)
+              printf '{"error":"unauthorized"}\n'
+              kfail 1 ;;
+            refused)
+              printf '{"error":"remote_action_failed","hostId":"t-demo","failureClass":"remote-error","remoteStatus":404,"remoteBody":{"error":"qitem_not_found","hint":"Queue item was not found on the team daemon."}}\n'
+              kfail 1 ;;
+            refused-closed)
+              # What the real hub returns when the row is no longer parked on a human: the team refused,
+              # and kubectl's own line lands on stderr beside it.
+              printf '{"error":"remote_action_failed","hostId":"t-demo","failureClass":"remote-error","remoteStatus":409,"detail":"qitem_not_leg1_parked"}\n'
+              kfail 2 ;;
+            *) nope "FAKE_ANSWER=${FAKE_ANSWER}" ;;
+          esac ;;
         "usage series") shift 3; usage_series "$@" ;;
         "usage top")
           if [ "${FAKE_FAIL_USAGE_TOP:-0}" = 1 ]; then
@@ -119,13 +174,27 @@ serve() {
       : ;;
     rm) : ;;
     env)
-      # Two shapes arrive here: `env HUB_MODE=... node -` from the hub registry helper, which these
-      # tests do not exercise, and `env LC_ALL=C git ... bundle create` from `collect`, whose
-      # locale-pinned bundle step the fake still has to run. Strip the assignments and serve the
-      # command behind them.
+      # Three shapes arrive here: `env HUB_MODE=has ... node -` from the hub registry helper,
+      # `env -u NAME ... rig queue resolve ...` from the hub answer path (no seat, on purpose), and
+      # `env OPENRIG_SESSION_NAME=<who> rig queue resolve ...` from the in-pod fallback. Strip the
+      # assignments and unsets and dispatch on the command behind them.
       shift
-      while [ $# -gt 1 ] && [ "${1%%=*}" != "$1" ]; do shift; done
-      case "${1:-}" in node) : ;; *) serve "$@" ;; esac ;;
+      local hubmode=""
+      while [ $# -gt 1 ]; do
+        case "$1" in
+          -u) shift 2 ;;
+          HUB_MODE=*) hubmode=${1#HUB_MODE=}; shift ;;
+          *=*) shift ;;
+          *) break ;;
+        esac
+      done
+      if [ "$hubmode" = has ]; then
+        # `hub_registry has` exits 0 when the team is registered and 1 when it is not, which is what
+        # decides whether `answer` may try the hub at all.
+        if [ "${FAKE_NOT_REGISTERED:-0}" = 1 ]; then exit 1; fi
+        exit 0
+      fi
+      serve "$@" ;;
     git)
       # `collect` bundles the result branch out of the pod. The bytes are opaque here; what the test
       # cares about is that collect keeps the archive whatever the bundle step does, and that a ticket
@@ -168,7 +237,10 @@ case "${rest[0]:-}" in
           fix statefulset.json
         fi ;;
       pod)
-        if [ "${FAKE_POD_READY:-1}" = 1 ]; then fix pod-ready.json; else fix pod-not-ready.json; fi ;;
+        # hub_ready() asks about the hub pod by name, so a test can take the hub away on its own.
+        if [ "${rest[2]:-}" = "hub-0" ] && [ "${FAKE_NO_HUB:-0}" = 1 ]; then fix pod-not-ready.json
+        elif [ "${FAKE_POD_READY:-1}" = 1 ]; then fix pod-ready.json
+        else fix pod-not-ready.json; fi ;;
       *) nope "get $*" ;;
     esac ;;
   exec)

@@ -37,6 +37,12 @@ absent() { if [ ! -e "$1" ]; then ok "$2"; else bad "$2 ($1 should not exist)"; 
 in_calls() { # in_calls <desc> <pattern>
   if grep -q -- "$2" "$CALLS"; then ok "$1"; else bad "$1 (no [$2] in the recorded calls)"; fi
 }
+in_err() { # in_err <desc> <pattern> -- dispatcher log lines go to stderr
+  if grep -q -- "$2" "$ERR"; then ok "$1"; else bad "$1 (no [$2] in stderr: $(head -c 200 "$ERR"))"; fi
+}
+not_in_calls() { # not_in_calls <desc> <pattern>
+  if grep -q -- "$2" "$CALLS"; then bad "$1 (found [$2] in the recorded calls)"; else ok "$1"; fi
+}
 
 # run_archive <case> <archive-root> [ENV=VALUE...] -- run `rig-dispatch archive DEMO --dir <root>`
 # against the fake and report through RC (exit code), DIR (<root>/demo) and CALLS (the call log).
@@ -63,12 +69,14 @@ run_dispatch() {
   CALLS="$WORK/$name.calls"
   : > "$CALLS"
   export FAKE_CALLS=$CALLS
+  OUT="$WORK/$name.out"
+  ERR="$WORK/$name.err"
   if [ "${#envs[@]}" -gt 0 ]; then
     ( cd "$WORK" && env "${envs[@]}" KUBECTL=kubectl RIG_DISPATCH_NAMESPACE=openrig \
-        "$DISPATCH" "$@" ) >"$WORK/$name.out" 2>"$WORK/$name.err"
+        "$DISPATCH" "$@" ) >"$OUT" 2>"$ERR"
   else
     ( cd "$WORK" && env KUBECTL=kubectl RIG_DISPATCH_NAMESPACE=openrig \
-        "$DISPATCH" "$@" ) >"$WORK/$name.out" 2>"$WORK/$name.err"
+        "$DISPATCH" "$@" ) >"$OUT" 2>"$ERR"
   fi
   RC=$?
 }
@@ -316,6 +324,115 @@ jqis "and reports it" "$WORK/report-all.out" '.[0].slug' demo
 
 run_dispatch report-missing -- report DEMO --dir "$WORK/noarchive"
 eq "report refuses to invent figures for a ticket it never archived" 1 "$RC"
+
+echo "== answer: through the hub when the hub can do it"
+run_dispatch answer-hub -- answer DEMO qitem-a "Use the existing retry helper."
+eq "answer exits 0" 0 "$RC"
+in_calls "the hub pod was asked, with the team's registered host id" "exec -i hub-0 -c daemon -- env -u OPENRIG_SESSION_NAME -u RIGGED_SESSION_NAME rig queue resolve --host t-demo"
+in_err "and it says which path it used" "resolved on t-demo through hub-0 as the seatless human"
+in_calls "the hub call carries no seat name" "env -u OPENRIG_SESSION_NAME"
+not_in_calls "no seat env was set for the hub call" "env OPENRIG_SESSION_NAME=human"
+not_in_calls "the team pod was not touched" "t-demo-0 -c daemon -- env OPENRIG_SESSION_NAME"
+
+run_dispatch answer-no-hub FAKE_NO_HUB=1 -- answer DEMO qitem-a "Use the existing retry helper."
+eq "answer still works with no Ready hub" 0 "$RC"
+in_err "it says the hub is not there" "no Ready hub pod hub-0"
+in_calls "and falls back to the team pod as its lead" "t-demo-0 -c daemon -- env OPENRIG_SESSION_NAME=orch-lead@demo-rig rig queue resolve"
+in_err "and says what the fallback records" "will name that seat, not the human"
+
+run_dispatch answer-unregistered FAKE_NOT_REGISTERED=1 -- answer DEMO qitem-a "Use the existing retry helper."
+eq "answer works when the team is not registered on the hub" 0 "$RC"
+in_err "it names the host that is not registered" "not registered on hub-0"
+in_calls "and falls back" "t-demo-0 -c daemon -- env OPENRIG_SESSION_NAME=orch-lead@demo-rig rig queue resolve"
+
+run_dispatch answer-unroutable FAKE_ANSWER=unroutable -- answer DEMO qitem-a "Use the existing retry helper."
+eq "answer works when the hub cannot route to the team" 0 "$RC"
+in_err "it names what the hub could not do" "could not record the answer (unknown-host)"
+in_calls "it read the team's own copy first" "rig queue show qitem-a --json"
+in_err "the row was still parked, so it fell back" "still blocked on human@host"
+in_calls "and falls back" "t-demo-0 -c daemon -- env OPENRIG_SESSION_NAME=orch-lead@demo-rig rig queue resolve"
+
+echo "== answer: a landing is believed when the team's audit row carries it"
+run_dispatch answer-landed FAKE_ANSWER=unreachable-landed FAKE_SHOW_STATE=in-progress FAKE_SHOW_BLOCKED="" \
+  -- answer DEMO qitem-a "Use the existing retry helper."
+eq "a write the audit row confirms exits 0" 0 "$RC"
+in_err "it says the hub's answer landed" "the hub's answer landed on t-demo"
+in_err "and that nothing was re-issued" "nothing is re-issued"
+in_calls "and it decided from the team's audit rows" "api/mission-control/audit"
+not_in_calls "the team pod was not asked to resolve again" "t-demo-0 -c daemon -- env OPENRIG_SESSION_NAME"
+
+echo "== answer: a moved row whose audit rows do not carry this decision is not a landing"
+# Someone else unparked the row. The state alone would have looked like a landing; the resolve in the
+# audit log carries a different decision, so this dispatcher cannot claim the human's answer landed.
+run_dispatch answer-landed-other FAKE_ANSWER=unreachable-landed FAKE_SHOW_STATE=in-progress FAKE_SHOW_BLOCKED="" \
+  FAKE_AUDIT_A=audit-qitem-a-otherdecision.json \
+  -- answer DEMO qitem-a "Use the existing retry helper."
+eq "an unconfirmed landing exits 5, not 0" 5 "$RC"
+in_err "it says no audit row carries the decision" "no audit row on t-demo carries this decision"
+not_in_calls "and it did not re-issue the answer inside the pod" "t-demo-0 -c daemon -- env OPENRIG_SESSION_NAME"
+
+echo "== answer: a row that cannot be read is not a moved row"
+run_dispatch answer-row-unreadable FAKE_ANSWER=unreachable-landed FAKE_SHOW_UNREADABLE=1 \
+  -- answer DEMO qitem-a "Use the existing retry helper."
+eq "an unreadable row exits 5" 5 "$RC"
+in_err "it says the answer is not confirmed" "so the answer is not confirmed"
+in_err "and it says where it could not read" "cannot read qitem-a on t-demo"
+not_in_calls "and nothing was re-issued on the guess" "t-demo-0 -c daemon -- env OPENRIG_SESSION_NAME"
+
+echo "== answer: blocked with no blockedOn is unreadable, not moved"
+run_dispatch answer-blocked-nothing FAKE_ANSWER=hub401 FAKE_SHOW_BLOCKED="" \
+  -- answer DEMO qitem-a "Use the existing retry helper."
+eq "a row parked with no one to wait on exits 5" 5 "$RC"
+in_err "and it says it could not read the row" "cannot read qitem-a on t-demo"
+
+echo "== answer: a moved row after the hub never sent the write"
+run_dispatch answer-moved-unknown-host FAKE_ANSWER=unroutable FAKE_SHOW_STATE=in-progress FAKE_SHOW_BLOCKED="" \
+  FAKE_AUDIT_A=audit-qitem-a-otherdecision.json \
+  -- answer DEMO qitem-a "Use the existing retry helper."
+eq "a row moved by someone else exits 5" 5 "$RC"
+in_err "it names what the hub could not do" "unknown-host"
+in_err "and says the write is not confirmed" "no audit row on t-demo carries this decision"
+not_in_calls "and the answer was not re-issued in the pod" "t-demo-0 -c daemon -- env OPENRIG_SESSION_NAME"
+
+echo "== answer: a failure of the hub itself is not blamed on the team"
+run_dispatch answer-hub-401 FAKE_ANSWER=hub401 -- answer DEMO qitem-a "Use the existing retry helper."
+eq "a hub-local failure falls back rather than dying" 0 "$RC"
+not_in_calls "it did not call that a team refusal" "the team refused it"
+in_err "it read the team's copy before falling back" "reading the team's own copy before falling back"
+in_calls "and it fell back" "t-demo-0 -c daemon -- env OPENRIG_SESSION_NAME=orch-lead@demo-rig rig queue resolve"
+
+echo "== answer: a moved row beside an unexplained hub failure is not called a landing"
+run_dispatch answer-hub-401-moved FAKE_ANSWER=hub401 FAKE_SHOW_STATE=in-progress FAKE_SHOW_BLOCKED="" \
+  FAKE_AUDIT_A=audit-qitem-a-otherdecision.json \
+  -- answer DEMO qitem-a "Use the existing retry helper."
+eq "a moved row that cannot be confirmed exits 5" 5 "$RC"
+in_err "it says it cannot tell whether the write landed" "cannot tell whether that write landed"
+in_err "and names what the hub reported" "unauthorized"
+not_in_calls "and the pod was not asked to resolve again" "t-demo-0 -c daemon -- env OPENRIG_SESSION_NAME"
+
+echo "== answer: a refusal by the team is not a reason to fall back"
+run_dispatch answer-refused FAKE_ANSWER=refused -- answer DEMO qitem-a "Use the existing retry helper."
+eq "a refused answer exits non-zero" 1 "$RC"
+not_in_calls "the team pod was not asked again" "t-demo-0 -c daemon -- env OPENRIG_SESSION_NAME"
+not_in_calls "and the row was not even re-read" "rig queue show qitem-a --json"
+if grep -q "Not falling back" "$WORK/answer-refused.err"; then ok "and it says it is not falling back"
+else bad "and it says it is not falling back (got: $(head -c 200 "$WORK/answer-refused.err"))"; fi
+if grep -q "the team refused it" "$WORK/answer-refused.err"; then ok "and names who refused"
+else bad "and names who refused (got: $(head -c 200 "$WORK/answer-refused.err"))"; fi
+if grep -q "remote-error" "$WORK/answer-refused.err"; then ok "and passes the team's own reason through"
+else bad "and passes the team's own reason through"; fi
+
+echo "== answer: a refusal is still a refusal with kubectl's own line beside it"
+# The shape the live hub gives for a row that is no longer parked: remote-error, and kubectl appends
+# "command terminated with exit code 2" beside the JSON. Classifying that as "the hub could not do it"
+# would re-issue a decision the team already refused.
+run_dispatch answer-refused-closed FAKE_ANSWER=refused-closed -- answer DEMO qitem-a "Use the existing retry helper."
+eq "a 409 refusal exits non-zero" 1 "$RC"
+in_err "it passes the team's own detail through" "qitem_not_leg1_parked"
+if grep -q "the team refused it" "$WORK/answer-refused-closed.err"; then ok "and it names the team as the refuser"
+else bad "and it names the team as the refuser (got: $(head -c 200 "$WORK/answer-refused-closed.err"))"; fi
+not_in_calls "so the row was not re-read to guess" "rig queue show qitem-a --json"
+not_in_calls "and no fallback resolve was issued" "t-demo-0 -c daemon -- env OPENRIG_SESSION_NAME"
 
 echo "== running it again"
 run_archive rerun "$WORK/rerun"

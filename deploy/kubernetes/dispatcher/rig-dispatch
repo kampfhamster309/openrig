@@ -1174,21 +1174,122 @@ cmd_report() {
   echo "  duration = first to last archived event; tokens = sampled cumulative counters, not exact accounting"
 }
 
-# --- collect / answer / delete ---------------------------------------------------------------
+# `kubectl exec` appends "command terminated with exit code N" to its own stderr, and the answer path
+# captures both streams together, so a hub error arrives as one line of JSON plus a line of kubectl
+# noise. Parsing the whole blob with jq fails on the noise, which would make a real refusal look like an
+# unparsable failure. Pick the last line that is a JSON object.
+json_last() { printf '%s\n' "$1" | jq -Rc 'fromjson? | select(type == "object")' 2>/dev/null | tail -1; }
+
+# Did the hub's write actually reach the team? The row's own state cannot say so - anything that unparks
+# a row looks the same. The team's audit rows can: a relayed resolve carries the decision text in
+# `reason` and the hub that forwarded it in auditNotes.openrig_relay.from_host. One page of the same
+# loopback read the archive uses; the newest rows come first, so a resolve this dispatcher just asked
+# for is in it or the write is not confirmed.
+answer_confirmed() { # answer_confirmed <slug> <qitem> <decision>
+  inpod "$1" sh -c '
+    tok=$(cat "${OPENRIG_HOME:-$HOME/.openrig}/terminal-token" 2>/dev/null)
+    curl -fsS -H "Authorization: Bearer $tok" \
+      "http://127.0.0.1:${OPENRIG_PORT:-7433}/api/mission-control/audit?qitem_id=$1&limit=$2"
+  ' sh "$2" "$AUDIT_PAGE" 2>/dev/null |
+    jq -e --arg d "$3" 'any(.rows[]?; .actionVerb == "resolve" and .reason == $d
+      and ((.auditNotes.openrig_relay.from_host // "") != ""))' >/dev/null 2>&1
+}
+
+# Answer a parked ticket's queue item.
+#
+# The hub first, because the hub runs the code that records a human truthfully: forwarded with a hostId,
+# the origin team daemon stores the actor as the human and stamps auditNotes.openrig_relay.from_host with
+# the hub's own host id, so the archive can later say who answered and from where. Resolving inside the
+# team pod instead records the team's lead session as the resolver, which is a seat, and a seat is not who
+# answered.
+#
+# No seat environment is set for the hub call, on purpose. `rig queue resolve` with no seat sends its own
+# seatless human actor in the request body and the team records that at the provenance the CLI itself
+# claims for it. Setting OPENRIG_SESSION_NAME would send a header instead, which the hub treats as
+# transport-proven and the team downgrades to relay:v1 - a strength nothing here verified. Naming an
+# individual human needs the hub's own human registry, which is a later step; until then every answer is
+# recorded as the seatless human actor.
+#
+# The fallback is for the hub being unable to answer, never for the team refusing. A write the team itself
+# rejected comes back as remote_action_failed with failureClass remote-error, and re-issuing that inside the
+# pod would bury the team's reason under a seat's name. Every other failure means the hub could not do it -
+# and three of them (a request timeout, a body that timed out after the headers arrived, a network failure
+# the forwarder itself calls indeterminate) can happen after the team already took the write, so the row is
+# read in the pod first, and the team's own audit rows decide whether the hub's write is confirmed.
 
 cmd_answer() {
   [ $# -ge 3 ] || usage
-  local slug sts rig lead session
-  slug=$(slug_of "$1")
-  sts=$(sts_json "$slug") || die "$1 has no team"
+  local ticket=$1 qitem=$2; shift 2
+  local decision="$*"
+  local slug host out rc fc err body row state blocked
+  slug=$(slug_of "$ticket")
+  # The same id `start` registered, never a guess.
+  host=$(name_of "$slug")
+
+  if ! hub_ready; then
+    log "answer: no Ready hub pod $HUB_POD, so this cannot be recorded as a human answer; falling back to the team pod"
+  elif ! hub_registry has "$host" >/dev/null 2>&1; then
+    log "answer: team host $host is not registered on $HUB_POD, so the hub cannot forward to it; falling back to the team pod"
+  else
+    rc=0
+    out=$(hub_exec env -u OPENRIG_SESSION_NAME -u RIGGED_SESSION_NAME rig queue resolve --host "$host" \
+      "$qitem" --decision "$decision" --json 2>&1) || rc=$?
+    if [ "$rc" = 0 ]; then
+      log "answer: resolved on $host through $HUB_POD as the seatless human, so the audit row names the human and the origin host"
+      printf '%s\n' "$out"
+      return 0
+    fi
+    body=$(json_last "$out")
+    fc=$(printf '%s' "$body" | jq -r '.failureClass // empty' 2>/dev/null || true)
+    err=$(printf '%s' "$body" | jq -r '.error // empty' 2>/dev/null || true)
+    if [ "$err" = "remote_action_failed" ] && [ "$fc" = "remote-error" ]; then
+      printf '%s\n' "$out" >&2
+      die "answer: $HUB_POD delivered the answer to $host and the team refused it (exit $rc). Not falling back: resolving it inside the pod would only bury the team's own reason."
+    fi
+    log "answer: $HUB_POD could not record the answer${fc:+ ($fc)}; reading the team's own copy before falling back"
+    row=$(inpod "$slug" rig queue show "$qitem" --json 2>/dev/null || true)
+    state=$(printf '%s' "$row" | jq -r '.state // empty' 2>/dev/null || true)
+    blocked=$(printf '%s' "$row" | jq -r '.blockedOn // empty' 2>/dev/null || true)
+    if [ -z "$row" ] || [ -z "$state" ] || { [ "$state" = "blocked" ] && [ -z "$blocked" ]; }; then
+      # Nothing was learned about the row. A pod that cannot be read is also the usual cause of an
+      # `unreachable` hub failure, so this is exactly where claiming a landing would be wrong.
+      printf '%s\n' "$out" >&2
+      log "answer: cannot read $qitem on $host, so the answer is not confirmed; the hub reported ${err:-an error}${fc:+/$fc}. Check the team pod before answering again."
+      return 5
+    fi
+    if [ "$state" != "blocked" ]; then
+      # The row is not parked, which is not the same as the human's answer having been recorded. The
+      # team's audit rows decide it; a row moved by anything else is not a landing.
+      if answer_confirmed "$slug" "$qitem" "$decision"; then
+        log "answer: the hub's answer landed on $host; its audit row carries the decision from $HUB_POD, so nothing is re-issued"
+        printf '%s\n' "$out"
+        return 0
+      fi
+      printf '%s\n' "$out" >&2
+      case "$fc" in
+        unreachable)
+          log "answer: $qitem is now '${state}' and not parked on a human, but no audit row on $host carries this decision, so the hub's write is not confirmed (it reported ${fc})" ;;
+        *)
+          log "answer: $qitem is now '${state}' and not parked on a human, but no audit row on $host carries this decision; $HUB_POD reported ${err:-an error}${fc:+/$fc} and this dispatcher cannot tell whether that write landed" ;;
+      esac
+      return 5
+    fi
+    log "answer: $qitem is still blocked on $blocked, so the hub's write never reached it; falling back to the team pod"
+  fi
+
+  # The old path, kept for the cases above. It records the team's lead as the resolver because a bare
+  # exec shell has no human identity to offer the team's own daemon.
+  local sts rig lead session
+  sts=$(sts_json "$slug") || die "$ticket has no team"
   rig=$(annotation "$sts" rig)
   lead=$(annotation "$sts" lead || true); [ -n "$lead" ] || lead=orch.lead
-  # `rig queue resolve` takes its actor from the seat env (X-OpenRig-Session), and a bare
-  # `kubectl exec` shell has none, so name the ticket's lead explicitly. --actor is ignored.
   session=$(lead_session "$slug" "$rig" "$lead")
   [ -n "$session" ] || die "no seat '$lead' in rig $rig; cannot answer as a seat"
-  inpod "$slug" env OPENRIG_SESSION_NAME="$session" rig queue resolve "$2" --decision "${*:3}" --json
+  log "answer: resolving inside the team pod as $session; the audit row will name that seat, not the human"
+  inpod "$slug" env OPENRIG_SESSION_NAME="$session" rig queue resolve "$qitem" --decision "$decision" --json
 }
+
+# --- collect / answer / delete ---------------------------------------------------------------
 
 cmd_delete() {
   local ticket="" force=0 dir=""
