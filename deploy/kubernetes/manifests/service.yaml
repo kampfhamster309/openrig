@@ -1,0 +1,13 @@
+# Headless: each pod gets a stable name, rig-N.rig.openrig.svc. Cluster-internal only; reach it
+# from outside with `kubectl port-forward`, never a public LoadBalancer or Ingress.
+apiVersion: v1
+kind: Service
+metadata:
+  name: rig
+spec:
+  clusterIP: None
+  selector:
+    app: openrig-host
+  ports:
+    - name: daemon
+      port: 7433

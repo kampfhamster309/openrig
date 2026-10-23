@@ -1,0 +1,110 @@
+# One replica is one OpenRig host: daemon, tmux and every seat of its rigs share the container.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: rig
+spec:
+  serviceName: rig
+  replicas: 1
+  selector:
+    matchLabels:
+      app: openrig-host
+  template:
+    metadata:
+      labels:
+        app: openrig-host
+    spec:
+      # Agents need no Kubernetes API access.
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      imagePullSecrets:
+        - name: ghcr-pull
+      terminationGracePeriodSeconds: 60
+      containers:
+        - name: daemon
+          image: openrig-host
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+          ports:
+            - name: daemon
+              containerPort: 7433
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            # Seeds the daemon's self-host id on first boot; the id then lives in the volume.
+            - name: OPENRIG_HOST_NAME
+              value: "$(POD_NAME)"
+            - name: OPENRIG_BIND_HOST
+              value: "0.0.0.0"
+            - name: OPENRIG_PORT
+              value: "7433"
+            # The kernel rig wants its own model login; this host runs only the rigs sent to it.
+            - name: OPENRIG_NO_KERNEL
+              value: "1"
+            # A bind that is neither loopback nor Tailscale refuses to start without this.
+            - name: OPENRIG_AUTH_BEARER_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: openrig-daemon
+                  key: bearer
+            - name: CLAUDE_CODE_OAUTH_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: openrig-agents
+                  key: CLAUDE_CODE_OAUTH_TOKEN
+            # Provider env reaches seats only when named here.
+            - name: OPENRIG_RECOVERY_PROVIDER_AUTH_ENV_ALLOWLIST
+              value: CLAUDE_CODE_OAUTH_TOKEN
+            - name: OPENRIG_PI_SEATS
+              value: dev-build@claude-pi-k8s
+            - name: OPENRIG_WORKSPACE_REPO
+              value: https://github.com/kampfhamster309/openrig.git
+            - name: GIT_USER_NAME
+              value: OpenRig agents (rig-0)
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: daemon
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 500m
+              memory: 2Gi
+            limits:
+              memory: 8Gi
+          volumeMounts:
+            - name: home
+              mountPath: /home/openrig
+            - name: kit
+              mountPath: /etc/openrig-kit
+              readOnly: true
+      volumes:
+        - name: kit
+          configMap:
+            name: openrig-kit
+            defaultMode: 0444
+            items:
+              - { key: rig.yaml, path: rig.yaml }
+              - { key: lead-monitoring.md, path: guidance/lead-monitoring.md }
+              - { key: pi-seat-status, path: bin/pi-seat-status, mode: 0555 }
+              - { key: openrig-heartbeat.ts, path: pi-extensions/openrig-heartbeat.ts }
+              - { key: models.json, path: pi/models.json }
+  volumeClaimTemplates:
+    - metadata:
+        name: home
+      spec:
+        accessModes: [ReadWriteOnce]
+        storageClassName: local-path
+        resources:
+          requests:
+            storage: 20Gi

@@ -1,0 +1,450 @@
+#!/usr/bin/env bash
+# rig-dispatch: one OpenRig team pod per ticket (stage 1 of docs/proposals/factory-on-kubernetes.md).
+#
+#   rig-dispatch start   <ticket> --repo <url> --brief-file <file> [options]
+#   rig-dispatch status  [<ticket>] [--json]
+#   rig-dispatch wait    <ticket> [--timeout <seconds>] [--stall <minutes>]
+#   rig-dispatch collect <ticket> [--archive <dir>] [--into <local git repo>]
+#   rig-dispatch answer  <ticket> <qitem> <decision text>
+#   rig-dispatch delete  <ticket>
+#
+# State lives in Kubernetes labels and annotations and in the team pod, so every command can be
+# run again. The dispatcher reaches team pods only through `kubectl exec`; inside the pod, `rig`
+# talks to its own daemon over loopback.
+#
+# Environment: KUBECONFIG, KUBECTL (default kubectl), RIG_DISPATCH_NAMESPACE (default openrig),
+# RIG_DISPATCH_IMAGE (default: the image pinned in ../kustomization.yaml).
+set -euo pipefail
+
+HERE="$(cd "$(dirname "$0")" && pwd)"
+NS="${RIG_DISPATCH_NAMESPACE:-openrig}"
+KUBECTL="${KUBECTL:-kubectl}"
+WORK=/home/openrig/work
+RESULT="$WORK/result.json"
+ANN=openrig.dev
+
+die() { echo "rig-dispatch: $*" >&2; exit 1; }
+log() { echo "[rig-dispatch] $*" >&2; }
+k() { "$KUBECTL" -n "$NS" "$@"; }
+need() { command -v "$1" >/dev/null || die "$1 is required"; }
+need jq; need "$KUBECTL"
+
+usage() { sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
+
+# PROJ-123 -> proj-123: a DNS label that is also a valid OpenRig host id (no dots).
+slug_of() {
+  local s
+  s=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9-]+/-/g; s/^-+//; s/-+$//' | cut -c1-40)
+  s=${s%-}
+  [ -n "$s" ] || die "ticket '$1' gives an empty name"
+  printf '%s' "$s"
+}
+
+name_of() { printf 't-%s' "$1"; }
+pod_of() { printf 't-%s-0' "$1"; }
+inpod() { local slug=$1; shift; k exec -i "$(pod_of "$slug")" -c daemon -- "$@"; }
+sts_json() { k get statefulset "$(name_of "$1")" -o json 2>/dev/null; }
+annotation() { jq -r --arg k "$ANN/$2" '.metadata.annotations[$k] // empty' <<<"$1"; }
+annotate() { k annotate --overwrite statefulset "$(name_of "$1")" "$ANN/$2=$3" >/dev/null; }
+
+default_image() {
+  local kz="$HERE/../kustomization.yaml"
+  [ -f "$kz" ] || die "set RIG_DISPATCH_IMAGE"
+  awk '/newName:/{n=$2} /newTag:/{t=$2} END{if(n&&t) print n":"t}' "$kz"
+}
+
+# --- start -------------------------------------------------------------------------------------
+
+team_manifests() {
+  # args: slug ticket repo ref spec image cpu memory storage envjson bearer
+  jq -n --arg slug "$1" --arg ticket "$2" --arg repo "$3" --arg ref "$4" --arg spec "$5" \
+    --arg image "$6" --arg cpu "$7" --arg mem "$8" --arg storage "$9" --argjson extra "${10}" \
+    --arg bearer "${11}" --arg ann "$ANN" '
+    ($slug | "t-" + .) as $name |
+    {app: "openrig-team", ($ann + "/role"): "team", ($ann + "/ticket"): $slug} as $labels |
+    {apiVersion: "v1", kind: "List", items: [
+      {apiVersion: "v1", kind: "Secret", type: "Opaque",
+       metadata: {name: $name, labels: $labels},
+       stringData: {bearer: $bearer}},
+      {apiVersion: "apps/v1", kind: "StatefulSet",
+       metadata: {name: $name, labels: $labels,
+         annotations: {($ann + "/ticket-key"): $ticket, ($ann + "/repo"): $repo, ($ann + "/ref"): $ref,
+                       ($ann + "/spec"): $spec}},
+       spec: {
+         serviceName: "teams", replicas: 1,
+         selector: {matchLabels: {($ann + "/ticket"): $slug}},
+         persistentVolumeClaimRetentionPolicy: {whenDeleted: "Delete", whenScaled: "Retain"},
+         template: {
+           metadata: {labels: $labels},
+           spec: {
+             automountServiceAccountToken: false,
+             securityContext: {runAsNonRoot: true, runAsUser: 1000, runAsGroup: 1000, fsGroup: 1000,
+                               seccompProfile: {type: "RuntimeDefault"}},
+             imagePullSecrets: [{name: "ghcr-pull"}],
+             terminationGracePeriodSeconds: 60,
+             containers: [{
+               name: "daemon", image: $image,
+               securityContext: {allowPrivilegeEscalation: false, capabilities: {drop: ["ALL"]}},
+               ports: [{name: "daemon", containerPort: 7433}],
+               env: ([
+                 {name: "OPENRIG_HOST_NAME", value: $name},
+                 {name: "OPENRIG_BIND_HOST", value: "0.0.0.0"},
+                 {name: "OPENRIG_PORT", value: "7433"},
+                 {name: "OPENRIG_NO_KERNEL", value: "1"},
+                 {name: "OPENRIG_AUTH_BEARER_TOKEN",
+                  valueFrom: {secretKeyRef: {name: $name, key: "bearer"}}},
+                 {name: "OPENRIG_WORKSPACE_REPO", value: $repo},
+                 {name: "GIT_USER_NAME", value: ("OpenRig team " + $name)}
+               ]
+               + (if $ref == "" then [] else [{name: "OPENRIG_WORKSPACE_REF", value: $ref}] end)
+               + $extra),
+               envFrom: [{secretRef: {name: "openrig-agents"}}],
+               readinessProbe: {httpGet: {path: "/healthz", port: "daemon"}, periodSeconds: 10},
+               resources: {requests: {cpu: $cpu, memory: $mem}, limits: {memory: $mem}},
+               volumeMounts: [{name: "home", mountPath: "/home/openrig"},
+                              {name: "kit", mountPath: "/etc/openrig-kit", readOnly: true}]
+             }],
+             volumes: [{name: "kit", configMap: {name: "openrig-kit", defaultMode: 292,
+               items: [
+                 {key: "rig.yaml", path: "rig.yaml"},
+                 {key: "lead-monitoring.md", path: "guidance/lead-monitoring.md"},
+                 {key: "pi-seat-status", path: "bin/pi-seat-status", mode: 365},
+                 {key: "openrig-heartbeat.ts", path: "pi-extensions/openrig-heartbeat.ts"},
+                 {key: "models.json", path: "pi/models.json"}]}}]
+           }
+         },
+         volumeClaimTemplates: [{metadata: {name: "home"},
+           spec: {accessModes: ["ReadWriteOnce"], resources: {requests: {storage: $storage}}}}]
+       }}
+    ]}'
+}
+
+# KEY=VALUE lines -> a JSON env array. Values are taken verbatim.
+env_json() {
+  local out='[]' line
+  for line in "$@"; do
+    [[ "$line" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]] || die "bad --env '$line' (want NAME=VALUE)"
+    out=$(jq -c --arg n "${line%%=*}" --arg v "${line#*=}" '. + [{name: $n, value: $v}]' <<<"$out")
+  done
+  printf '%s' "$out"
+}
+
+wait_ready() {
+  local slug=$1 timeout=$2 pod deadline
+  pod=$(pod_of "$slug"); deadline=$((SECONDS + timeout))
+  until k get pod "$pod" >/dev/null 2>&1; do
+    [ $SECONDS -lt $deadline ] || die "$pod was not created within ${timeout}s"
+    sleep 2
+  done
+  log "waiting for $pod to be Ready"
+  k wait --for=condition=Ready "pod/$pod" --timeout="$((deadline - SECONDS > 1 ? deadline - SECONDS : 1))s" >/dev/null \
+    || die "$pod is not Ready; inspect it with: $KUBECTL -n $NS describe pod $pod"
+}
+
+# Brings the team's rig up, or back after a pod restart. Records the rig name on the StatefulSet.
+ensure_rig() {
+  local slug=$1 sts rig spec nodes out
+  sts=$(sts_json "$slug"); rig=$(annotation "$sts" rig); spec=$(annotation "$sts" spec)
+  if [ -z "$rig" ]; then
+    log "rig up $spec"
+    out=$(inpod "$slug" rig up "$spec" --yes --json) || die "rig up failed: $out"
+    rig=$(jq -r '[.. | objects | .specName? // empty] | first // empty' <<<"$out")
+    [ -n "$rig" ] || die "rig up gave no rig name: $(head -c 400 <<<"$out")"
+    annotate "$slug" rig "$rig"
+    return
+  fi
+  nodes=$(inpod "$slug" rig ps --nodes --rig "$rig" --json 2>/dev/null || echo '[]')
+  if ! jq -e 'length > 0 and all(.[]; .sessionStatus == "running")' >/dev/null <<<"$nodes"; then
+    log "restoring rig $rig"
+    inpod "$slug" rig up "$rig" --existing --yes --json >/dev/null || die "restoring $rig failed"
+  fi
+}
+
+lead_session() {
+  local slug=$1 rig=$2 lead=$3
+  inpod "$slug" rig ps --nodes --rig "$rig" --json |
+    jq -r --arg l "$lead" '.[] | select(.logicalId == $l) | .canonicalSessionName' | head -1
+}
+
+brief_with_contract() {
+  local slug=$1 file=$2
+  cat "$file"
+  cat <<EOF
+
+
+---
+Completion contract (from the dispatcher; follow it exactly):
+
+1. Work in /home/openrig/work/project. Commit the change on branch ticket/$slug.
+2. The change is complete only after your reviewer has approved it.
+3. Then write $RESULT as JSON:
+   {"status": "done" | "failed" | "needs-human", "branch": "ticket/$slug", "commit": "<sha>", "summary": "<what changed and how it was verified>"}
+   Use "needs-human" when you need a decision; ask for it on the queue, and overwrite the file once you continue.
+4. Close your queue items. Do not push; this pod has no Git credentials.
+EOF
+}
+
+cmd_start() {
+  local ticket="" repo="" ref="" spec=/etc/openrig-kit/rig.yaml brief="" image="${RIG_DISPATCH_IMAGE:-}"
+  local cpu=500m mem=4Gi storage=20Gi lead=orch.lead ready_timeout=600
+  local -a envs=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --repo) repo=$2; shift 2 ;;
+      --ref) ref=$2; shift 2 ;;
+      --spec) spec=$2; shift 2 ;;
+      --brief-file) brief=$2; shift 2 ;;
+      --image) image=$2; shift 2 ;;
+      --env) envs+=("$2"); shift 2 ;;
+      --cpu) cpu=$2; shift 2 ;;
+      --memory) mem=$2; shift 2 ;;
+      --storage) storage=$2; shift 2 ;;
+      --lead) lead=$2; shift 2 ;;
+      --ready-timeout) ready_timeout=$2; shift 2 ;;
+      -*) die "unknown option $1" ;;
+      *) [ -z "$ticket" ] || die "one ticket at a time"; ticket=$1; shift ;;
+    esac
+  done
+  [ -n "$ticket" ] || usage
+  local slug sts
+  slug=$(slug_of "$ticket")
+  sts=$(sts_json "$slug" || true)
+
+  if [ -z "$sts" ]; then
+    [ -n "$repo" ] || die "--repo is required for a new ticket"
+    [ -n "$brief" ] && [ -f "$brief" ] || die "--brief-file is required for a new ticket"
+    [ -n "$image" ] || image=$(default_image)
+    # Site defaults for the kit's rigs, e.g. which seats need Pi seeding.
+    if [ -f "$HERE/team.env" ]; then
+      while IFS= read -r line; do
+        [[ -z "$line" || "$line" == \#* ]] || envs=("$line" "${envs[@]}")
+      done < "$HERE/team.env"
+    fi
+    local bearer
+    bearer=$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')
+    log "creating $(name_of "$slug") for $ticket ($image)"
+    team_manifests "$slug" "$ticket" "$repo" "$ref" "$spec" "$image" "$cpu" "$mem" "$storage" \
+      "$(env_json "${envs[@]}")" "$bearer" | k apply -f - >/dev/null
+    unset bearer
+  else
+    log "$(name_of "$slug") exists; resuming"
+  fi
+
+  wait_ready "$slug" "$ready_timeout"
+  ensure_rig "$slug"
+
+  sts=$(sts_json "$slug")
+  if [ -z "$(annotation "$sts" qitem)" ]; then
+    [ -n "$brief" ] && [ -f "$brief" ] || die "--brief-file is required to hand over the ticket"
+    local rig session qitem
+    rig=$(annotation "$sts" rig)
+    session=$(lead_session "$slug" "$rig" "$lead")
+    [ -n "$session" ] || die "no seat '$lead' in rig $rig (use --lead <logicalId>)"
+    brief_with_contract "$slug" "$brief" | inpod "$slug" sh -c "cat > $WORK/brief.md"
+    qitem=$(inpod "$slug" rig queue create --source "dispatcher@$NS" --destination "$session" \
+      --tags "ticket:$slug" --summary "$(annotation "$sts" ticket-key): $(head -n1 "$brief" | sed 's/^#* *//' | cut -c1-100)" \
+      --body-file "$WORK/brief.md" --json | jq -r '.qitemId // .qitem.qitemId // empty')
+    [ -n "$qitem" ] || die "queue create returned no qitem id"
+    annotate "$slug" qitem "$qitem"
+    annotate "$slug" lead "$lead"
+    log "handed $ticket to $session as $qitem"
+  fi
+  cmd_status "$ticket"
+}
+
+# --- status / wait ---------------------------------------------------------------------------
+
+# One JSON object describing a ticket, read from the cluster and the pod.
+probe() {
+  local slug=$1 sts pod ready rig nodes items result
+  sts=$(sts_json "$slug") || { jq -n --arg s "$slug" '{slug: $s, phase: "absent"}'; return; }
+  pod=$(k get pod "$(pod_of "$slug")" -o json 2>/dev/null || echo '{}')
+  ready=$(jq -r '[.status.conditions[]? | select(.type == "Ready") | .status] | first // "False"' <<<"$pod")
+  rig=$(annotation "$sts" rig)
+  nodes='[]' items='[]' result='null'
+  if [ "$ready" = True ]; then
+    [ -z "$rig" ] || nodes=$(inpod "$slug" rig ps --nodes --rig "$rig" --json 2>/dev/null || echo '[]')
+    items=$(inpod "$slug" rig queue list -a -A -o json --limit 500 2>/dev/null |
+      jq -c --arg t "ticket:$slug" '[.[] | select((.tags // []) | index($t))]' 2>/dev/null || echo '[]')
+    result=$(inpod "$slug" sh -c "cat $RESULT 2>/dev/null; true" | jq -c . 2>/dev/null || echo 'null')
+    [ -n "$result" ] || result=null
+  fi
+  jq -n --arg slug "$slug" --argjson sts "$sts" --argjson pod "$pod" --arg ready "$ready" \
+    --arg rig "$rig" --argjson nodes "$nodes" --argjson items "$items" --argjson result "$result" --arg ann "$ANN" '
+    {slug: $slug, ticket: $sts.metadata.annotations[$ann + "/ticket-key"], rig: $rig,
+     qitem: $sts.metadata.annotations[$ann + "/qitem"], created: $sts.metadata.creationTimestamp,
+     pod: ($pod.status.phase // "None"), ready: ($ready == "True"),
+     seats: [$nodes[] | {seat: .logicalId, session: .canonicalSessionName, status: .sessionStatus,
+                         activity: (.agentActivity.state // "unknown")}],
+     open: [$items[] | select(.state as $s | ["pending", "in-progress", "blocked"] | index($s)) |
+            {qitemId, state, destination: .destinationSession}],
+     result: $result}
+    | .phase = (if .result != null then "result:" + (.result.status // "?")
+                elif .ready | not then "starting"
+                elif .rig == "" then "ready"
+                elif .qitem == null then "up"
+                elif ([.seats[] | select(.status != "running")] | length) > 0 then "degraded"
+                elif ([.open[] | select(.state == "blocked")] | length) > 0 then "blocked"
+                else "working" end)'
+}
+
+team_slugs() {
+  k get statefulsets -l "$ANN/role=team" -o json | jq -r --arg a "$ANN/ticket" '.items[].metadata.labels[$a]'
+}
+
+cmd_status() {
+  local json=0 ticket="" slug
+  while [ $# -gt 0 ]; do
+    case "$1" in --json) json=1; shift ;; -*) die "unknown option $1" ;; *) ticket=$1; shift ;; esac
+  done
+  local -a slugs
+  if [ -n "$ticket" ]; then slugs=("$(slug_of "$ticket")"); else mapfile -t slugs < <(team_slugs); fi
+  local all='[]'
+  for slug in "${slugs[@]}"; do
+    [ -n "$slug" ] || continue
+    all=$(jq -c --argjson p "$(probe "$slug")" '. + [$p]' <<<"$all")
+  done
+  if [ $json = 1 ]; then jq . <<<"$all"; return; fi
+  jq -r '
+    (["TICKET", "PHASE", "SEATS", "OPEN", "CREATED", "SUMMARY"] | @tsv),
+    (.[] | [(.ticket // .slug), .phase,
+            ([.seats[] | "\(.seat)=\(.activity)"] | join(",") | if . == "" then "-" else . end),
+            (.open | length | tostring), (.created // "-"),
+            ((.result.summary // "") | .[0:60])] | @tsv)' <<<"$all" | column -t -s $'\t'
+}
+
+# What changes while a team makes progress: its queue items and its workspace.
+progress_fingerprint() {
+  local slug=$1 p=$2
+  { jq -c '[.open[] | [.qitemId, .state, .destination]]' <<<"$p"
+    inpod "$slug" sh -c "cd $WORK/project && git rev-parse HEAD && git status --porcelain && git diff | md5sum" 2>/dev/null
+  } | md5sum | cut -d' ' -f1
+}
+
+# A seat can sit in a dead loop while its lead idles, and nothing inside the team notices (an idle
+# agent does not wake up to check on others). After --stall minutes without progress, nudge the lead.
+nudge_lead() {
+  local slug=$1 minutes=$2 sts session
+  sts=$(sts_json "$slug")
+  session=$(lead_session "$slug" "$(annotation "$sts" rig)" "$(annotation "$sts" lead || true)")
+  [ -n "$session" ] || session=$(lead_session "$slug" "$(annotation "$sts" rig)" orch.lead)
+  [ -n "$session" ] || { log "no lead seat to nudge"; return; }
+  inpod "$slug" rig send "$session" "From the dispatcher: no progress on this ticket for $minutes minutes (queue items, HEAD and working tree unchanged). Check every seat now: is one stuck in a loop, waiting on something that already finished, or waiting for a decision? Unblock it, or write $RESULT with status needs-human and the question." >/dev/null 2>&1 \
+    && log "nudged $session after $minutes minutes without progress" || log "could not nudge $session"
+}
+
+cmd_wait() {
+  local ticket="" timeout=7200 interval=30 stall=20
+  while [ $# -gt 0 ]; do
+    case "$1" in --timeout) timeout=$2; shift 2 ;; --interval) interval=$2; shift 2 ;;
+      --stall) stall=$2; shift 2 ;;
+      -*) die "unknown option $1" ;; *) ticket=$1; shift ;; esac
+  done
+  [ -n "$ticket" ] || usage
+  local slug deadline p phase last="" fp prev_fp="" since=$SECONDS
+  slug=$(slug_of "$ticket"); deadline=$((SECONDS + timeout))
+  while :; do
+    p=$(probe "$slug"); phase=$(jq -r .phase <<<"$p")
+    [ "$phase" = "$last" ] || log "$ticket: $phase"; last=$phase
+    case "$phase" in
+      absent) die "$ticket has no team" ;;
+      result:done) jq .result <<<"$p"; return 0 ;;
+      result:needs-human) jq .result <<<"$p"; return 3 ;;
+      result:*) jq .result <<<"$p"; return 1 ;;
+      degraded) ensure_rig "$slug" ;;
+      working|blocked)
+        fp=$(progress_fingerprint "$slug" "$p")
+        if [ "$fp" != "$prev_fp" ]; then prev_fp=$fp; since=$SECONDS
+        elif [ $((SECONDS - since)) -ge $((stall * 60)) ]; then
+          nudge_lead "$slug" "$(((SECONDS - since) / 60))"; since=$SECONDS
+        fi ;;
+    esac
+    [ $SECONDS -lt $deadline ] || { log "timed out after ${timeout}s"; return 4; }
+    sleep "$interval"
+  done
+}
+
+# --- collect / answer / delete ---------------------------------------------------------------
+
+cmd_collect() {
+  local ticket="" archive="" into=""
+  while [ $# -gt 0 ]; do
+    case "$1" in --archive) archive=$2; shift 2 ;; --into) into=$2; shift 2 ;;
+      -*) die "unknown option $1" ;; *) ticket=$1; shift ;; esac
+  done
+  [ -n "$ticket" ] || usage
+  local slug p rig branch dir seat
+  slug=$(slug_of "$ticket"); p=$(probe "$slug")
+  jq -e '.ready' >/dev/null <<<"$p" || die "$ticket: the team pod is not Ready"
+  dir=${archive:-./tickets}/$slug; mkdir -p "$dir"
+  rig=$(jq -r .rig <<<"$p")
+
+  jq . <<<"$p" > "$dir/status.json"
+  inpod "$slug" rig queue list -a -A -o json --full --limit 500 |
+    jq --arg t "ticket:$slug" '[.[] | select((.tags // []) | index($t))]' > "$dir/queue.json"
+  inpod "$slug" rig ps --nodes --rig "$rig" --json > "$dir/nodes.json"
+  for seat in $(jq -r '.seats[].session' <<<"$p"); do
+    inpod "$slug" rig usage series --seat "$seat" --json > "$dir/usage-$seat.json" 2>/dev/null || true
+  done
+  inpod "$slug" rig usage top --json > "$dir/usage-top.json" 2>/dev/null || true
+
+  branch=$(jq -r '.result.branch // empty' <<<"$p")
+  if [ -n "$branch" ]; then
+    # Only the commits the remote does not have; the receiving clone has the rest.
+    inpod "$slug" git -C "$WORK/project" bundle create - "$branch" --not --remotes > "$dir/result.bundle" \
+      || die "could not bundle branch $branch"
+    if [ -n "$into" ]; then
+      git -C "$into" fetch --quiet "$(realpath "$dir/result.bundle")" "$branch:refs/tickets/$slug"
+      log "fetched $branch into $into as refs/tickets/$slug"
+    fi
+  else
+    log "no result branch yet; archived status only"
+  fi
+  log "archived $ticket in $dir"
+}
+
+cmd_answer() {
+  [ $# -ge 3 ] || usage
+  local slug sts rig lead session
+  slug=$(slug_of "$1")
+  sts=$(sts_json "$slug") || die "$1 has no team"
+  rig=$(annotation "$sts" rig)
+  lead=$(annotation "$sts" lead || true); [ -n "$lead" ] || lead=orch.lead
+  # `rig queue resolve` takes its actor from the seat env (X-OpenRig-Session), and a bare
+  # `kubectl exec` shell has none, so name the ticket's lead explicitly. --actor is ignored.
+  session=$(lead_session "$slug" "$rig" "$lead")
+  [ -n "$session" ] || die "no seat '$lead' in rig $rig; cannot answer as a seat"
+  inpod "$slug" env OPENRIG_SESSION_NAME="$session" rig queue resolve "$2" --decision "${*:3}" --json
+}
+
+cmd_delete() {
+  [ $# -eq 1 ] || usage
+  local slug sts rig name
+  slug=$(slug_of "$1"); name=$(name_of "$slug")
+  sts=$(sts_json "$slug" || true)
+  if [ -n "$sts" ]; then
+    rig=$(annotation "$sts" rig)
+    if [ -n "$rig" ] && k get pod "$(pod_of "$slug")" >/dev/null 2>&1; then
+      inpod "$slug" rig down "$rig" >/dev/null 2>&1 || log "rig down failed; deleting anyway"
+    fi
+    k delete statefulset "$name" --wait=true >/dev/null
+  fi
+  k delete secret "$name" --ignore-not-found >/dev/null
+  # whenDeleted: Delete removes the volume; this covers a StatefulSet deleted by other means.
+  k delete pvc -l "$ANN/ticket=$slug" --ignore-not-found >/dev/null
+  k delete pvc "home-$name-0" --ignore-not-found >/dev/null
+  log "deleted $name"
+}
+
+[ $# -ge 1 ] || usage
+cmd=$1; shift
+case "$cmd" in
+  start) cmd_start "$@" ;;
+  status|ls) cmd_status "$@" ;;
+  wait) cmd_wait "$@" ;;
+  collect) cmd_collect "$@" ;;
+  answer) cmd_answer "$@" ;;
+  delete|rm) cmd_delete "$@" ;;
+  -h|--help|help) usage ;;
+  *) die "unknown command $cmd" ;;
+esac
