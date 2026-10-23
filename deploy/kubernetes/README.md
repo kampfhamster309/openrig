@@ -17,9 +17,10 @@ OpenAI-compatible model, and a Claude Code reviewer.
 | `build-image.sh` | Builds the image (`--push` to push). Prints the tag, `<version>-<commit>`. |
 | `create-secrets.sh` | Creates the three Secrets, prompting for each token. |
 | `dispatcher/` | `rig-dispatch`: one team pod per ticket (see below), and `team.env`, the env every team pod gets. |
-| `manifests/` | Namespace, headless Service, StatefulSet with a 20Gi volume for `/home/openrig`, NetworkPolicy. |
+| `manifests/` | Shared objects: namespace, the `teams` Service the team pods join, NetworkPolicy. |
+| `single-host/` | Optional: one long-lived host, pod `rig-0` (StatefulSet with a 20Gi volume, Service). |
 | `kit/` | Mounted read-only at `/etc/openrig-kit` from a ConfigMap: the rig spec, the lead's guidance, `pi-seat-status`, the Pi heartbeat extension and the Pi `models.json`. |
-| `kustomization.yaml` | Ties it together; pins the image tag. |
+| `kustomization.yaml` | The shared objects and the kit ConfigMap; pins the image tag new team pods get. |
 
 ## Deploy
 
@@ -28,7 +29,8 @@ export KUBECONFIG=...                       # the cluster
 deploy/kubernetes/build-image.sh --push     # after `docker login ghcr.io`; set the printed tag in kustomization.yaml
 kubectl apply -f deploy/kubernetes/manifests/namespace.yaml
 deploy/kubernetes/create-secrets.sh         # GHCR read token, Claude token from `claude setup-token`
-kubectl apply -k deploy/kubernetes
+kubectl apply -k deploy/kubernetes          # shared objects; team pods then come from the dispatcher
+kubectl apply -k deploy/kubernetes/single-host   # optional: one long-lived host, rig-0
 kubectl -n openrig rollout status statefulset/rig
 ```
 
@@ -36,11 +38,11 @@ The Secrets:
 
 | Secret | Key | Used for |
 |---|---|---|
-| `openrig-daemon` | `bearer` | `OPENRIG_AUTH_BEARER_TOKEN`. The script generates it into `~/.config/openrig/rig-0.bearer`. |
-| `openrig-agents` | `CLAUDE_CODE_OAUTH_TOKEN` | Claude Code seats. Named in `OPENRIG_RECOVERY_PROVIDER_AUTH_ENV_ALLOWLIST`, or it never reaches them. |
+| `openrig-daemon` | `bearer` | `OPENRIG_AUTH_BEARER_TOKEN` of the single host. The script generates it into `~/.config/openrig/rig-0.bearer`. Team pods get their own, from the dispatcher. |
+| `openrig-agents` | `CLAUDE_CODE_OAUTH_TOKEN` | Claude Code seats, in every pod. Named in `OPENRIG_RECOVERY_PROVIDER_AUTH_ENV_ALLOWLIST`, or it never reaches them. |
 | `ghcr-pull` | | Pulling the private image. |
 
-## Connect and run the rig
+## Connect to the single host and run a rig
 
 The Service is cluster-internal. Reach it with a port-forward, and register the pod once:
 
