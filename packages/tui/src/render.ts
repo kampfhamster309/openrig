@@ -153,8 +153,13 @@ function operationalState(status: string, motion: MotionCtx): { mark: string; wo
   return { mark: "?", word: "unknown" };
 }
 
-function queueFacts(snap: FleetSnapshot, session: string | null | undefined): { count: number; work: string; now: string } {
+function queueFacts(snap: FleetSnapshot, session: string | null | undefined, remote = false): { count: number; work: string; now: string } {
   if (!session) return { count: 0, work: "—", now: "—" };
+  // A REMOTE seat's queue lives on its own daemon. These four lists are LOCAL reads, so
+  // joining them on a bare session name would paste a local seat's rows onto a remote
+  // one the moment both exist. No read here gives a remote seat's queue per seat, so the
+  // cell says so rather than guessing.
+  if (remote) return { count: 0, work: "remote", now: "queue not served here" };
   const sources: Array<["needs you" | "blocked" | "working" | "queued", FleetSnapshot["attention"]]> = [
     ["needs you", snap.attention], ["blocked", snap.blocked], ["working", snap.inProgress], ["queued", snap.pending],
   ];
@@ -249,11 +254,22 @@ function agentDetailLines(
 ): ContentLine[] {
   const { agent, rig, pod } = found;
   const session = agent.session;
+  // A seat read through a REMOTE host is read-only from here: the
+  // daemon that can act on it is elsewhere, so the local write affordances are replaced
+  // by the address that reaches it, and the local queue joins are skipped rather than
+  // guessed.
+  const remote = !!found.host.remote;
   const specInLibrary = !!agent.spec && !!findSpec(snap, agent.spec, "agent");
-  const currentRows = session ? rowsForAgent(snap, session, [snap.attention, snap.blocked, snap.inProgress]) : [];
-  const pendingRows = session ? rowsForAgent(snap, session, [snap.pending]) : [];
-  const recentRows = session ? rowsForAgent(snap, session, [snap.recentlyFinished]) : [];
-  const needs = session ? snap.needs.filter((item) => item.target === session) : [];
+  const currentRows = session && !remote ? rowsForAgent(snap, session, [snap.attention, snap.blocked, snap.inProgress]) : [];
+  const pendingRows = session && !remote ? rowsForAgent(snap, session, [snap.pending]) : [];
+  const recentRows = session && !remote ? rowsForAgent(snap, session, [snap.recentlyFinished]) : [];
+  // Needs-You rows DO carry fleet provenance, so a remote seat joins them
+  // when the host matches; a local seat keeps today's unqualified join.
+  const needs = session
+    ? remote
+      ? snap.needs.filter((item) => item.target === session && item.hostId === found.host.id)
+      : snap.needs.filter((item) => item.target === session)
+    : [];
   const visibleAssigned = new Set([...currentRows, ...pendingRows].map(row => row.qitemId)).size;
   const assigned = agent.assignedWorkCount ?? visibleAssigned;
   const pending = agent.pendingWorkCount ?? pendingRows.length;
@@ -291,8 +307,12 @@ function agentDetailLines(
           fieldLine({ label: "meter", value: context == null ? "— (not yet known)" : `${context}% used  ${barCells(context / 100, meterWidth)}` }),
           fieldLine({ label: "tokens", value: `${number(agent.totalInputTokens)} input · ${number(agent.totalOutputTokens)} output · ${number(agent.contextWindowSize)} window` }),
           runtimeLine,
-          ...(agent.attach ? [fieldLine({ label: "attach", value: agent.attach })] : []),
-          fieldLine({ label: "terminal", value: `Open terminals ▸ pod ${pod.name}`, link: { type: "act", act: "open-terminal", view: `pod:${rig.name}/${pod.name}` } }),
+          ...(remote
+            ? [fieldLine({ label: "reach", value: agent.remoteAddress ? `rig capture|send ${agent.remoteAddress}` : "no canonical session served — this remote seat has no address to print" })]
+            : [
+                ...(agent.attach ? [fieldLine({ label: "attach", value: agent.attach })] : []),
+                fieldLine({ label: "terminal", value: `Open terminals ▸ pod ${pod.name}`, link: { type: "act", act: "open-terminal", view: `pod:${rig.name}/${pod.name}` } }),
+              ]),
         ],
       },
       {
@@ -312,7 +332,7 @@ function agentDetailLines(
           rigId: rig.id ?? rig.name,
           seatId: agent.nodeId ?? null,
           seatName: agent.name,
-          local: found.host === snap.hosts[0],
+          local: !found.host.remote,
         }, contentWidth),
       },
       { title: `CURRENT WORK · ${currentRows.length}${queueIncomplete(snap) ? " sampled" : ""}`, lines: workRows(currentRows, contentWidth, queueIncomplete(snap)) },
@@ -603,7 +623,7 @@ function instanceContentLines(
                 alignedRow([[rig.name, 20], [rig.lifecycleState ?? "unknown", 20], [rig.inventoryUnavailable ? "inventory unavailable" : `${rig.pods.length} pods · ${rig.pods.reduce((n, pod) => n + pod.agents.length, 0)} seats`, 24]]),
                 { type: "drill", resource: "rig", name: rig.name, target: { host: host.name } },
               ))
-            : [{ text: "  (no local rigs served — proven empty)" }],
+            : [{ text: host.rigsUnavailable ? "  ✕ remote rigs read failed — named in the status line" : `  (no ${host.remote ? "" : "local "}rigs served — proven empty)` }],
         },
       ]),
     ];
@@ -653,7 +673,7 @@ function instanceContentLines(
     const rigAction: Action = { type: "drill", resource: "rig", name: rig.name, target: { host: host.name } };
     if (agents.length === 0) {
       lines.push({
-        text: tableRow(columns, { rig: rig.name, pod: "—", seat: rig.inventoryUnavailable ? "(read failed)" : "(no seats)", status: rig.lifecycleState ?? "unknown" }),
+        text: tableRow(columns, { rig: rig.name, pod: "—", seat: rig.inventoryUnavailable ? "(read failed)" : rig.inventoryNotLoaded ? "(seats not read)" : "(no seats)", status: rig.lifecycleState ?? "unknown" }),
         action: rigAction,
       });
       continue;
@@ -664,7 +684,7 @@ function instanceContentLines(
       if (firstInPod && previousPod != null) lines.push({ text: "┈".repeat(columnsWidth(columns)) });
       previousPod = pod;
       const stateCell = operationalState(agent.status, motion);
-      const queue = queueFacts(snap, agent.session);
+      const queue = queueFacts(snap, agent.session, rig.remote);
       seatCount += 1;
       if (["active", "working", "running"].includes(agent.status)) workingCount += 1;
       if (/attention|needs|blocked|unknown|failed/.test(agent.status)) attentionCount += 1;
@@ -772,9 +792,23 @@ function contentLines(state: ViewState, snap: FleetSnapshot, contentWidth: numbe
       .filter((a) => !state.filter || a.name.includes(state.filter) || a.pod.includes(state.filter));
     const suffix = `rig ${rig.name}${podFilter ? ` · pod ${podFilter}` : ""}${state.filter ? ` · filter "${state.filter}"` : ""}`;
     lines.push(...tabsLine(state, suffix));
-    // Keep the explicit desktop action above the rig's grid.
-    if (!podFilter) lines.push(fieldLine({ label: "terminal", value: `Open terminals ▸ rig ${rig.name}`, link: { type: "act", act: "open-terminal", view: `rig:${rig.name}` } }));
-    const healthScope = { kind: "rig" as const, rigId: rig.id ?? rig.name, rigName: rig.name, local: host === snap.hosts[0] };
+    // Keep the explicit desktop action above the rig's grid. A REMOTE rig has none: the
+    // terminal would open on the wrong machine, so the page prints the address that
+    // reaches the seats instead.
+    if (!podFilter) {
+      if (rig.remote) {
+        // Rig-WIDE, so it must not print one seat's address as if it addressed the
+        // whole rig (review N4). The shape is what the operator needs; the seat page
+        // prints that seat's concrete address.
+        lines.push(fieldLine({
+          label: "reach",
+          value: `read-only from here · rig capture|send <seat>@${rig.name}@${rig.hostId ?? host.name}`,
+        }));
+      } else {
+        lines.push(fieldLine({ label: "terminal", value: `Open terminals ▸ rig ${rig.name}`, link: { type: "act", act: "open-terminal", view: `rig:${rig.name}` } }));
+      }
+    }
+    const healthScope = { kind: "rig" as const, rigId: rig.id ?? rig.name, rigName: rig.name, local: !host.remote };
     if (state.viewTab === "health") return [...lines, { text: "" }, ...healthListLines(snap, healthScope, contentWidth)];
     if (state.viewTab === "recent") {
       const recent = recentLines(snap, { kind: "rig", rig: rig.name }, contentWidth, true, state.timeZone);
@@ -876,10 +910,12 @@ function contentLines(state: ViewState, snap: FleetSnapshot, contentWidth: numbe
       // write contract: `run ▸` = the rig-restore write (rendered only where
       // it applies — the seat is not running); `term ▸` = the terminal-open
       // view contract (pod-scoped, the web's granularity). No false affordance.
-      const canRun = a.canRun ?? !a.live;
-      const actionsCell = canRun ? "run ▸ · term ▸" : "term ▸";
+      const canRun = !rig.remote && (a.canRun ?? !a.live);
+      // A remote seat offers NOTHING clickable: the word is plain, with no ▸ glyph, so
+      // the column cannot read as a control: no false affordance.
+      const actionsCell = rig.remote ? "remote" : canRun ? "run ▸ · term ▸" : "term ▸";
       const zones: ContentLine["zones"] = [];
-      if (actionsColStart >= 0) {
+      if (!rig.remote && actionsColStart >= 0) {
         const termOffset = actionsColStart + actionsCell.indexOf("term ▸");
         zones.push({ start: termOffset, end: termOffset + "term ▸".length, action: { type: "act", act: "open-terminal", view: `pod:${rig.name}/${a.pod}` } });
       }
@@ -890,7 +926,7 @@ function contentLines(state: ViewState, snap: FleetSnapshot, contentWidth: numbe
           action: { type: "act", act: "run", rigId: rig.id ?? rig.name, agent: a.name },
         });
       const stateCell = operationalState(a.status, motion);
-      const queue = queueFacts(snap, a.session);
+      const queue = queueFacts(snap, a.session, rig.remote);
       lines.push({
         // the WHOLE row is the hit surface (not a testid'd control): clicking
         // any visible cell opens the agent; the ACTIONS zones override.

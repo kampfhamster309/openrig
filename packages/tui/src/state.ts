@@ -429,6 +429,14 @@ export function locationKey(state: ViewState): string {
 function syncSelection(state: ViewState, snap: FleetSnapshot): ViewState {
   const expanded = new Set(state.expanded);
   const names = new Map(state.drill.map((seg) => [seg.kind, seg.name]));
+  // For a REMOTE host/rig the drill path is what makes the lazy read run, so
+  // every level the path passes through expands (the rule `pod` already followed). On a
+  // local tree these keys gate nothing, so this is inert there. Added in TREE ORDER and
+  // before the pod key on purpose: `expanded` is a set in behaviour but an array in
+  // state, and a one-dispatch command path must land on the same array as a multi-
+  // dispatch click path (parity-content pins exactly that).
+  if (names.get("host")) expanded.add(`host:${names.get("host")}`);
+  if (names.get("host") && names.get("rig")) expanded.add(`rig:${names.get("host")}/${names.get("rig")}`);
   if (names.has("pod")) expanded.add(`pod:${names.get("host")}/${names.get("rig")}/${names.get("pod")}`);
   const leaf = state.drill.at(-1);
   if (leaf?.kind === "spec") {
@@ -469,11 +477,17 @@ export function findSpec(snap: FleetSnapshot, name: string, kind?: SpecKind) {
 /** Joins a Needs-You target (a session name) back to the topology agent. */
 export function findAgentBySession(snap: FleetSnapshot, session: string, hostId?: string) {
   const matches = [];
-  for (const host of snap.hosts)
+  for (const host of snap.hosts) {
+    // A Needs-You row with NO hostId is a local row (hydrate stamps remote rows with
+    // one). Without this guard, a remote seat that shares a canonical session name with
+    // a local seat would make the join ambiguous the moment the operator expanded that
+    // host, and the local row would silently lose its open link.
+    if (!hostId && host.remote) continue;
     for (const rig of host.rigs)
       for (const pod of rig.pods)
         for (const agent of pod.agents)
           if (agent.session === session && (!hostId || (host.id ?? host.name) === hostId)) matches.push({ host, rig, pod, agent });
+  }
   return matches.length === 1 ? matches[0]! : null;
 }
 
@@ -658,18 +672,52 @@ export function computeExplorerRows(state: ViewState, snap: FleetSnapshot): Expl
       // expanded (drilling a pod expands it) — "tighter visually".
       const expanded = new Set(state.expanded);
       for (const host of snap.hosts) {
+        const hostKey = `host:${host.name}`;
+        // A LOCAL host keeps today's always-open tree. A REMOTE host is a DISCLOSURE:
+        // collapsed until the operator opens it, because opening it is what costs the
+        // read-through request. An unreachable host has nothing to open and
+        // is never dialled, so it stays a bare labelled row rather than an error flood.
+        const hostExpandable = !!host.remote && host.reachable;
+        const hostOpen = !host.remote || (host.reachable && expanded.has(hostKey));
         rows.push({
-          label: `  ▾ ${host.name}${host.reachable ? "" : " (unreachable)"}`,
+          label: `  ${hostExpandable ? (hostOpen ? "▾" : "▸") : host.remote ? "•" : "▾"} ${host.name}${host.reachable ? "" : " (unreachable)"}`,
           action: { type: "drill", resource: "host", name: host.name },
-          key: `host:${host.name}`,
+          key: hostKey,
+          ...(hostExpandable ? { disclosureAction: { type: "toggle-expand" as const, key: hostKey } } : {}),
         });
+        if (!hostOpen) continue;
+        if (host.remote && host.rigs.length === 0) {
+          // The read already ran in this same hydrate pass, so an empty list here is a
+          // PROVEN empty answer or a named failure — never a spinner.
+          rows.push({
+            label: `    ${host.rigsUnavailable ? "✕ rigs read failed — named in the status line" : "(no rigs served — proven empty)"}`,
+            action: { type: "drill", resource: "host", name: host.name },
+            key: `${hostKey}:empty`,
+          });
+          continue;
+        }
         for (const rig of host.rigs) {
           const stateSuffix = rig.lifecycleState && rig.lifecycleState !== "running" ? ` (${rig.lifecycleState})` : "";
+          const rigKey = `rig:${host.name}/${rig.name}`;
+          // Same lazy rule one level down: a remote rig's seats are read only once the
+          // rig is opened (or drilled into), so the tree shows a disclosure for it.
+          const rigExpandable = !!rig.remote;
+          const rigOpen = !rigExpandable || expanded.has(rigKey);
           rows.push({
-            label: `    ▾ ${rig.name}${stateSuffix}`,
+            label: `    ${rigExpandable ? (rigOpen ? "▾" : "▸") : "▾"} ${rig.name}${stateSuffix}`,
             action: { type: "drill", resource: "rig", name: rig.name, target: { host: host.name } },
-            key: `rig:${host.name}/${rig.name}`,
+            key: rigKey,
+            ...(rigExpandable ? { disclosureAction: { type: "toggle-expand" as const, key: rigKey } } : {}),
           });
+          if (rigExpandable && !rigOpen) continue;
+          if (rigExpandable && rig.pods.length === 0) {
+            rows.push({
+              label: `      ${rig.inventoryUnavailable ? "✕ seats read failed — named in the status line" : "(no seats served — proven empty)"}`,
+              action: { type: "drill", resource: "rig", name: rig.name, target: { host: host.name } },
+              key: `${rigKey}:empty`,
+            });
+            continue;
+          }
           for (const pod of rig.pods) {
             const podKey = `pod:${host.name}/${rig.name}/${pod.name}`;
             const open = expanded.has(podKey);

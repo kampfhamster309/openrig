@@ -19,8 +19,8 @@ import type { ConfigRead } from "./config/config-model.js";
 import type { ConnectionsRead, ControlPlaneRead, SlackManifestRead } from "./connections/connections-model.js";
 import { DaemonClient } from "./daemon-client.js";
 import { parse as parseYaml } from "yaml";
-import type { AgentRow, FleetSnapshot, HealthCoverage, HealthRecord, HostNode, NeedsItem, PodNode, QueueRead, RecentTransitionSnap, SeatActivitySummary, SliceDetailSnap, SpecEntry, ViewState } from "./types.js";
-import { LOCAL_HOST_ID_SENTINEL, RIG_DOWN_ID_PREFIX } from "./types.js";
+import type { AgentRow, FleetSnapshot, HealthCoverage, HealthRecord, HostNode, NeedsItem, PodNode, QueueRead, RecentTransitionSnap, RigNode, SeatActivitySummary, SliceDetailSnap, SpecEntry, ViewState } from "./types.js";
+import { LOCAL_HOST_ID_SENTINEL, RIG_DOWN_ID_PREFIX, remoteSeatAddress } from "./types.js";
 import { isHumanSeatSession } from "./pulse/pulse-model.js";
 
 // Narrow read-shapes: just the served fields this module consumes (names match
@@ -392,7 +392,7 @@ function agentSpecTruth(raw?: string): { runtime?: string; skills: string[] } {
  * avoids re-reading every spec every refresh; the key rolls when the library
  * entry's updatedAt changes. Owned by the caller (instance-scoped, no module state). */
 export type SpecReviewCache = Map<string, SpecLibraryReviewRead>;
-export type HydrateViewContext = Pick<ViewState, "project" | "section" | "viewTab" | "drill" | "file" | "externalUrl" | "terminalView" | "attentionOpen" | "pendingDrill">;
+export type HydrateViewContext = Pick<ViewState, "project" | "section" | "viewTab" | "drill" | "file" | "externalUrl" | "terminalView" | "attentionOpen" | "pendingDrill" | "expanded">;
 
 export async function hydrateSnapshot(
   client: DaemonClient,
@@ -630,16 +630,79 @@ export async function hydrateSnapshot(
       if (spec.name) rigSpecRefs.set(spec.name, refs);
     }
   }
-  const aggHosts = agg?.hosts ?? [];
+  // The aggregate's `hosts` leg is the ONLY thing that names the remote
+  // hosts, and it rode `broadReads` alone, so a remote host existed only in PULSE and
+  // vanished the moment it was drilled (drilling switches to the table tab, which reads
+  // narrowly). A daemon that runs NO rigs of its own is a hub, and the fleet view IS
+  // its product, so the topology scope reads the aggregate for it. Quietly: a failing
+  // aggregate leaves the local host alone rather than naming an error on every focused
+  // view. A machine that runs its own rigs pays nothing extra — that is where the
+  // 24-rig landing cost guard (navigation-continuity) lives, and it stays exact.
+  let fleetAgg = agg;
+  if (fleetAgg === null && wantsTopologyScope && (summaries?.length ?? 0) === 0) {
+    fleetAgg = await client.attentionAggregate().catch(() => null) as AttentionAggregateRead | null;
+  }
+  const aggHosts = fleetAgg?.hosts ?? [];
   const localHost: HostNode = {
     id: "local",
     name: instanceHealth?.selfHostId?.trim() || "local",
     reachable: true,
     rigs,
   };
-  const remoteHosts: HostNode[] = aggHosts
+  // A REACHABLE remote host expands to its rigs through the shipped
+  // read-through (the rigs-summary read with a host envelope), and a remote rig drills
+  // into its seats the same way (the nodes read with the same envelope). The origin
+  // answers VERBATIM, so the same local projection code (groupPods) maps both levels.
+  //
+  // Both reads are LAZY by construction: a remote host's rigs are read only
+  // while the operator has that host expanded or drilled, and a remote rig's seats
+  // only while that rig is expanded or focused. The cost per refresh therefore follows
+  // what the operator looks at, not the number of entries in hosts.yaml. An
+  // UNREACHABLE host is never dialled — the aggregate already said so — so a dead team
+  // costs one skipped read rather than a named read error every refresh.
+  const expandedKeys = new Set(viewContext?.expanded ?? []);
+  const drillHost = wantsTopologyScope ? viewContext?.drill.find((seg) => seg.kind === "host")?.name : undefined;
+  const drillRig = wantsTopologyScope ? viewContext?.drill.find((seg) => seg.kind === "rig")?.name : undefined;
+  // One task per host, and one per rig inside a host, so a single slow team cannot
+  // stall the whole hydrate behind a serial chain of 5s client timeouts (review N3).
+  // Promise.all keeps the emitted order identical to the aggregate's.
+  const remoteHosts: HostNode[] = await Promise.all(aggHosts
     .filter((h) => h.hostId !== LOCAL_HOST_ID_SENTINEL)
-    .map((h) => ({ id: h.hostId, name: h.hostId, reachable: h.status === "ok", rigs: [] }));
+    .map(async (aggHost): Promise<HostNode> => {
+      const host: HostNode = { id: aggHost.hostId, name: aggHost.hostId, reachable: aggHost.status === "ok", rigs: [], remote: true };
+      if (!host.reachable || !wantsTopologyScope) return host;
+      if (!expandedKeys.has(`host:${host.name}`) && drillHost !== host.name) return host;
+      const remoteRigs = await safe<RigSummaryRead[]>(`rigs-summary(${host.id})`, () => client.rigsSummary(host.id));
+      if (remoteRigs === null) {
+        host.rigsUnavailable = true;
+        return host;
+      }
+      host.rigs = await Promise.all(remoteRigs.map(async (rig): Promise<RigNode> => {
+        const focused = expandedKeys.has(`rig:${host.name}/${rig.name}`) || (drillHost === host.name && drillRig === rig.name);
+        const nodes = focused
+          ? await safe<NodeInventoryRead[]>(`nodes(${host.id}/${rig.name})`, () => client.rigNodes(rig.id, host.id))
+          : null;
+        return {
+          id: rig.id,
+          name: rig.name,
+          remote: true,
+          hostId: host.id,
+          // A remote seat is READ-ONLY from here: stamp the address that reaches
+          // it so the renderer can print it where it would otherwise offer an action.
+          pods: nodes
+            ? groupPods(nodes).map((pod) => ({
+                ...pod,
+                agents: pod.agents.map((agent) => ({ ...agent, remoteAddress: remoteSeatAddress(host.id, agent.session) })),
+              }))
+            : [],
+          ...(!focused ? { inventoryNotLoaded: true } : nodes === null ? { inventoryUnavailable: true } : {}),
+          ...(rig.lifecycleState ? { lifecycleState: rig.lifecycleState } : {}),
+          hasLiveAgents: rig.hasLiveAgents ?? null,
+          authoredSpecName: undefined as string | undefined,
+        };
+      }));
+      return host;
+    }));
 
   // Specs: RIG + AGENT land well by consuming the existing structured review
   // for BOTH kinds. WORKFLOW remains basics. Reviews are memoized by updatedAt.
@@ -797,7 +860,7 @@ export async function hydrateSnapshot(
         }
       : {}),
     attention: (attention ?? []).map(toQueueRead),
-    fleetQueue: (agg?.items ?? []).map(toFleetQueueRead).filter((row): row is QueueRead => row !== null),
+    fleetQueue: (fleetAgg?.items ?? []).map(toFleetQueueRead).filter((row): row is QueueRead => row !== null),
     queueCoverage: !seatQueueReads ? undefined
       : [attention, blocked, inProgress, pending].some(rows => rows === null) ? "unavailable"
       // Existing /list defaults cap the first three reads at 100; pending requests 50.

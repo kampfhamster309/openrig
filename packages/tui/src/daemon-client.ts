@@ -53,6 +53,15 @@ export interface LaunchNodeResult {
   warnings?: string[];
 }
 
+/** The `?host=<id>` read-through envelope (daemon `domain/hosts/read-through.ts`).
+ * Absent or empty means a LOCAL read, which is every existing call site unchanged.
+ * The daemon edge consumes the param, strips it from the forwarded request, and
+ * returns the origin's answer verbatim — so the response shape here is the SAME
+ * shape a local read serves, and hydrate can reuse the local projection code. */
+export function hostEnvelope(hostId?: string | null): string {
+  return hostId ? `?host=${encodeURIComponent(hostId)}` : "";
+}
+
 export function launchNodeNotice(agent: string, result: LaunchNodeResult): string {
   const notice = result.code === "already_running"
     ? `agent already running: ${agent}`
@@ -213,11 +222,11 @@ export class DaemonClient {
   ps() {
     return this.get(`/api/ps`);
   }
-  rigsSummary() {
-    return this.get(`/api/rigs/summary`);
+  rigsSummary(hostId?: string | null) {
+    return this.get(`/api/rigs/summary${hostEnvelope(hostId)}`);
   }
-  rigNodes(rigId: string) {
-    return this.get(`/api/rigs/${encodeURIComponent(rigId)}/nodes`);
+  rigNodes(rigId: string, hostId?: string | null) {
+    return this.get(`/api/rigs/${encodeURIComponent(rigId)}/nodes${hostEnvelope(hostId)}`);
   }
   reviewAgents(scope: "rig" | "fleet" = "rig") {
     return this.get(`/api/review/agents?scope=${scope}`);

@@ -51,6 +51,10 @@ export interface AgentRow {
    * within the daemon's silence window — the substrate whose false→true
    * transition means real new pane output; null = no signal */
   paneActive?: boolean | null;
+  /** Set on a seat read through a REMOTE host: the `member@rig@host` address the
+   * operator uses with `rig capture|send` in place of the local actions the TUI
+   * cannot run there. Absent on a local seat. */
+  remoteAddress?: string | null;
 }
 
 export interface PodNode {
@@ -68,6 +72,13 @@ export interface RigNode {
   id?: string;
   name: string;
   pods: PodNode[];
+  /** The rig lives on a REMOTE fleet host. Its seats came through the
+   * read-through, so every WRITE surface the TUI would offer on them (attach, open
+   * terminal, run, focus, send) belongs to that host, not this daemon. Consumers
+   * suppress the affordance and print `remoteSeatAddress` instead. */
+  remote?: boolean;
+  /** The remote host's registry id this rig was read through; local rigs carry none. */
+  hostId?: string;
   /** the rig's served graph projection (§4.A topology row 1 — a DECLARED
    * existing read via daemon-client.rigGraph; slice-17 view consumes it, R7-clean) */
   graph?: import("./topology/graph-types.js").RigGraph;
@@ -81,6 +92,24 @@ export interface HostNode {
   name: string;
   reachable: boolean;
   rigs: RigNode[];
+  /** This host is a REMOTE fleet host rather than the daemon being viewed. Remote
+   * hosts are lazy: their rigs are read only while the operator has them expanded,
+   * so an absent read is a deliberate non-read, never a failure. */
+  remote?: boolean;
+  /** The remote-rigs read was attempted and FAILED (the read-through named a cause).
+   * Distinct from `rigs: []`, which is a proven-empty answer. */
+  rigsUnavailable?: boolean;
+}
+
+/** The address that REACHES a remote seat from here. The TUI cannot act on a remote
+ * seat — acting on it belongs to the daemon that owns it — so it prints this instead.
+ * `canonicalSessionName` is already `member@rig`, so appending `@<hostId>` yields the
+ * `member@rig@host` form `rig capture|send` parses as its cross-host sugar
+ * (packages/cli/src/commands/capture.ts, send.ts). Null for a local seat or one with
+ * no canonical session — the caller then says so honestly rather than guessing. */
+export function remoteSeatAddress(hostId: string | undefined, session: string | null | undefined): string | null {
+  if (!hostId || !session) return null;
+  return `${session}@${hostId}`;
 }
 
 export type SpecKind = "rig" | "agent" | "workflow";
