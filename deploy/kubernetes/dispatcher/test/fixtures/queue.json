@@ -11,7 +11,7 @@
   {
     "qitemId": "qitem-b",
     "state": "done",
-    "destinationSession": "dev-build@demo-rig",
+    "destinationSession": "review-r1@demo-rig",
     "tags": [
       "ticket:demo",
       "review"

@@ -8,7 +8,8 @@
 # `--start retained` would read no history at all, so it is recorded as a failure here.
 #
 # Knobs a test sets: FAKE_FIXTURES, FAKE_CALLS, FAKE_POD_READY, FAKE_FAIL_USAGE_TOP,
-# FAKE_STALL_EVENTS, FAKE_NO_RESULT.
+# FAKE_STALL_EVENTS, FAKE_NO_RESULT, FAKE_EMPTY_BUNDLE, FAKE_FAIL_BUNDLE,
+# FAKE_WATERMARK_EVENTS, FAKE_WATERMARK_TRANSITIONS, FAKE_STS_CREATED.
 set -u
 
 : "${FAKE_FIXTURES:?fake-kubectl needs FAKE_FIXTURES}"
@@ -18,9 +19,9 @@ printf '%s\n' "$*" >> "$FAKE_CALLS"
 fix() { cat "$FAKE_FIXTURES/$1"; }
 nope() { echo "fake kubectl: no recorded response for [$*]" >&2; exit 1; }
 
-# One telemetry stream. The first page must be opened with `--start retained`; after that the
-# archive follows the cursor. FAKE_STALL_EVENTS hands out page 1 forever, which is the shape of a
-# cursor that stops advancing.
+# One telemetry stream. The archive opens a history with `--start retained` and then follows the
+# cursor. A read with neither asks for the CURRENT window and gets no rows back, which is exactly how
+# the delete guard learns how far the stream has reached without dragging the whole history along.
 telemetry() {
   local stream=$1 cursor="" started=""
   shift
@@ -32,15 +33,41 @@ telemetry() {
     shift
   done
   if [ -z "$cursor" ] && [ "$started" != retained ]; then
-    nope "telemetry $stream opened without --start retained: that reads no history"
+    case "$stream" in
+      events) fix events-latest.json | jq -c --arg wm "${FAKE_WATERMARK_EVENTS:-$( [ "${FAKE_R3_WRITES:-0}" = 1 ] && echo 9 || echo 3 )}" '.page.retainedHighWatermark = $wm' ;;
+      transitions) fix transitions-latest.json | jq -c --arg wm "${FAKE_WATERMARK_TRANSITIONS:-5}" '.page.retainedHighWatermark = $wm' ;;
+      *) nope "telemetry $stream latest window" ;;
+    esac
+    return
   fi
   case "$stream:$cursor" in
     events:) fix events-page1.json ;;
     events:CURSOR-E1)
-      if [ "${FAKE_STALL_EVENTS:-0}" = 1 ]; then fix events-page1.json; else fix events-page2.json; fi ;;
+      if [ "${FAKE_STALL_EVENTS:-0}" = 1 ]; then fix events-page1.json
+      elif [ "${FAKE_R3_WRITES:-0}" = 1 ]; then
+        # The team wrote while the read was running: the window's `through` stays where it opened, but
+        # the high watermark the daemon reports has moved past what this read can include.
+        fix events-page2.json | jq -c '.page.retainedHighWatermark = "9"'
+      else fix events-page2.json; fi ;;
     transitions:) fix transitions-page1.json ;;
     transitions:CURSOR-T1) fix transitions-page2.json ;;
     *) nope "telemetry $stream cursor $cursor" ;;
+  esac
+}
+
+# One seat's usage series. The public read answers oldest-first up to a cap and says nothing when it
+# truncates, so the archive pages it with --since; RIG_DISPATCH_USAGE_PAGE is set small in the test so
+# two pages are enough to show that it really followed them.
+usage_series() {
+  local since=""
+  while [ $# -gt 0 ]; do
+    case "$1" in --since) since=${2:-} ;; esac
+    shift
+  done
+  case "$since" in
+    "") fix usage-series.json ;;
+    2026-10-23T20:08:00Z) fix usage-series-page2.json ;;
+    *) printf '{"rows": []}\n' ;;
   esac
 }
 
@@ -62,6 +89,7 @@ pod_sh() {
     *result.json*)
       # `cat ... 2>/dev/null; true` prints nothing when the file is absent, and still exits 0.
       [ "${FAKE_NO_RESULT:-0}" = 1 ] || fix result.json ;;
+    *"npm root"*) printf '/usr/lib/node_modules\n' ;;
     *) nope "pod shell: $script" ;;
   esac
 }
@@ -72,7 +100,7 @@ serve() {
       case "${2:-} ${3:-}" in
         "ps --nodes") fix nodes.json ;;
         "queue list") fix queue.json ;;
-        "usage series") fix usage-series.json ;;
+        "usage series") shift 3; usage_series "$@" ;;
         "usage top")
           if [ "${FAKE_FAIL_USAGE_TOP:-0}" = 1 ]; then
             echo "rig usage top: the daemon answered 503 usage_unavailable" >&2
@@ -81,9 +109,36 @@ serve() {
           fix usage-top.json ;;
         "telemetry events") shift 3; telemetry events "$@" ;;
         "telemetry transitions") shift 3; telemetry transitions "$@" ;;
+        "config reset"*) : ;;
+        "down"*) : ;;
         *) nope "rig $*" ;;
       esac ;;
     sh) pod_sh "$@" ;;
+    delete)
+      # `kubectl delete` on the way out: succeed quietly, the test checks what was asked for.
+      : ;;
+    rm) : ;;
+    env)
+      # Two shapes arrive here: `env HUB_MODE=... node -` from the hub registry helper, which these
+      # tests do not exercise, and `env LC_ALL=C git ... bundle create` from `collect`, whose
+      # locale-pinned bundle step the fake still has to run. Strip the assignments and serve the
+      # command behind them.
+      shift
+      while [ $# -gt 1 ] && [ "${1%%=*}" != "$1" ]; do shift; done
+      case "${1:-}" in node) : ;; *) serve "$@" ;; esac ;;
+    git)
+      # `collect` bundles the result branch out of the pod. The bytes are opaque here; what the test
+      # cares about is that collect keeps the archive whatever the bundle step does, and that a ticket
+      # with nothing to bundle is a state of the ticket rather than a failed archive.
+      if [ "${FAKE_FAIL_BUNDLE:-0}" = 1 ]; then
+        echo "fatal: not a valid object name ticket/demo" >&2
+        exit 128
+      fi
+      if [ "${FAKE_EMPTY_BUNDLE:-0}" = 1 ]; then
+        echo "fatal: can't create empty bundle" >&2
+        exit 128
+      fi
+      printf 'fake git bundle for %s\n' "${*}" ;;
     *) nope "$*" ;;
   esac
 }
@@ -99,11 +154,19 @@ done
 [ -n "$ns" ] || nope "a call with no -n namespace; the dispatcher always passes one"
 
 case "${rest[0]:-}" in
+  delete)
+    # `kubectl delete` on the way out: succeed quietly; the test asserts on the calls it saw.
+    : ;;
   get)
     case "${rest[1]:-}" in
       statefulset|statefulsets)
         if [ "${#rest[@]}" -gt 2 ] && [ "${rest[2]}" != "t-demo" ]; then nope "statefulset ${rest[2]}"; fi
-        fix statefulset.json ;;
+        # FAKE_STS_CREATED stands in for a re-dispatched ticket: same slug, newer pod.
+        if [ -n "${FAKE_STS_CREATED:-}" ]; then
+          fix statefulset.json | jq -c --arg c "$FAKE_STS_CREATED" '.metadata.creationTimestamp = $c'
+        else
+          fix statefulset.json
+        fi ;;
       pod)
         if [ "${FAKE_POD_READY:-1}" = 1 ]; then fix pod-ready.json; else fix pod-not-ready.json; fi ;;
       *) nope "get $*" ;;

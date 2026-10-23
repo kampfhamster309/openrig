@@ -6,8 +6,9 @@
 #   rig-dispatch wait    <ticket> [--timeout <seconds>] [--stall <minutes>]
 #   rig-dispatch archive <ticket> [--dir <root>]
 #   rig-dispatch collect <ticket> [--archive <dir>] [--into <local git repo>]
+#   rig-dispatch report  <ticket>|--all [--dir <root>] [--json]
 #   rig-dispatch answer  <ticket> <qitem> <decision text>
-#   rig-dispatch delete  <ticket>
+#   rig-dispatch delete  <ticket> [--dir <root>] [--force]
 #
 # State lives in Kubernetes labels and annotations and in the team pod, so every command can be
 # run again. The dispatcher reaches team pods only through `kubectl exec`; inside the pod, `rig`
@@ -33,7 +34,7 @@ k() { "$KUBECTL" -n "$NS" "$@"; }
 need() { command -v "$1" >/dev/null || die "$1 is required"; }
 need jq; need "$KUBECTL"
 
-usage() { sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
+usage() { sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
 
 # PROJ-123 -> proj-123: a DNS label that is also a valid OpenRig host id (no dots).
 slug_of() {
@@ -529,6 +530,10 @@ QUEUE_LIMIT="${RIG_DISPATCH_QUEUE_LIMIT:-100000}"
 MAX_PAGES="${RIG_DISPATCH_MAX_PAGES:-100000}"   # an opt-in ceiling, not a normal failure: termination comes from the cursor contract
 AUDIT_PAGE=200     # the audit browse clamps anything larger to 200 anyway
 TELEMETRY_PAGE=128 # the telemetry v1 contract caps a page at 128 source rows
+USAGE_PAGE="${RIG_DISPATCH_USAGE_PAGE:-5000}"  # the public usage read caps a reply at 10,000 rows oldest-first and says nothing when it does
+
+# Where the archives live: --dir wins, then the environment, then ./tickets.
+archive_root() { printf '%s' "${1:-${RIG_DISPATCH_ARCHIVE_DIR:-$ARCHIVE_ROOT_DEFAULT}}"; }
 
 PARTS='[]'
 SCRATCH=""
@@ -681,6 +686,42 @@ read_audit() { # read_audit <slug> <qitem>
     '{qitemId: $q, pages: $pages, stalled: $stalled, rows: $rows}'
 }
 
+# One seat's usage series, paged to the end. The public read answers at most 10,000 rows, oldest
+# first, and says nothing when it truncates, so a long-running seat would quietly lose its NEWEST
+# samples and the part would still claim success. `--since` walks forward from the last capturedAt
+# seen; it is inclusive of that timestamp, so the rows are deduped by `id` at the end rather than
+# counted per page. A page that cannot move the timestamp forward is a failure, not a short read.
+read_usage() { # read_usage <slug> <seat>
+  local slug=$1 seat=$2 since="" pages=0 n ts
+  : > "$SCRATCH/usage-rows.jsonl"
+  while :; do
+    local -a args=(--seat "$seat" --limit "$USAGE_PAGE" --json)
+    if [ -n "$since" ]; then args+=(--since "$since"); fi
+    if ! inpod "$slug" rig usage series "${args[@]}" >"$SCRATCH/upage" 2>"$SCRATCH/upage-err"; then
+      PART_ERR=$(head -c 300 "$SCRATCH/upage-err" | tr '\n\r' '  '); return 1
+    fi
+    if ! jq -e . "$SCRATCH/upage" >/dev/null 2>&1; then
+      PART_ERR="usage page $((pages + 1)) is not JSON: $(head -c 200 "$SCRATCH/upage" | tr '\n\r' '  ')"; return 1
+    fi
+    jq -c '.rows[]?' "$SCRATCH/upage" >> "$SCRATCH/usage-rows.jsonl"
+    pages=$((pages + 1))
+    n=$(jq -c '(.rows // []) | length' "$SCRATCH/upage")
+    if [ "$n" -lt "$USAGE_PAGE" ]; then break; fi
+    ts=$(jq -r '[.rows[]?.capturedAt] | map(select(type == "string")) | max // ""' "$SCRATCH/upage")
+    if [ -z "$ts" ] || [ "$ts" = "$since" ]; then
+      PART_ERR="the usage series for $seat did not move past $ts at page $pages, so it could not be read to the end"
+      return 1
+    fi
+    since=$ts
+    if [ "$pages" -ge "$MAX_PAGES" ]; then
+      PART_ERR="the page budget RIG_DISPATCH_MAX_PAGES=$MAX_PAGES ran out reading the usage series for $seat; raise it"
+      return 1
+    fi
+  done
+  jq -n --arg seat "$seat" --argjson pages "$pages" --slurpfile rows "$SCRATCH/usage-rows.jsonl" \
+    '{seat: $seat, pages: $pages, rows: ($rows | unique_by(.id))}'
+}
+
 # Every queue row in the pod, with no 500-row ceiling: the daemon route passes the limit through and
 # the CLI takes any positive integer, so the ceiling was always the dispatcher's own. Nothing is
 # filtered by tag, because a team pod holds ONE ticket's database - which the events and transitions
@@ -709,7 +750,7 @@ cmd_archive() {
   slug=$(slug_of "$ticket")
   p=$(probe "$slug")
   jq -e '.ready' >/dev/null <<<"$p" || die "$ticket: the team pod is not Ready, so there is nothing to archive"
-  root=${dir:-${RIG_DISPATCH_ARCHIVE_DIR:-$ARCHIVE_ROOT_DEFAULT}}
+  root=$(archive_root "$dir")
   key=$(jq -r '.ticket // empty' <<<"$p")
   rig=$(jq -r '.rig // empty' <<<"$p")
   mkdir -p "$root" || die "cannot create the archive root $root"
@@ -728,7 +769,7 @@ cmd_archive() {
   fi
 
   for seat in $(jq -r '.seats[].session // empty' <<<"$p"); do
-    save_part "usage:$seat" "$TMP/usage-$seat.json" inpod "$slug" rig usage series --seat "$seat" --json
+    save_part "usage:$seat" "$TMP/usage-$seat.json" read_usage "$slug" "$seat"
   done
   save_part usage-top "$TMP/usage-top.json" inpod "$slug" rig usage top --json
 
@@ -796,44 +837,344 @@ cmd_archive() {
   [ "$complete" = true ] || return 1
 }
 
-# --- collect / answer / delete ---------------------------------------------------------------
+# Fold one more part into a finished manifest and recompute completeness, so `collect` can report its
+# bundle step in the same manifest as the parts the archive read. An empty error means the part is ok.
+manifest_add() { # manifest_add <dir> <part> <error> [note] [rows]
+  local dir=$1 name=$2 err=$3 note=${4:-} rows=${5:-1} tmp
+  [ -f "$dir/manifest.json" ] || return 0
+  tmp=$(mktemp "$dir/.manifest.XXXXXX") || return 0
+  if jq --arg n "$name" --arg e "$err" --arg note "$note" --argjson r "$rows" \
+      '.parts = (((.parts // []) | map(select(.name != $n)))
+                 + [{name: $n, ok: ($e == ""), rows: $r}
+                    + (if $e == "" then {} else {error: $e} end)
+                    + (if $note == "" then {} else {note: $note} end)])
+       | .complete = (((.parts | length) > 0) and (all(.parts[]; .ok)))' \
+      "$dir/manifest.json" > "$tmp"; then
+    mv "$tmp" "$dir/manifest.json"
+  else
+    rm -f "$tmp"
+    log "WARNING: could not record the $name part in $dir/manifest.json"
+    return 1
+  fi
+}
 
+# collect = the archive, then the result branch. The order is the point: the history is saved first
+# and stays saved even when the bundle step fails, because losing the history is the one failure here
+# that cannot be undone and a missing bundle only costs the commits. A failed bundle is reported and
+# makes collect exit non-zero; it never discards what was already archived.
 cmd_collect() {
   local ticket="" archive="" into=""
   while [ $# -gt 0 ]; do
-    case "$1" in --archive) archive=$2; shift 2 ;; --into) into=$2; shift 2 ;;
+    case "$1" in --archive|--dir) archive=$2; shift 2 ;; --into) into=$2; shift 2 ;;
       -*) die "unknown option $1" ;; *) ticket=$1; shift ;; esac
   done
   [ -n "$ticket" ] || usage
-  local slug p rig branch dir seat
-  slug=$(slug_of "$ticket"); p=$(probe "$slug")
-  jq -e '.ready' >/dev/null <<<"$p" || die "$ticket: the team pod is not Ready"
-  dir=${archive:-./tickets}/$slug; mkdir -p "$dir"
-  rig=$(jq -r .rig <<<"$p")
+  local slug root dir p branch bundle_err rc
+  slug=$(slug_of "$ticket")
+  root=$(archive_root "$archive")
+  dir="$root/$slug"
 
-  jq . <<<"$p" > "$dir/status.json"
-  inpod "$slug" rig queue list -a -A -o json --full --limit 500 |
-    jq --arg t "ticket:$slug" '[.[] | select((.tags // []) | index($t))]' > "$dir/queue.json"
-  inpod "$slug" rig ps --nodes --rig "$rig" --json > "$dir/nodes.json"
-  for seat in $(jq -r '.seats[].session' <<<"$p"); do
-    inpod "$slug" rig usage series --seat "$seat" --json > "$dir/usage-$seat.json" 2>/dev/null || true
-  done
-  inpod "$slug" rig usage top --json > "$dir/usage-top.json" 2>/dev/null || true
+  rc=0
+  if [ -n "$archive" ]; then cmd_archive "$ticket" --dir "$archive" || rc=1
+  else cmd_archive "$ticket" || rc=1; fi
 
+  p=$(probe "$slug")
   branch=$(jq -r '.result.branch // empty' <<<"$p")
-  if [ -n "$branch" ]; then
-    # Only the commits the remote does not have; the receiving clone has the rest.
-    inpod "$slug" git -C "$WORK/project" bundle create - "$branch" --not --remotes > "$dir/result.bundle" \
-      || die "could not bundle branch $branch"
-    if [ -n "$into" ]; then
-      git -C "$into" fetch --quiet "$(realpath "$dir/result.bundle")" "$branch:refs/tickets/$slug"
-      log "fetched $branch into $into as refs/tickets/$slug"
-    fi
+  bundle_err=""; bundle_note="nothing to bundle: the ticket has no result branch yet"; bundle_rows=0
+  if [ -z "$branch" ]; then
+    log "no result branch yet; the archive holds the history only"
   else
-    log "no result branch yet; archived status only"
+    bundle_note="branch $branch bundled"
+    # Only the commits the remote does not have; the receiving clone has the rest.
+    if inpod "$slug" env LC_ALL=C git -C "$WORK/project" bundle create - "$branch" --not --remotes \
+         > "$dir/result.bundle" 2> "$dir/.bundle-err"; then
+      bundle_rows=1
+      if [ -n "$into" ]; then
+        if git -C "$into" fetch --quiet "$(realpath "$dir/result.bundle")" "$branch:refs/tickets/$slug"; then
+          log "fetched $branch into $into as refs/tickets/$slug"
+        else
+          bundle_err="the bundle was made but fetching it into $into failed; it is still at $dir/result.bundle"
+        fi
+      fi
+    else
+      bundle_err=$(head -c 300 "$dir/.bundle-err" | tr '\n\r' '  ')
+      # A ticket that needed no commit has nothing to bundle. That is a state of the ticket, like an
+      # absent result.json, so it is a note rather than a failure: an archive must not be made
+      # incomplete by a ticket that finished cleanly, or `delete` would refuse it forever.
+      case "$bundle_err" in
+        *"empty bundle"*)
+          bundle_note="branch $branch has no commit the remote does not already have, so there was nothing to bundle"
+          bundle_err=""
+          # git creates the file before it refuses, and a zero-byte result.bundle is exactly the
+          # unusable part the delete guard would (rightly) refuse. Nothing was bundled, so nothing stays.
+          rm -f "$dir/result.bundle" ;;
+        *)
+          [ -n "$bundle_err" ] || bundle_err="could not bundle branch $branch"
+          bundle_note=""
+          rm -f "$dir/result.bundle"
+          ;;
+      esac
+    fi
+    rm -f "$dir/.bundle-err"
   fi
-  log "archived $ticket in $dir"
+
+  manifest_add "$dir" bundle "$bundle_err" "$bundle_note" "$bundle_rows" || rc=1
+  if [ -n "$bundle_err" ]; then
+    log "FAILED bundle: $bundle_err"
+    log "the archive in $dir is kept: the history is safe, the commits are not"
+    rc=1
+  fi
+  log "collected $ticket in $dir"
+  [ "$rc" = 0 ] || return 1
 }
+
+# The stream's current high watermark, read with the cheap default page: `start=latest` returns the
+# window and no rows, which is all the delete guard needs to know about whether the team wrote more.
+live_watermark() { # live_watermark <slug> <events|transitions>
+  inpod "$1" rig telemetry "$2" --json 2>/dev/null | jq -r '.page.retainedHighWatermark // empty' || true
+}
+
+# Is it safe to delete this ticket's pod? Three separate questions, all answered before anything is
+# touched, because `delete` is the step that cannot be undone: is the archive COMPLETE (its manifest
+# says so and no part failed), is it REAL (every part it claims was saved is on disk, parses, and
+# holds the rows it claims), and is it CURRENT (it describes this pod, and this pod has not written
+# history since). A complete archive of an earlier moment, or of an earlier team that used the same
+# slug, answers none of the third. Prints the reason it is not safe, or nothing when it is.
+archive_check() { # archive_check <root> <slug>
+  local dir=$1/$2 bad missing complete name f want have sts live inc at moved wm want_wm have_wm
+  if [ ! -f "$dir/manifest.json" ]; then
+    printf 'there is no archive at %s (no manifest.json); run archive or collect first' "$dir"
+    return 0
+  fi
+  bad=$(jq -r '[.parts[]? | select(.ok | not) | "\(.name) (\(.error // "failed"))"] | join("; ")' "$dir/manifest.json")
+  missing=""
+  while IFS=$'\t' read -r name want; do
+    case "$name" in
+      status) f=status.json ;;
+      queue) f=queue.json ;;
+      nodes) f=nodes.json ;;
+      events) f=events.json ;;
+      transitions) f=queue-transitions.json ;;
+      result) f=result.json ;;
+      usage-top) f=usage-top.json ;;
+      usage:*) f="usage-${name#usage:}.json" ;;
+      audit:*) f="audit-${name#audit:}.json" ;;
+      bundle) f=result.bundle ;;
+      *) f="" ;;
+    esac
+    [ -n "$f" ] || continue
+    if [ ! -e "$dir/$f" ]; then
+      # A part that saved nothing because there was nothing to save - no result.json yet, no branch to
+      # bundle - is a state of the ticket, not a missing file.
+      if [ -n "$want" ] && [ "$want" != 0 ]; then missing="$missing $name"; fi
+      continue
+    fi
+    if [ "$f" = result.bundle ]; then
+      [ -s "$dir/$f" ] || missing="$missing $name(empty)"
+      continue
+    fi
+    # An empty or truncated file passes `[ -e ]` and is not an archived part.
+    if ! jq -e . "$dir/$f" >/dev/null 2>&1; then missing="$missing $name(unreadable)"; continue; fi
+    if [ -n "$want" ]; then
+      have=$(rows_of "$dir/$f")
+      [ "$have" = "$want" ] || missing="$missing $name(has $have rows, the manifest says $want)"
+    fi
+  done < <(jq -r '.parts[]? | select(.ok) | [.name, (.rows // "")] | @tsv' "$dir/manifest.json")
+  complete=$(jq -r '.complete // false' "$dir/manifest.json")
+  if [ -z "$bad" ] && [ -z "$missing" ] && [ "$complete" = true ]; then
+    sts=$(sts_json "$2" 2>/dev/null || true)
+    if [ -n "$sts" ]; then
+      inc=$(jq -r '.incarnation // empty' "$dir/manifest.json")
+      live=$(jq -r '.metadata.creationTimestamp // empty' <<<"$sts")
+      if [ -n "$live" ] && [ -n "$inc" ] && [ "$inc" != "$live" ]; then
+        printf 'the archive at %s describes a different incarnation of this ticket (archived %s; the pod running now was created %s); archive again' "$dir" "$inc" "$live"
+        return 0
+      fi
+      moved=""
+      for wm in events transitions; do
+        want_wm=$(jq -r ".watermarks.$wm // empty" "$dir/manifest.json")
+        [ -n "$want_wm" ] || continue
+        have_wm=$(live_watermark "$2" "$wm")
+        if [ -z "$have_wm" ]; then moved="$moved $wm(cannot be read now)"; continue; fi
+        [ "$have_wm" = "$want_wm" ] || moved="$moved $wm"
+      done
+      if [ -n "$moved" ]; then
+        printf 'the team has moved on since the archive at %s was taken (%s); archive again' "$dir" "${moved# }"
+        return 0
+      fi
+    fi
+    return 0
+  fi
+  printf 'the archive at %s is not complete' "$dir"
+  if [ -n "$bad" ]; then printf '; parts that failed: %s' "$bad"; fi
+  if [ -n "$missing" ]; then printf '; parts the manifest says were saved but are not usable on disk:%s' "$missing"; fi
+  if [ -z "$bad" ] && [ -z "$missing" ]; then printf '; its manifest does not say complete'; fi
+}
+
+# --- report ----------------------------------------------------------------------------------
+#
+# Everything here is computed from the archive directory alone -- that is the point of the archive --
+# so what a part could not read is simply absent from the figures rather than guessed. The definitions
+# are stated in the README and repeated in the footer of the table, because a figure nobody can check
+# is not a figure. Each one says what it cannot tell.
+#
+#   duration        first to last archived event timestamp. Not the pod's lifetime: nothing before the
+#                   first event and nothing the event stream did not record is in here, and if the
+#                   archive reports coverage gaps the duration is a floor, not a total.
+#   reviewRounds    how many of the ticket's queue items were addressed to a review seat, ignoring the
+#                   stuck-sweep recovery rows that are addressed to a review seat for a different
+#                   reason. A review that found nothing still counts as a round; a review done inside
+#                   one seat's own turn without a queue item is invisible here.
+#   handoffs        how many archived queue transitions closed a handoff: `handoff` closes with state
+#                   handed-off, while `handoff-and-complete` and a plain close with a handed_off_to
+#                   reason close with state done and that reason, so counting the state alone misses
+#                   two of the three ways a handoff is recorded. Handoffs made outside the queue are
+#                   not counted, because there is no record of them.
+#   humanDecisions  how many archived audit rows are a resolve, with the actor and, for an answer that
+#                   came through a hub, the host it came from (auditNotes.openrig_relay.from_host).
+#                   That host is present only for a relayed answer: an answer typed inside the team's
+#                   own pod records no origin host, and report says so rather than inventing one.
+#   usage           the sum of positive per-node token deltas across the archived usage samples, which
+#                   is the same rule the daemon's own top-burn uses. These are periodic samples of
+#                   cumulative counters, NOT exact token accounting: a restart resets a counter (those
+#                   are counted as resets, never as negative burn), and a quiet stretch between two
+#                   samples is invisible. usage-top is a snapshot of the last hour before the archive
+#                   ran, so it is labelled as a window and never added to the total.
+REPORT_JQ='
+def ts: if (type == "string") then ((.[0:19] + "Z") | fromdate) else null end;
+def is_recovery: ((.tags // []) | index("stuck-sweep-finding")) != null or ((.qitemId // "") | startswith("qitem-recovery-"));
+def span($a; $b): if (($a | ts) != null and ($b | ts) != null) then (($b | ts) - ($a | ts)) else null end;
+def hm: if . == null then "-" elif . < 60 then "\(.)s" elif . < 3600 then "\((./60 | floor))m" else "\((./3600 | floor))h\((((. % 3600) / 60) | floor))m" end;
+def tokdelta($rows):
+  ($rows | map(select(.lane == "context"))) as $ctx
+  | ($ctx | group_by(.nodeId)
+     | map(sort_by(.capturedAt)
+           | reduce .[] as $r ({prev: null, delta: 0, resets: 0};
+               if (($r.totalInputTokens == null) or ($r.totalOutputTokens == null)) then .
+               else ($r.totalInputTokens + $r.totalOutputTokens) as $cur
+                 | if .prev == null then {prev: $cur, delta: .delta, resets: .resets}
+                   elif ($cur - .prev) >= 0 then {prev: $cur, delta: (.delta + $cur - .prev), resets: .resets}
+                   else {prev: $cur, delta: .delta, resets: (.resets + 1)} end
+               end)
+           | {delta: .delta, resets: .resets})
+     | {tokens: (map(.delta) | add // 0), resets: (map(.resets) | add // 0), samples: ($ctx | length)});
+{
+  slug: $slug,
+  ticket: ($m[0].ticket // null),
+  archivedAt: ($m[0].archivedAt // null),
+  archiveComplete: ($m[0].complete // false),
+  partsFailed: [$m[0].parts[]? | select(.ok | not) | .name],
+  events: ($ev.rows | length),
+  firstEvent: ($ev.rows | map(.createdAt) | map(select(type == "string")) | first),
+  lastEvent: ($ev.rows | map(.createdAt) | map(select(type == "string")) | last),
+  coverageGaps: ($ev.gaps | length),
+  historyMayBePartial: (($ev.stalled // false) or (($ev.gaps | length) > 0)),
+  transitions: ($tr.rows | length),
+  handoffs: ([$tr.rows[]? | select(.state == "handed-off" or .closureReason == "handed_off_to")] | length),
+  reviewRounds: ([$qu[]? | select((.destinationSession // "") | startswith("review")) | select(is_recovery | not)] | length),
+  reviewItems: [$qu[]? | select((.destinationSession // "") | startswith("review")) | select(is_recovery | not) | .qitemId],
+  humanDecisions: ([$au.rows[]? | select(.actionVerb == "resolve")] | length),
+  decisions: [$au.rows[]? | select(.actionVerb == "resolve")
+              | {at: (.actedAt // null), actor: (.actorSession // null),
+                 fromHost: (((.auditNotes // {}) | (.openrig_relay // {})) | .from_host // null),
+                 decision: (.reason // null)}],
+  usage: {
+    seats: [$usage[] | {seat: .seat} + tokdelta(.rows)],
+    tokens: (reduce ($usage[] | {seat: .seat} + tokdelta(.rows)) as $s (0; . + $s.tokens)),
+    resets: (reduce ($usage[] | {seat: .seat} + tokdelta(.rows)) as $s (0; . + $s.resets)),
+    samples: (reduce ($usage[] | {seat: .seat} + tokdelta(.rows)) as $s (0; . + $s.samples)),
+    topWindowHours: ($utop.windowHours // null),
+    topRankedSeats: ($utop.totalRankedSeats // null),
+    topUnknownSeats: ([$utop.unknown[]?] | length)
+  }
+}
+| .durationSeconds = span(.firstEvent; .lastEvent)
+| .duration = (.durationSeconds | hm)
+'
+
+load_or() { # load_or <file> <fallback-json>
+  if [ -f "$1" ] && jq -e . "$1" >/dev/null 2>&1; then cat "$1"; else printf '%s' "$2"; fi
+}
+
+# One ticket's figures, or non-zero when there is no archive to report from.
+report_one() { # report_one <root> <slug>
+  local dir=$1/$2 ev tr qu au utop usage f
+  [ -f "$dir/manifest.json" ] || return 1
+  ev=$(load_or "$dir/events.json" '{rows: [], gaps: [], stalled: false}')
+  tr=$(load_or "$dir/queue-transitions.json" '{rows: []}')
+  qu=$(load_or "$dir/queue.json" '[]')
+  utop=$(load_or "$dir/usage-top.json" '{}')
+  au='{"rows": []}'
+  for f in "$dir"/audit-*.json; do
+    [ -e "$f" ] || continue
+    au=$(jq -c --slurpfile a "$f" '{rows: (.rows + ($a[0].rows // []))}' <<<"$au") || return 1
+  done
+  usage='[]'
+  for f in "$dir"/usage-*.json; do
+    [ -e "$f" ] || continue
+    case "$f" in */usage-top.json) continue ;; esac
+    usage=$(jq -c --arg s "$(basename "$f" .json | sed 's/^usage-//')" --slurpfile u "$f" \
+      '. + [{seat: $s, rows: ($u[0].rows // [])}]' <<<"$usage") || return 1
+  done
+  jq -n --arg slug "$2" --slurpfile m "$dir/manifest.json" \
+    --argjson ev "$ev" --argjson tr "$tr" --argjson qu "$qu" --argjson au "$au" \
+    --argjson utop "$utop" --argjson usage "$usage" "$REPORT_JQ"
+}
+
+cmd_report() {
+  local json=0 all=0 dir="" ticket="" d
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --json) json=1; shift ;;
+      --all) all=1; shift ;;
+      --dir) dir=$2; shift 2 ;;
+      -*) die "unknown option $1" ;;
+      *) [ -z "$ticket" ] || die "one ticket at a time"; ticket=$1; shift ;;
+    esac
+  done
+  if [ -z "$ticket" ] && [ $all = 0 ]; then usage; fi
+  local root out='[]' s r found=0
+  root=$(archive_root "$dir")
+  local -a slugs=()
+  if [ $all = 1 ]; then
+    for d in "$root"/*/; do
+      [ -f "${d}manifest.json" ] || continue
+      slugs+=("$(basename "$d")")
+    done
+    if [ "${#slugs[@]}" = 0 ]; then die "no archived tickets under $root"; fi
+  else
+    slugs=("$(slug_of "$ticket")")
+  fi
+  for s in "${slugs[@]}"; do
+    if r=$(report_one "$root" "$s"); then
+      found=1
+      out=$(jq -c --argjson r "$r" '. + [$r]' <<<"$out")
+    else
+      if [ $all = 1 ]; then log "no archive for $s under $root, skipped"
+      else die "no archive for $s under $root; run archive or collect first"; fi
+    fi
+  done
+  [ $found = 1 ] || die "nothing to report under $root"
+  if [ $json = 1 ]; then
+    if [ $all = 1 ]; then jq . <<<"$out"; else jq '.[0]' <<<"$out"; fi
+    return 0
+  fi
+  jq -r '
+    (["TICKET", "DURATION", "EVENTS", "ROUNDS", "HANDOFFS", "DECISIONS", "TOKENS", "ARCHIVE"] | @tsv),
+    (.[] | [(.ticket // .slug), .duration, (.events | tostring), (.reviewRounds | tostring),
+            (.handoffs | tostring), (.humanDecisions | tostring), (.usage.tokens | tostring),
+            (if .archiveComplete then "complete" else "INCOMPLETE" end)] | @tsv)' <<<"$out" |
+    column -t -s $'\t'
+  jq -r '.[] | (.ticket // .slug) as $t | (.decisions[] |
+    "\($t): decided by \(.actor // "?") at \(.at // "?") \(if .fromHost then "from host \(.fromHost)" else "(no relay host recorded)" end)")' \
+    <<<"$out"
+  jq -r '.[] | select(.historyMayBePartial) |
+    "\(.ticket // .slug): the archived history reports gaps or a stalled read, so duration and counts are a floor"' \
+    <<<"$out"
+  echo "  duration = first to last archived event; tokens = sampled cumulative counters, not exact accounting"
+}
+
+# --- collect / answer / delete ---------------------------------------------------------------
 
 cmd_answer() {
   [ $# -ge 3 ] || usage
@@ -850,9 +1191,28 @@ cmd_answer() {
 }
 
 cmd_delete() {
-  [ $# -eq 1 ] || usage
-  local slug sts rig name
-  slug=$(slug_of "$1"); name=$(name_of "$slug")
+  local ticket="" force=0 dir=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --force) force=1; shift ;;
+      --dir) dir=$2; shift 2 ;;
+      -*) die "unknown option $1" ;;
+      *) [ -z "$ticket" ] || die "one ticket at a time"; ticket=$1; shift ;;
+    esac
+  done
+  [ -n "$ticket" ] || usage
+  local slug sts rig name reason
+  slug=$(slug_of "$ticket"); name=$(name_of "$slug")
+  # The guard runs before anything is touched, so a refused delete leaves the team, its hub entry and
+  # its volume exactly as they were.
+  reason=$(archive_check "$(archive_root "$dir")" "$slug")
+  if [ -n "$reason" ]; then
+    if [ "$force" = 1 ]; then
+      log "WARNING: deleting without a complete archive: $reason"
+    else
+      die "$ticket: $reason. Use --force to delete anyway."
+    fi
+  fi
   sts=$(sts_json "$slug" || true)
   # Unregister before the pod goes, so the hub never keeps a host it can no longer reach.
   hub_unregister "$slug"
@@ -878,6 +1238,7 @@ case "$cmd" in
   wait) cmd_wait "$@" ;;
   archive) cmd_archive "$@" ;;
   collect) cmd_collect "$@" ;;
+  report) cmd_report "$@" ;;
   answer) cmd_answer "$@" ;;
   delete|rm) cmd_delete "$@" ;;
   -h|--help|help) usage ;;

@@ -1,8 +1,27 @@
 {
   "windowHours": 1,
-  "totalRankedSeats": 2,
-  "seats": [
-    { "seatSession": "orch-lead@demo-rig", "totalTokens": 2150 },
-    { "seatSession": "dev-build@demo-rig", "totalTokens": 900 }
-  ]
+  "sinceIso": "2026-10-23T20:20:00Z",
+  "ranked": [
+    {
+      "seatSession": "orch-lead@demo-rig",
+      "tokensPerHour": 1150,
+      "tokensDelta": 1150,
+      "resets": 1,
+      "spanHours": 1,
+      "samples": 4,
+      "windows": [
+        {
+          "window": "five_hour",
+          "usedPercentFirst": 20,
+          "usedPercentLast": 31,
+          "percentPerHour": 11,
+          "resetsAt": "2026-10-24T00:00:00Z"
+        }
+      ]
+    }
+  ],
+  "unknown": [
+    { "seatSession": "dev-build@demo-rig", "reason": "no_fresh_samples" }
+  ],
+  "totalRankedSeats": 1
 }
