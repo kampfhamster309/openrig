@@ -13,7 +13,8 @@
 # talks to its own daemon over loopback.
 #
 # Environment: KUBECONFIG, KUBECTL (default kubectl), RIG_DISPATCH_NAMESPACE (default openrig),
-# RIG_DISPATCH_IMAGE (default: the image pinned in ../kustomization.yaml).
+# RIG_DISPATCH_IMAGE (default: the image pinned in ../kustomization.yaml), RIG_DISPATCH_HUB_POD
+# (default hub-0; the hub to register teams with. No Ready hub pod there: registration is skipped).
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -51,6 +52,103 @@ default_image() {
   local kz="$HERE/../kustomization.yaml"
   [ -f "$kz" ] || die "set RIG_DISPATCH_IMAGE"
   awk '/newName:/{n=$2} /newTag:/{t=$2} END{if(n&&t) print n":"t}' "$kz"
+}
+
+# --- hub (stage 2) -------------------------------------------------------------------------------
+#
+# The hub (../hub) is an OpenRig daemon with no rigs whose hosts.yaml lists every team pod, so one
+# TUI shows every team at once. The dispatcher keeps it in step: `start` registers a team once its
+# pod is Ready, `delete` unregisters it. With no Ready hub pod in the namespace every helper here is
+# a no-op and the dispatcher behaves exactly as it did in stage 1.
+
+HUB_POD="${RIG_DISPATCH_HUB_POD:-hub-0}"
+_hub_npm_root=""
+
+hub_ready() {
+  [ "$(k get pod "$HUB_POD" -o jsonpath='{.status.conditions[?(@.type==\"Ready\")].status}' 2>/dev/null)" = "True" ]
+}
+
+hub_exec() { "$KUBECTL" -n "$NS" exec -i "$HUB_POD" -c daemon -- "$@"; }
+
+# What the hub dials. A bearer is required: the team pod binds 0.0.0.0, and sending one also
+# satisfies the daemon's Host-header check, so the teams need no OPENRIG_ALLOWED_HOSTS.
+hub_host_url() { printf 'http://%s.teams.%s.svc:7433' "$(pod_of "$1")" "$NS"; }
+hub_bearer_file() { printf '/home/openrig/.openrig/hosts.d/%s.bearer' "$(name_of "$1")"; }
+team_bearer() { k get secret "$(name_of "$1")" -o jsonpath='{.data.bearer}' | base64 -d; }
+
+# The hub image has no PyYAML. The CLI's own `yaml` dependency is the same parser `rig host add`
+# writes with, so the registry is edited with it.
+hub_npm_root() {
+  [ -n "$_hub_npm_root" ] || _hub_npm_root=$(hub_exec sh -c 'npm root -g' 2>/dev/null | tail -n1)
+  printf '%s' "$_hub_npm_root"
+}
+
+# There is no `rig host remove`, so hosts.yaml is edited directly:
+#   HUB_MODE=has    exit 0 if HUB_HOST_ID is registered, 1 if it is not
+#   HUB_MODE=remove drop that entry and rewrite the file at 0600
+hub_registry() {
+  local mode=$1 host=$2
+  printf '%s\n' '
+const fs = require("fs"), path = require("path");
+const file = path.join(process.env.OPENRIG_HOME || process.env.HOME + "/.openrig", "hosts.yaml");
+const mode = process.env.HUB_MODE, id = process.env.HUB_HOST_ID;
+function loadYaml() {
+  const r = process.env.NPM_ROOT;
+  if (r) { try { return require(path.join(r, "@openrig/cli/node_modules/yaml")); } catch (e) {}
+  }
+  return require("yaml");
+}
+if (!fs.existsSync(file)) process.exit(mode === "has" ? 1 : 0);
+const YAML = loadYaml();
+const doc = YAML.parse(fs.readFileSync(file, "utf8")) || {};
+const hosts = Array.isArray(doc.hosts) ? doc.hosts : [];
+if (mode === "has") process.exit(hosts.some((h) => h && h.id === id) ? 0 : 1);
+const kept = hosts.filter((h) => !(h && h.id === id));
+if (kept.length === hosts.length) { console.log("absent"); process.exit(0); }
+doc.hosts = kept;
+fs.writeFileSync(file, YAML.stringify(doc), { mode: 0o600 });
+console.log("removed " + id);
+' | hub_exec env NPM_ROOT="$(hub_npm_root)" HUB_MODE="$mode" HUB_HOST_ID="$host" node -
+}
+
+hub_register() {
+  local slug=$1 ticket=$2 rig=$3
+  if ! hub_ready; then
+    log "no Ready hub pod $HUB_POD; $slug is not registered with any hub"
+    return 0
+  fi
+  local host url bf bearer
+  host=$(name_of "$slug"); url=$(hub_host_url "$slug"); bf=$(hub_bearer_file "$slug")
+  bearer=$(team_bearer "$slug")
+  [ -n "$bearer" ] || die "secret $host has no bearer key; cannot register it with the hub"
+
+  # The bearer travels on stdin, never in a command line the node can see.
+  printf '%s' "$bearer" | hub_exec sh -c "umask 077; mkdir -p $(dirname "$bf"); cat > '$bf'; chmod 0600 '$bf'" \
+    || die "could not write $bf in $HUB_POD"
+
+  if hub_registry has "$host" >/dev/null 2>&1; then
+    log "hub already has host $host"
+  else
+    hub_exec rig host add --id "$host" --transport http --url "$url" --bearer-file "$bf" \
+      --notes "ticket $ticket, rig ${rig:-none}" >/dev/null \
+      || die "the hub refused to register $host"
+    log "registered $host with the hub at $url"
+  fi
+  # Without the subscription the hub lists the host but never reads its queue state.
+  hub_exec rig config set "feed.subscriptions.$host.enabled" true >/dev/null \
+    || log "could not set feed.subscriptions.$host.enabled on the hub"
+}
+
+hub_unregister() {
+  local slug=$1
+  hub_ready || return 0
+  local host bf
+  host=$(name_of "$slug"); bf=$(hub_bearer_file "$slug")
+  hub_registry remove "$host" >/dev/null 2>&1 || log "could not edit the hub's hosts.yaml"
+  # `rig config reset` is the unset: it drops the whole feed.subscriptions.<host> node.
+  hub_exec rig config reset "feed.subscriptions.$host.enabled" >/dev/null 2>&1 || true
+  hub_exec rm -f "$bf" >/dev/null 2>&1 || true
+  log "unregistered $host from the hub"
 }
 
 # --- start -------------------------------------------------------------------------------------
@@ -232,6 +330,7 @@ cmd_start() {
 
   wait_ready "$slug" "$ready_timeout"
   ensure_rig "$slug"
+  hub_register "$slug" "$ticket" "$(annotation "$(sts_json "$slug")" rig)"
 
   sts=$(sts_json "$slug")
   if [ -z "$(annotation "$sts" qitem)" ]; then
@@ -414,6 +513,8 @@ cmd_delete() {
   local slug sts rig name
   slug=$(slug_of "$1"); name=$(name_of "$slug")
   sts=$(sts_json "$slug" || true)
+  # Unregister before the pod goes, so the hub never keeps a host it can no longer reach.
+  hub_unregister "$slug"
   if [ -n "$sts" ]; then
     rig=$(annotation "$sts" rig)
     if [ -n "$rig" ] && k get pod "$(pod_of "$slug")" >/dev/null 2>&1; then
