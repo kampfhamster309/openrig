@@ -24,6 +24,10 @@ import type { HostRegistryLoadResult } from "../hosts/hosts-registry-reader.js";
 import { resolveHost } from "../hosts/hosts-registry-reader.js";
 import { FLEET_CACHE_MS, FLEET_FANOUT_CONCURRENCY_DEFAULT, FLEET_HOST_TIMEOUT_MS_DEFAULT, FLEET_STALE_BOUND_MS } from "./fleet-settings.js";
 import { createSingleFlightCache, hostGet, mapWithConcurrency } from "./fleet-fanout.js";
+// The arithmetic is a separate module so the CLI's fallback can use the SAME sums
+// and ranking without importing a fan-out. One implementation of "what do these
+// seats add up to", read by both.
+import { addUsageTotals, parseUsageTopBody, rankFleetSeats, sumUsageTotals, ZERO_USAGE_TOTALS, type UsageLeg } from "./fleet-usage-math.js";
 import type {
   FleetHostUsage,
   FleetSeatBurn,
@@ -42,10 +46,8 @@ export interface FleetUsageWindow {
   windowHours: number;
 }
 
-/** One host's usage answer: the numbers, or the reason there are none. */
-export type UsageLeg =
-  | { ok: true; body: UsageTopBody }
-  | { ok: false; reason: string };
+export { addUsageTotals, parseUsageTopBody, rankFleetSeats, sumUsageTotals, ZERO_USAGE_TOTALS } from "./fleet-usage-math.js";
+export type { UsageLeg } from "./fleet-usage-math.js";
 
 export interface FleetUsageDeps {
   /** The LOCAL host's usage, read in-process from this daemon's own samples.
@@ -61,122 +63,6 @@ export interface FleetUsageDeps {
   fetchImpl?: typeof fetch;
   env?: Record<string, string | undefined>;
   readFile?: (path: string) => string;
-}
-
-// ---------------------------------------------------------------------------
-// Parsing what an origin answered
-// ---------------------------------------------------------------------------
-
-function finiteNumber(value: unknown): number | null {
-  return typeof value === "number" && Number.isFinite(value) ? value : null;
-}
-
-function nullableNumber(value: unknown): number | null {
-  return value === null || value === undefined ? null : finiteNumber(value);
-}
-
-function isoString(value: unknown): string | null {
-  if (typeof value !== "string" || value === "") return null;
-  return Number.isFinite(new Date(value).getTime()) ? value : null;
-}
-
-/** One seat row, as the wire delivered it.
- *
- *  A row whose burn numbers are not finite is DROPPED and disclosed rather than
- *  coerced: `tokensDelta ?? 0` would put a fabricated zero into a total, and a
- *  total is exactly the number an operator compares teams on. */
-function parseSeatRow(raw: Record<string, unknown>): UsageSeatBurn | null {
-  const seatSession = typeof raw["seatSession"] === "string" ? raw["seatSession"] : null;
-  const tokensPerHour = finiteNumber(raw["tokensPerHour"]);
-  const tokensDelta = finiteNumber(raw["tokensDelta"]);
-  if (seatSession === null || tokensPerHour === null || tokensDelta === null) return null;
-  const windows: UsageSeatBurn["windows"] = [];
-  const rawWindows = Array.isArray(raw["windows"]) ? raw["windows"] : [];
-  for (const entry of rawWindows) {
-    if (!entry || typeof entry !== "object") continue;
-    const w = entry as Record<string, unknown>;
-    // A window with no name is not a window. Its percentages stay unread rather
-    // than being attached to a lane nobody named.
-    if (typeof w["window"] !== "string") continue;
-    windows.push({
-      window: w["window"],
-      usedPercentFirst: nullableNumber(w["usedPercentFirst"]),
-      usedPercentLast: nullableNumber(w["usedPercentLast"]),
-      percentPerHour: nullableNumber(w["percentPerHour"]),
-      resetsAt: typeof w["resetsAt"] === "string" ? w["resetsAt"] : null,
-    });
-  }
-  return {
-    seatSession,
-    tokensPerHour,
-    tokensDelta,
-    resets: finiteNumber(raw["resets"]) ?? 0,
-    spanHours: finiteNumber(raw["spanHours"]) ?? 0,
-    samples: finiteNumber(raw["samples"]) ?? 0,
-    windows,
-  };
-}
-
-/** The origin's `usage/top` body, defensively read. An older image is the
- *  authority on this shape and a hub must not put a malformed row into a total. */
-export function parseUsageTopBody(payload: unknown): { leg: UsageLeg; droppedRows: number } {
-  if (!payload || typeof payload !== "object") {
-    return { leg: { ok: false, reason: "the usage read answered something that is not an object" }, droppedRows: 0 };
-  }
-  const body = payload as Record<string, unknown>;
-  const windowHours = finiteNumber(body["windowHours"]);
-  const sinceIso = isoString(body["sinceIso"]);
-  if (windowHours === null || sinceIso === null || !Array.isArray(body["ranked"])) {
-    return { leg: { ok: false, reason: "the usage read is missing its window, its window start, or its ranked seats" }, droppedRows: 0 };
-  }
-  const ranked: UsageSeatBurn[] = [];
-  let dropped = 0;
-  for (const row of body["ranked"]) {
-    if (!row || typeof row !== "object") { dropped += 1; continue; }
-    const seat = parseSeatRow(row as Record<string, unknown>);
-    if (seat) ranked.push(seat);
-    else dropped += 1;
-  }
-  const unknown: UsageUnknownSeat[] = [];
-  for (const row of Array.isArray(body["unknown"]) ? body["unknown"] : []) {
-    if (!row || typeof row !== "object") continue;
-    const u = row as Record<string, unknown>;
-    if (typeof u["seatSession"] !== "string") continue;
-    unknown.push({ seatSession: u["seatSession"], reason: typeof u["reason"] === "string" ? u["reason"] : "unspecified" });
-  }
-  const totalRankedSeats = finiteNumber(body["totalRankedSeats"]) ?? ranked.length;
-  return {
-    leg: { ok: true, body: { windowHours, sinceIso, ranked, unknown, totalRankedSeats } },
-    droppedRows: dropped,
-  };
-}
-
-// ---------------------------------------------------------------------------
-// The only arithmetic this read is allowed to do
-// ---------------------------------------------------------------------------
-
-/** Sum the numbers that honestly add. `tokensPerHour`, `spanHours` and every
- *  percentage is left out on purpose — see `FleetUsageTotals`. */
-export function sumUsageTotals(ranked: readonly UsageSeatBurn[], unknownCount: number): FleetUsageTotals {
-  let tokensDelta = 0;
-  let resets = 0;
-  for (const seat of ranked) {
-    tokensDelta += seat.tokensDelta;
-    resets += seat.resets;
-  }
-  return { tokensDelta, resets, seatsRanked: ranked.length, seatsUnknown: unknownCount };
-}
-
-/** Fleet ranking: the per-seat rate the ORIGIN computed, over a bigger pool. This
- *  is the same comparison the single-host read already makes; the hub adds a host
- *  label, not a new metric. Ties break on host then seat so a payload is
- *  deterministic across runs. */
-export function rankFleetSeats(seats: readonly FleetSeatBurn[]): FleetSeatBurn[] {
-  return [...seats].sort((a, b) => (
-    b.tokensPerHour - a.tokensPerHour
-    || a.hostId.localeCompare(b.hostId)
-    || a.seatSession.localeCompare(b.seatSession)
-  ));
 }
 
 // ---------------------------------------------------------------------------
@@ -355,16 +241,8 @@ export async function composeFleetUsage(deps: FleetUsageDeps): Promise<FleetUsag
   let totals: FleetUsagePayload["totals"] = null;
   if (answering.length > 0) {
     const summed = answering.reduce<FleetUsageTotals>(
-      (acc, item) => {
-        const t = item.usage.totals!;
-        return {
-          tokensDelta: acc.tokensDelta + t.tokensDelta,
-          resets: acc.resets + t.resets,
-          seatsRanked: acc.seatsRanked + t.seatsRanked,
-          seatsUnknown: acc.seatsUnknown + t.seatsUnknown,
-        };
-      },
-      { tokensDelta: 0, resets: 0, seatsRanked: 0, seatsUnknown: 0 },
+      (acc, item) => addUsageTotals(acc, item.usage.totals!),
+      ZERO_USAGE_TOTALS,
     );
     totals = { ...summed, hostsAnswered: answering.length, hostsTargeted: targetedHostIds.length };
   }

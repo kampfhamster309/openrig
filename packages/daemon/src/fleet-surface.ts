@@ -16,3 +16,20 @@ export {
   FLEET_READER_MARGIN_MS,
   FLEET_READER_MIN_TIMEOUT_MS,
 } from "./domain/fleet/fleet-settings.js";
+
+/** The fleet usage ARITHMETIC, published for the CLI's fallback read.
+ *
+ *  `rig usage top --all-hosts` prefers the hub route and falls back to dialing every
+ *  host itself when the local daemon is too old to serve it. That fallback has to
+ *  produce the same totals and the same ranking as the hub, so it uses these rather
+ *  than a second implementation — two sums that can drift is how a hub and a CLI
+ *  report different numbers for one fleet at one moment. Dependency-free by design:
+ *  whatever rides here rides in the published CLI bundle. */
+export {
+  addUsageTotals,
+  parseUsageTopBody,
+  rankFleetSeats,
+  sumUsageTotals,
+  ZERO_USAGE_TOTALS,
+} from "./domain/fleet/fleet-usage-math.js";
+export type { UsageLeg } from "./domain/fleet/fleet-usage-math.js";

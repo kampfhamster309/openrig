@@ -3,7 +3,7 @@ import stringWidth from "string-width";
 import { resolveEffectiveHost } from "../host-selection.js";
 import { sessionRigOf } from "../session-name.js";
 import { DaemonClient, remoteDaemonClient } from "../client.js";
-import { getDaemonStatus, getDaemonUrl, resolveOriginSelfHostId, resolveLocalDaemonUrl, type LifecycleDeps , daemonStatusGuard} from "../daemon-lifecycle.js";
+import { getDaemonStatus, getDaemonUrl, resolveOriginSelfHostId, type LifecycleDeps , daemonStatusGuard} from "../daemon-lifecycle.js";
 import { realDeps } from "./daemon.js";
 import type { StatusDeps } from "./status.js";
 import { loadHostRegistry, resolveHost, hostDisplayTarget, resolveRemoteBearer, classifyHttpFailedStep, classifyHttpError, type HttpHostEntry } from "../host-registry.js";
@@ -11,8 +11,7 @@ import { runCrossHostCommand, type RunCrossHostCommandOpts } from "../cross-host
 import { emitCrossHostError, emitCrossHostFailure } from "../cross-host-cli-helpers.js";
 import { readOpenRigEnv } from "../openrig-compat.js";
 import type { AggregatedPayload, PerHostStatus } from "../lib/hosts/fanout-contract.js";
-import { fleetSummaryReaderTimeoutMs, FLEET_HOST_TIMEOUT_MS_DEFAULT, FLEET_FANOUT_CONCURRENCY_DEFAULT } from "@openrig/daemon/fleet";
-import { ConfigStore } from "../config-store.js";
+import { isAggregatedFleetPayload, fleetReaderBudget, tryHubFleetRead } from "../lib/fleet-hub-read.js";
 
 interface PsEntry {
   rigId: string;
@@ -1696,51 +1695,17 @@ function fleetResultsFromSummary(
  *  returns null and the caller uses today's CLI-side fan-out. The fallback is the
  *  contract for an old local daemon, not an error.
  *
- *  The timeout is the shared rule, not the client default. The route answers only
- *  after EVERY host leg finishes, so a reader on the 5 s default would abandon a
- *  healthy fan-out whenever one host is slow or the concurrency cap queues legs up —
- *  and then pay for a SECOND fan-out in the fallback. That is the exact cost this
- *  read exists to remove, so the reader must outlast the work it is waiting for. */
-/** The operator's own fan-out budget, read from the SAME settings file the daemon
- *  reads. F7 made `fleet.host_timeout_ms` and `fleet.fanout_concurrency` operator
- *  settings, and the route applies them — so a reader that still assumes the compiled
- *  defaults is wrong under exactly the configuration this change introduced. Five hosts
- *  at a 15 s budget is two waves, about 30 s of fan-out; a reader computing its wait
- *  from a 5 s default gives up at 20 s and pays for a second fan-out in its fallback.
- *
- *  A missing or unreadable store is not an error: the defaults are what the daemon would
- *  have used anyway. */
-function fleetReaderBudget(): { hostTimeoutMs: number; concurrency: number } {
-  try {
-    const store = new ConfigStore();
-    const hostTimeoutMs = store.get("fleet.host_timeout_ms");
-    const concurrency = store.get("fleet.fanout_concurrency");
-    return {
-      hostTimeoutMs: typeof hostTimeoutMs === "number" && hostTimeoutMs > 0 ? hostTimeoutMs : FLEET_HOST_TIMEOUT_MS_DEFAULT,
-      concurrency: typeof concurrency === "number" && concurrency > 0 ? concurrency : FLEET_FANOUT_CONCURRENCY_DEFAULT,
-    };
-  } catch {
-    return { hostTimeoutMs: FLEET_HOST_TIMEOUT_MS_DEFAULT, concurrency: FLEET_FANOUT_CONCURRENCY_DEFAULT };
-  }
-}
-
+ *  The budget and the shape check are the SHARED hub-read rule (`lib/fleet-hub-read`),
+ *  the same one `rig usage top --all-hosts` uses, so two commands cannot drift about
+ *  how long the CLI waits for a fan-out it is deliberately outlasting. */
 async function tryFleetSummary(
   deps: PsDeps,
   hostCount: number,
   budget = fleetReaderBudget(),
 ): Promise<FleetSummaryPayload | null> {
-  try {
-    const client = deps.clientFactory(resolveLocalDaemonUrl());
-    const res = await client.get<FleetSummaryPayload>("/api/fleet/summary", {
-      timeoutMs: fleetSummaryReaderTimeoutMs(hostCount, budget.hostTimeoutMs, budget.concurrency),
-    });
-    if (res.status < 200 || res.status >= 300) return null;
-    const payload = res.data as FleetSummaryPayload | undefined;
-    if (!payload || !Array.isArray(payload.items) || !Array.isArray(payload.hosts)) return null;
-    return payload;
-  } catch {
-    return null;
-  }
+  return tryHubFleetRead<FleetSummaryPayload>(
+    deps, "/api/fleet/summary", hostCount, isAggregatedFleetPayload, budget,
+  );
 }
 
 /** OPR.0.4.4.21 FR-5 — adapter to the intra-P4 shared contract
