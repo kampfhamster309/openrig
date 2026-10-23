@@ -17,6 +17,8 @@ OpenAI-compatible model, and a Claude Code reviewer.
 | `build-image.sh` | Builds the image (`--push` to push). Prints the tag, `<version>-<commit>`. |
 | `create-secrets.sh` | Creates the three Secrets, prompting for each token. |
 | `dispatcher/` | `rig-dispatch`: one team pod per ticket (see below), and `team.env`, the env every team pod gets. |
+| `hub/` | The hub: one more daemon from the same image, no rigs, whose `hosts.yaml` lists every team pod (see below). |
+| `HUB-TEST.md` | What the hub was observed to do on a real cluster, item by item, with the evidence. |
 | `manifests/` | Shared objects: namespace, the `teams` Service the team pods join, NetworkPolicy. |
 | `single-host/` | Optional: one long-lived host, pod `rig-0` (StatefulSet with a 20Gi volume, Service). |
 | `kit/` | Mounted read-only at `/etc/openrig-kit` from a ConfigMap: the rig spec, the lead's guidance, `pi-seat-status`, the Pi heartbeat extension and the Pi `models.json`. |
@@ -30,6 +32,7 @@ deploy/kubernetes/build-image.sh --push     # after `docker login ghcr.io`; set 
 kubectl apply -f deploy/kubernetes/manifests/namespace.yaml
 deploy/kubernetes/create-secrets.sh         # GHCR read token, Claude token from `claude setup-token`
 kubectl apply -k deploy/kubernetes          # shared objects; team pods then come from the dispatcher
+kubectl apply -k deploy/kubernetes/hub       # optional: the hub, the one point of truth for all teams
 kubectl apply -k deploy/kubernetes/single-host   # optional: one long-lived host, rig-0
 kubectl -n openrig rollout status statefulset/rig
 ```
@@ -91,6 +94,41 @@ $D delete PROJ-123
 - **Defaults:** `dispatcher/team.env` holds env every team pod gets; `--env NAME=VALUE` adds per ticket.
   The image defaults to the tag in `kustomization.yaml`; `RIG_DISPATCH_IMAGE` or `--image` overrides it.
 
+## The hub: one point of truth for every team
+
+`hub/` runs one more OpenRig daemon from the same image with no rigs (`OPENRIG_NO_KERNEL=1`, no agent
+credentials) and its own volume for `hosts.yaml`, `config.json` and one bearer file per team. The
+design is stage 2 of the factory proposal; what it was observed to do is in [HUB-TEST.md](HUB-TEST.md).
+
+```bash
+kubectl apply -k deploy/kubernetes/hub
+kubectl -n openrig rollout status statefulset/hub
+
+# the operator's view: one port-forward, one TUI, every team
+kubectl -n openrig port-forward pod/hub-0 17433:7433 &
+OPENRIG_HOME=/tmp/tuihome node "$(npm root -g)/@openrig/cli/tui/dist/main.js" --url http://127.0.0.1:17433
+
+# and the reads that show the teams today
+kubectl -n openrig exec -i hub-0 -c daemon -- rig ps --all-hosts --nodes -A
+kubectl -n openrig exec -i hub-0 -c daemon -- rig host list
+```
+
+- **The dispatcher keeps it in step.** `start` registers a team once its pod is Ready (bearer file at
+  0600 and an absolute path, `rig host add --transport http`, and
+  `feed.subscriptions.t-<slug>.enabled true`, so the hub reads the team's queue state and not just
+  its reachability); `delete` unregisters it, with `rig config reset` as the unset. Both are
+  idempotent, and with no Ready hub pod in the namespace they are no-ops, so the dispatcher works
+  exactly as before.
+- **It binds loopback.** Nothing in the cluster dials the hub, and the operator comes in through
+  `kubectl port-forward`, which connects inside the pod. A loopback bind needs no bearer, so reaching
+  the hub is exactly having `pods/portforward` on the namespace. Its readiness probe is therefore an
+  `exec` curl, not `httpGet`: the kubelet probes the pod IP, where a loopback bind has no listener.
+- **What it shows, and what it does not.** The daemon-side fan-outs work: `/api/review/fleet` stamps
+  every needs-you item with its team's `hostId`, the attention aggregate reports each team's status,
+  and `rig ps --all-hosts --nodes -A` lists every seat. The TUI does not render those yet: it shows
+  `hub-0` only, because remote hosts still hydrate with `rigs: []` and nothing reads the hosts-down
+  list. That gap is stage 3.1 and 3.2, and HUB-TEST.md records the evidence.
+
 ## How the pieces fit
 
 - **Daemon.** `rig daemon start` detaches, so the entrypoint runs
@@ -120,7 +158,11 @@ to answer prompts. The pod is the boundary:
   user, so both are readable from their environment or the terminal-token file. Nothing else: no
   Git push credentials, no service-account token.
 - **Who can use the bearer:** nobody outside the pod. The NetworkPolicy denies all ingress, so
-  only `kubectl port-forward` (which needs RBAC on the namespace) reaches the daemon.
+  only `kubectl port-forward` (which needs RBAC on the namespace) reaches the daemon. The one
+  exception is the hub pod, which may reach a team daemon on 7433 and nothing else can.
+- **The hub holds every team's bearer.** It runs no agents, binds loopback, has egress to cluster DNS
+  and the team daemons only, and is reached only through `kubectl port-forward`. Access to the hub is
+  access to the namespace.
 - **Where agents can connect:** the internet, cluster DNS, and the model server on port 8731. Not
   the cluster, the k3d node network with the API server, the LAN, the tailnet or link-local
   addresses. If the model server moves, change both `kit/pi/models.json` and
