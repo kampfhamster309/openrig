@@ -13,7 +13,8 @@
 # talks to its own daemon over loopback.
 #
 # Environment: KUBECONFIG, KUBECTL (default kubectl), RIG_DISPATCH_NAMESPACE (default openrig),
-# RIG_DISPATCH_IMAGE (default: the image pinned in ../kustomization.yaml).
+# RIG_DISPATCH_IMAGE (default: the image pinned in ../kustomization.yaml), RIG_DISPATCH_HUB_POD
+# (default hub-0; the hub to register teams with. No Ready hub pod there: registration is skipped).
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -51,6 +52,147 @@ default_image() {
   local kz="$HERE/../kustomization.yaml"
   [ -f "$kz" ] || die "set RIG_DISPATCH_IMAGE"
   awk '/newName:/{n=$2} /newTag:/{t=$2} END{if(n&&t) print n":"t}' "$kz"
+}
+
+# --- hub (stage 2) -------------------------------------------------------------------------------
+#
+# The hub (../hub) is an OpenRig daemon with no rigs whose hosts.yaml lists every team pod, so one
+# TUI shows every team at once. The dispatcher keeps it in step: `start` registers a team once its
+# pod is Ready, `delete` unregisters it. With no Ready hub pod in the namespace every helper here is
+# a no-op and the dispatcher behaves exactly as it did in stage 1.
+
+HUB_POD="${RIG_DISPATCH_HUB_POD:-hub-0}"
+_hub_npm_root=""
+
+hub_ready() {
+  "$KUBECTL" -n "$NS" get pod "$HUB_POD" -o json 2>/dev/null |
+    jq -e 'any(.status.conditions[]?; .type == "Ready" and .status == "True")' >/dev/null 2>&1
+}
+
+hub_exec() { "$KUBECTL" -n "$NS" exec -i "$HUB_POD" -c daemon -- "$@"; }
+
+# What the hub dials. A bearer is required: the team pod binds 0.0.0.0, and sending one also
+# satisfies the daemon's Host-header check, so the teams need no OPENRIG_ALLOWED_HOSTS.
+hub_host_url() { printf 'http://%s.teams.%s.svc:7433' "$(pod_of "$1")" "$NS"; }
+hub_bearer_file() { printf '/home/openrig/.openrig/hosts.d/%s.bearer' "$(name_of "$1")"; }
+team_bearer() { k get secret "$(name_of "$1")" -o jsonpath='{.data.bearer}' | base64 -d; }
+
+# The hub image has no PyYAML. The CLI's own `yaml` dependency is the same parser `rig host add`
+# writes with, so the registry is edited with it.
+hub_npm_root() {
+  # </dev/null matters: this is often called while a pipeline has stdin open, and
+  # `kubectl exec -i` would otherwise read the script meant for the next command.
+  [ -n "$_hub_npm_root" ] || _hub_npm_root=$(hub_exec sh -c 'npm root -g' </dev/null 2>/dev/null | tail -n1)
+  printf '%s' "$_hub_npm_root"
+}
+
+# There is no `rig host remove`, so hosts.yaml is edited directly, and host-bindings.json (the
+# trust-on-first-use alias sidecar) is cleaned in the same pass:
+#   HUB_MODE=has    exit 0 if HUB_HOST_ID is registered, 1 if it is not
+#   HUB_MODE=remove drop that entry and its alias, rewriting each file via tmp + rename at 0600
+hub_registry() {
+  local mode=$1 host=$2 root
+  root=$(hub_npm_root)
+  printf '%s\n' '
+const fs = require("fs"), path = require("path");
+const home = process.env.OPENRIG_HOME || process.env.HOME + "/.openrig";
+const yamlFile = path.join(home, "hosts.yaml");
+const bindFile = path.join(home, "host-bindings.json");
+const mode = process.env.HUB_MODE, id = process.env.HUB_HOST_ID;
+function loadYaml() {
+  const r = process.env.NPM_ROOT;
+  if (r) { try { return require(path.join(r, "@openrig/cli/node_modules/yaml")); } catch (e) {}
+  }
+  return require("yaml");
+}
+// tmp + rename, as the CLI does. The daemon re-reads hosts.yaml on every request, so an
+// in-place truncate could be observed half written.
+function writeAtomic(file, text) {
+  const tmp = file + ".tmp-" + process.pid;
+  fs.writeFileSync(tmp, text, { mode: 0o600 });
+  fs.renameSync(tmp, file);
+}
+if (!fs.existsSync(yamlFile)) process.exit(mode === "has" ? 1 : 0);
+const YAML = loadYaml();
+const doc = YAML.parse(fs.readFileSync(yamlFile, "utf8")) || {};
+const hosts = Array.isArray(doc.hosts) ? doc.hosts : [];
+if (mode === "has") process.exit(hosts.some((h) => h && h.id === id) ? 0 : 1);
+const kept = hosts.filter((h) => !(h && h.id === id));
+if (kept.length !== hosts.length) {
+  doc.hosts = kept;
+  writeAtomic(yamlFile, YAML.stringify(doc));
+}
+// A leftover alias is harmless - a re-dispatched slug presents the same self-id - but it is
+// residue, and "the hub forgot the team" should mean the hub forgot the team.
+try {
+  const b = JSON.parse(fs.readFileSync(bindFile, "utf8"));
+  if (b && b.bindings) {
+    let n = 0;
+    for (const [k, v] of Object.entries(b.bindings)) {
+      if (k === id || (v && v.hostId === id)) { delete b.bindings[k]; n++; }
+    }
+    if (n > 0) writeAtomic(bindFile, JSON.stringify(b, null, 2) + "\n");
+  }
+} catch (e) { /* no sidecar, or unreadable: nothing to clean */ }
+console.log(kept.length === hosts.length ? "absent" : "removed " + id);
+' | hub_exec env NPM_ROOT="$root" HUB_MODE="$mode" HUB_HOST_ID="$host" node -
+}
+
+hub_register() {
+  local slug=$1 ticket=$2 rig=$3
+  local host bf sub
+  host=$(name_of "$slug"); bf=$(hub_bearer_file "$slug"); sub="feed.subscriptions.$host.enabled"
+
+  if ! hub_ready; then
+    log "WARNING: no Ready hub pod $HUB_POD, so team $host is NOT registered with any hub: no hosts.yaml entry, no bearer file $bf, no $sub. The team works; the hub just does not see it. Re-run '$0 start $ticket' once the hub is Ready."
+    return 0
+  fi
+  local url bearer
+  url=$(hub_host_url "$slug")
+  bearer=$(team_bearer "$slug")
+  [ -n "$bearer" ] || die "secret $host has no bearer key; cannot register it with the hub"
+
+  # The bearer travels on stdin, never in a command line the node can see.
+  printf '%s' "$bearer" | hub_exec sh -c "umask 077; mkdir -p $(dirname "$bf"); cat > '$bf'; chmod 0600 '$bf'" \
+    || die "could not write $bf in $HUB_POD; $host has no bearer file on the hub"
+
+  if hub_registry has "$host" >/dev/null 2>&1; then
+    log "hub already has host $host"
+  else
+    hub_exec rig host add --id "$host" --transport http --url "$url" --bearer-file "$bf" \
+      --notes "ticket $ticket, rig ${rig:-none}" >/dev/null \
+      || die "the hub refused to register $host; it has a bearer file but no hosts.yaml entry"
+    # Re-read rather than trust the verb: a subscription for a host missing from
+    # hosts.yaml makes the hub report the team as unreachable forever.
+    hub_registry has "$host" >/dev/null 2>&1 \
+      || die "$host is still not in the hub's hosts.yaml after rig host add"
+    log "registered $host with the hub at $url"
+  fi
+  # Without the subscription the hub lists the host but never reads its queue state, which is
+  # as misleading as a missing host, so it fails the same way instead of being logged away.
+  hub_exec rig config set "$sub" true >/dev/null \
+    || die "host $host is registered but $sub is not true: the hub will show it without its queue"
+}
+
+hub_unregister() {
+  local slug=$1
+  local host bf sub
+  host=$(name_of "$slug"); bf=$(hub_bearer_file "$slug"); sub="feed.subscriptions.$host.enabled"
+
+  if ! hub_ready; then
+    log "WARNING: no Ready hub pod $HUB_POD, so $host is STILL registered with it. Once the hub is Ready, clean it by hand: drop the $host entry from ~/.openrig/hosts.yaml, run 'rig config reset $sub', and delete ~/.openrig/hosts.d/$host.bearer."
+    return 0
+  fi
+  local ok=1
+  hub_registry remove "$host" >/dev/null 2>&1 || { ok=0; log "could not remove $host from the hub's hosts.yaml or host-bindings.json"; }
+  # `rig config reset` is the unset: it drops the whole feed.subscriptions.<host> node.
+  hub_exec rig config reset "$sub" >/dev/null 2>&1 || { ok=0; log "could not reset $sub on the hub"; }
+  hub_exec rm -f "$bf" >/dev/null 2>&1 || { ok=0; log "could not remove $bf from the hub"; }
+  if [ "$ok" = 1 ]; then
+    log "unregistered $host from the hub"
+  else
+    log "WARNING: $host is only partly unregistered; check hosts.yaml, $sub and $bf on $HUB_POD by hand"
+  fi
 }
 
 # --- start -------------------------------------------------------------------------------------
@@ -249,6 +391,10 @@ cmd_start() {
     annotate "$slug" lead "$lead"
     log "handed $ticket to $session as $qitem"
   fi
+  # After the handover, on purpose: the hub is a view-only extra, and a hub that is Ready but
+  # failing (pods/exec RBAC, a full volume, a hosts.yaml `rig host add` refuses) must never
+  # leave a team running with no ticket. The failure is still loud and still exits non-zero.
+  hub_register "$slug" "$ticket" "$(annotation "$(sts_json "$slug")" rig)"
   cmd_status "$ticket"
 }
 
@@ -422,6 +568,8 @@ cmd_delete() {
   local slug sts rig name
   slug=$(slug_of "$1"); name=$(name_of "$slug")
   sts=$(sts_json "$slug" || true)
+  # Unregister before the pod goes, so the hub never keeps a host it can no longer reach.
+  hub_unregister "$slug"
   if [ -n "$sts" ]; then
     rig=$(annotation "$sts" rig)
     if [ -n "$rig" ] && k get pod "$(pod_of "$slug")" >/dev/null 2>&1; then
