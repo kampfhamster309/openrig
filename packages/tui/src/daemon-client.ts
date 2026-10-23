@@ -153,8 +153,8 @@ export class DaemonClient {
     }
   }
 
-  private async get(route: string, fetchImpl = this.fetchImpl): Promise<unknown> {
-    const res = await fetchImpl(`${this.baseUrl}${route}`, { headers: this.headers, signal: AbortSignal.timeout(5_000) });
+  private async get(route: string, fetchImpl = this.fetchImpl, timeoutMs = 5_000): Promise<unknown> {
+    const res = await fetchImpl(`${this.baseUrl}${route}`, { headers: this.headers, signal: AbortSignal.timeout(timeoutMs) });
     if (!res.ok) {
       const parsed = await res.json().catch(() => null);
       const detail = parsed && typeof parsed === "object" && "error" in parsed ? ` — ${(parsed as { error: unknown }).error}` : "";
@@ -370,6 +370,16 @@ export class DaemonClient {
   }
   attentionAggregate() {
     return this.get(`/api/queue/attention-aggregate`);
+  }
+  /** The hub-side fleet summary: ONE fan-out that answers reachability, rigs, seats,
+   * open work and the stall verdict for every registered host. OPTIONAL on purpose —
+   * a daemon that predates the route 404s and the page renders exactly as before. */
+  fleetSummary(options: { optional?: boolean; timeoutMs?: number } = {}) {
+    // The caller supplies the wait, derived from the operator's real budget (the last
+    // payload's own hostTimeoutMs/concurrency/host count). The 5 s client default would
+    // abandon a healthy fan-out whenever a host is slow or the concurrency cap queues
+    // legs up, and the page would lose STALLED and its remote rows for that poll.
+    return this.get(`/api/fleet/summary`, options.optional ? this.optionalFetchImpl : this.fetchImpl, options.timeoutMs ?? 5_000);
   }
   rigStatus(rigId: string) {
     return this.get(`/api/rigs/${encodeURIComponent(rigId)}/status`);

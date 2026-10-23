@@ -274,6 +274,82 @@ export interface SeatActivitySummary {
   logicalId: string;
   terminalActive: boolean | null;
   lastActivityAt: string | null;
+  /** Set ONLY for a seat read off ANOTHER host by the hub-side fleet summary.
+   * A local seat leaves it absent, so a row built from a remote seat can be
+   * labelled `[host]` instead of being painted under a local seat of the same
+   * name — the exact failure the cross-host PARKED join refused before. */
+  hostId?: string;
+}
+
+/** One rig or host the hub's fleet summary called STALLED: it holds open work and
+ * nothing has changed on it for longer than the threshold. The duration and the
+ * threshold travel with the row — the TUI never hardcodes a number it did not read. */
+export interface FleetStallRow {
+  /** "host" or "rig" — the two levels the verdict is served at. */
+  level: "host" | "rig";
+  hostId: string;
+  rigName: string | null;
+  /** open queue items the verdict counted */
+  openWorkCount: number;
+  /** minutes since the newest qualifying progress, as the hub computed it */
+  minutesSinceProgress: number | null;
+  /** the newest qualifying progress stamp, served verbatim */
+  lastProgressAt: string | null;
+  /** the threshold this verdict used */
+  thresholdMinutes: number;
+}
+
+/** The slice of the hub-side fleet summary the TUI consumes. Declared structurally
+ * (not imported from the daemon) so an OLDER daemon that 404s the route is a plain
+ * miss rather than a coupling; only the fields the page reads are named. */
+export interface FleetSummaryRead {
+  items: Array<{
+    hostId: string;
+    reachable: boolean;
+    progress: { lastQueueTransitionAt: string | null; minutesSinceProgress: number | null; stalled: boolean | null; openWorkCount: number };
+    rigs: Array<{
+      rigName: string;
+      hostId: string;
+      progress: { lastQueueTransitionAt: string | null; minutesSinceProgress: number | null; stalled: boolean | null; openWorkCount: number };
+      seats: Array<{
+        hostId: string;
+        rigName: string;
+        logicalId: string | null;
+        canonicalSessionName: string | null;
+        activity: string | null;
+        lastActivityAt: string | null;
+      }>;
+    }>;
+  }>;
+  stallThresholdMinutes?: number;
+  registryError?: string | null;
+  /** The fan-out's own budget and reach, echoed by the route. The reader needs them to
+   *  size its NEXT wait from the operator's real settings instead of the compiled
+   *  defaults — a hub configured for a 15 s per-host budget is not waited on for 20 s.
+   *  `targetedHostIds` counts hosts the fan-out tried, including ones that failed;
+   *  `items` does not, so the wait must not be sized from it. */
+  hostTimeoutMs?: number;
+  concurrency?: number;
+  targetedHostIds?: string[];
+  /** Per-host reachability, including hosts that failed — the sibling of `items`, which
+   *  only carries hosts that answered. */
+  hosts?: Array<{ hostId: string; status: string }>;
+  /** Every open queue row on every reachable host, in every open state — the read
+   * that makes a remote blocked-on-agent or in-progress row visible at all. */
+  openQueue?: Array<{
+    hostId: string;
+    rigName: string | null;
+    qitemId: string;
+    state: "pending" | "in-progress" | "blocked";
+    destinationSession: string | null;
+    blockedOn: string | null;
+    handedOffTo: string | null;
+    claimedAt: string | null;
+    priority: string | null;
+    summary: string | null;
+    tags: string[];
+    tsUpdated: string | null;
+  }>;
 }
 
 import type { MissionScopesSnap } from "./scopes/scopes-model.js";
@@ -465,6 +541,18 @@ export interface FleetSnapshot {
   /** Per-seat ps/activity (the PARKED join's right side), one entry per running
    * agent seat with a canonical session, from the shipped nodes read. */
   seatActivity: SeatActivitySummary[];
+  /** The SAME join's right side for seats on ANOTHER host, from the hub-side fleet
+   * summary. Empty when there is no remote host or the local daemon is too old to
+   * serve the read — and then a remote in-progress row joins nothing, which is the
+   * honest-unknown behaviour this field replaced, not a bug. */
+  remoteSeatActivity: SeatActivitySummary[];
+  /** Rigs/hosts the hub called STALLED (open work, no progress past the threshold).
+   * Empty when nothing stalled OR when the read is unavailable — see fleetProbed. */
+  stalled: FleetStallRow[];
+  /** The stall threshold the served verdict used, verbatim; absent with no read. */
+  stallThresholdMinutes?: number;
+  /** false until the fleet summary has answered — honest-unknown vs proven-none. */
+  fleetProbed: boolean;
   /** PULSE UP NEXT source (increment 3) — the shipped state=pending read
    * (unclaimed backlog). Carried in the daemon's served order (ts_created DESC);
    * the render keeps only unclaimed (claimedAt null) and caps for display. */

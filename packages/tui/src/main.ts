@@ -36,7 +36,7 @@ import { StartupController } from "./startup.js";
 import { dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
 import type { Action, FleetSnapshot, Screen } from "./types.js";
-import type { SpecReviewCache } from "./hydrate.js";
+import type { FleetReadRetention, SpecReviewCache } from "./hydrate.js";
 import { MOTION_FRAME_MS } from "./visual-layout.js";
 import { launchProcess, runSpecLaunch } from "./specs/launch.js";
 import { runCopySession, processCopyTerminal } from "./print-for-copy.js";
@@ -114,6 +114,10 @@ async function run(): Promise<void> {
   // pure and takes the clock + owner state as inputs. motionTimer keeps
   // redrawing ONLY while the frame reports live motion (spinner or flash).
   const reviewCache: SpecReviewCache = new Map();
+  // Caller-owned, like reviewCache: the fleet read's last good payload and the shape of
+  // the fleet it came from, so the next poll sizes its wait from the operator's real
+  // budget rather than the compiled defaults.
+  const fleetRetention: FleetReadRetention = { last: null };
   const selectedSliceDirectory = (): string | null => {
     const current = view.get();
     if (current.scopesSelected) return current.scopesSelected.slice;
@@ -125,7 +129,7 @@ async function run(): Promise<void> {
   const selectedRigName = (): string | null =>
     view.get().drill.find((part) => part.kind === "rig")?.name ?? null;
   const live = client
-    ? createLiveRefresh({ scopeKey: () => pageReadKey(view.get()), hydrate: (page, signal) => hydrateSnapshot(client.forPage(page, signal), reviewCache, view.get().scopesMission, selectedSliceDirectory(), selectedRigName(), view.get()), onFrame: () => draw(), now: () => Date.now() })
+    ? createLiveRefresh({ scopeKey: () => pageReadKey(view.get()), hydrate: (page, signal) => hydrateSnapshot(client.forPage(page, signal), reviewCache, view.get().scopesMission, selectedSliceDirectory(), selectedRigName(), view.get(), fleetRetention), onFrame: () => draw(), now: () => Date.now() })
     : null;
   let motionTimer: NodeJS.Timeout | null = null;
   // S19 AM-R18 — the open view updates ITSELF: oracle pushes drive the refresh owner.

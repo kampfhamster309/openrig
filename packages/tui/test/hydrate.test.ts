@@ -152,6 +152,10 @@ const FIXTURES: Record<string, unknown> = {
   "/api/queue/list?attention=1": [],
 
   "/api/scopes?detail=1": { missions: [] },
+  // The hub-side fleet read. The fixture represents a CURRENT daemon, so the route is
+  // served; a daemon that does not have it is covered in hydrate-fleet-summary.test.ts,
+  // where the interesting claim is what the page does when the read is absent or fails.
+  "/api/fleet/summary": { items: [], hosts: [{ hostId: "local", status: "ok" }], openQueue: [], generatedAt: "2026-10-23T12:00:00.000Z", stallThresholdMinutes: 30, enabledProgressSources: ["queue-transition"] },
   "/api/views/execution": { rowCount: 1, rows: [{ view: "execution", mission: "release-0.5.8", q1_lanes: [], q2_sequencing: [], q4_ladder: [], q5_park: [], sources: {} }] },
   "/api/queue/list?state=blocked": [],
   // PULSE ◌ PARKED WITH BATON source (increment 2b) — in-progress qitems

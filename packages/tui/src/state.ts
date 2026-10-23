@@ -31,7 +31,7 @@ export function defaultSections(): SectionDef[] {
 }
 
 export function emptySnapshot(): FleetSnapshot {
-  return { health: { availability: "unavailable", evaluatedAt: null, total: 0, truncated: false, records: [] }, hosts: [], specs: [], needs: [], humanQueueProbed: false, execution: null, executionMission: null, attention: [], fleetQueue: [], blocked: [], inProgress: [], seatActivity: [], pending: [], recentlyFinished: [], hostsDown: [], stream: [], readErrors: [] };
+  return { health: { availability: "unavailable", evaluatedAt: null, total: 0, truncated: false, records: [] }, hosts: [], specs: [], needs: [], humanQueueProbed: false, execution: null, executionMission: null, attention: [], fleetQueue: [], blocked: [], inProgress: [], seatActivity: [], remoteSeatActivity: [], stalled: [], fleetProbed: false, pending: [], recentlyFinished: [], hostsDown: [], stream: [], readErrors: [] };
 }
 
 export interface CreateViewStateOptions {

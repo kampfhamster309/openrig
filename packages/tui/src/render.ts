@@ -158,7 +158,8 @@ function queueFacts(snap: FleetSnapshot, session: string | null | undefined, rem
   // A REMOTE seat's queue lives on its own daemon. These four lists are LOCAL reads, so
   // joining them on a bare session name would paste a local seat's rows onto a remote
   // one the moment both exist. No read here gives a remote seat's queue per seat, so the
-  // cell says so rather than guessing.
+  // cell says so rather than guessing. The fleet summary does carry remote open rows;
+  // this cell does not use them yet.
   if (remote) return { count: 0, work: "remote", now: "queue not served here" };
   const sources: Array<["needs you" | "blocked" | "working" | "queued", FleetSnapshot["attention"]]> = [
     ["needs you", snap.attention], ["blocked", snap.blocked], ["working", snap.inProgress], ["queued", snap.pending],

@@ -182,6 +182,12 @@ export function demoSnapshot(): FleetSnapshot {
       { session: "dev50-guard@openrig-build", logicalId: "dev50.guard", terminalActive: false, lastActivityAt: "2026-08-06T11:13:00.000Z" },
       { session: "dev50-qa@openrig-build", logicalId: "dev50.qa", terminalActive: null, lastActivityAt: null },
     ],
+    // The demo fleet has NO remote host, so the hub-side fleet read contributes
+    // nothing here — and the rendered page is byte-identical to the one this fixture
+    // produced before the read existed. That is the contract, not an omission.
+    remoteSeatActivity: [],
+    stalled: [],
+    fleetProbed: false,
     // PULSE ○ UP NEXT source — shaped like the shipped state=pending read
     // (unclaimed backlog, served ts_created DESC → carried verbatim). SIX items
     // exercise the display-cap overflow: the view renders the first four + a "…"

@@ -306,7 +306,16 @@ function qitemShort(qitemId: string): string {
  * DURATION is a VIEW derived HERE from the owner's raw lastActivityAt (arch
  * 3a947fb1) + the reader clock (nowMs) — the renderer-side test-clock seam,
  * DISTINCT from the .cjs OPENRIG_TEST_CLOCK_NOW env clock. Render: owner ·
- * qitem-short · idle-duration · no-handoff · the drill hint. */
+ * qitem-short · idle-duration · no-handoff · the drill hint.
+ *
+ * The seat map is keyed by host+session, NOT by session alone. A remote row and a
+ * local seat can share a session name, and painting a remote host's stranded baton
+ * under a local seat - unlabelled - is worse than not joining at all. A row with no
+ * hostId is local and looks up under the empty host; a remote row matches only a
+ * seat the hub read off THAT host, and then carries its own [host] label. This is
+ * the join that could not run before the hub-side fleet read existed. A remote row
+ * whose seat the summary did not answer for stays excluded: unknown, never assumed
+ * idle. */
 function parkedRows(
   inProgress: QueueRead[],
   seatBySession: Map<string, SeatActivitySummary>,
@@ -316,7 +325,7 @@ function parkedRows(
   for (const q of inProgress) {
     if (q.state !== "in-progress") continue;       // defensive: the read is already state=in-progress
     if (q.handedOffTo != null) continue;           // handed off → not a stranded baton
-    const seat = seatBySession.get(q.destinationSession);
+    const seat = seatBySession.get(seatKey(q.hostId, q.destinationSession));
     if (!seat || seat.terminalActive !== false) continue; // IDLE owner ONLY (null ≠ idle — honest-unknown)
     const idle = ageLabel(seat.lastActivityAt, nowMs);
     // r1 belt (incr-3): a false-active seat carries a record, so it carries a
@@ -334,6 +343,45 @@ function parkedRows(
     });
   }
   return out;
+}
+
+/** The PARKED join's map key: host + session. A local row has no hostId, so it keys
+ * under the empty host; a remote row keys under the host the hub read it from. */
+function seatKey(hostId: string | null | undefined, session: string): string {
+  return `${hostId ?? ""}|${session}`;
+}
+
+/** ⚑ STALLED rows - the hub's own verdict, carried verbatim: open work, and no
+ * qualifying progress for longer than the threshold. The DURATION is the point, and
+ * the threshold travels with the row so a reader can tell a 31-minute verdict from
+ * a 6-hour one. A host and each of its rigs carry their own verdict; a rig row
+ * names the rig, so the operator knows which team owes the answer rather than only
+ * which machine. Nothing here is computed in the TUI. */
+function stalledRows(stalled: FleetSnapshot["stalled"]): PulseException[] {
+  // A host with exactly one rig would otherwise render two lines differing only in the
+  // rig name — same duration, same count, same threshold. One line says it once, and it
+  // names the rig, because the team is the useful referent. With several rigs the host
+  // row and the rig rows answer different questions (the machine vs each team), so all
+  // stay.
+  const rigCounts = new Map<string, number>();
+  for (const row of stalled) {
+    if (row.level === "rig") rigCounts.set(row.hostId, (rigCounts.get(row.hostId) ?? 0) + 1);
+  }
+  return stalled
+    .filter((row) => !(row.level === "host" && (rigCounts.get(row.hostId) ?? 0) === 1))
+    .map((row) => {
+      const age = row.minutesSinceProgress == null
+        ? "age unknown"
+        : `${row.minutesSinceProgress}m since last progress`;
+      return {
+        glyph: "⚑",
+        token: "warn" as Token,
+        subject: row.rigName ?? row.hostId,
+        claim: ` — ${age}, ${row.openWorkCount} open`,
+        meta: ` · threshold ${row.thresholdMinutes}m`,
+        host: row.hostId,
+      };
+    });
 }
 
 /** ✕ HOSTS DOWN rows — the aggregate host legs that are not `ok`, and ONLY those.
@@ -472,20 +520,15 @@ export function buildPulseModel(snap: FleetSnapshot, nowMs: number = Date.now())
   // derived at the renderer. Zero parked = silence (OMITTED), like the other live
   // joins — the incr-2 "read pending" placeholder is retired.
   //
-  // CROSS-HOST, and where it stops: the attention aggregate is the ONLY cross-host
-  // queue read the shipped surface offers (`/api/queue/*` is deliberately outside the
-  // read-through allowlist), and it carries the attention class — a row destined for a
-  // human seat, or blocked on one. So:
-  // - a remote row the fleet read already showed under NEEDS YOU is deduped out below,
-  //   exactly as a local one is;
-  // - a remote in-progress row joins NEITHER PARKED NOR NOW. Both look the row up in
-  //   the LOCAL seatActivity by bare destinationSession and ignore the host, and
-  //   seatActivity holds only agent seats — so an attention-class (human-destined)
-  //   remote row can never join honestly, and a coincidental session-name match across
-  //   hosts would paint a remote host's work under a local seat with no `[host]` label.
-  //   Per-seat activity is a local ps read; no signal is honest-unknown, never an
-  //   assumed idle owner. Cross-host PARKED/NOW needs per-seat activity read off the
-  //   remote host itself, which a local ps read cannot supply.
+  // CROSS-HOST: the fleet summary read answers per-seat activity on the remote host
+  // itself, which a local ps read cannot supply, so a remote in-progress row CAN join
+  // PARKED — keyed by host AND session, never by session alone. A remote row and a local
+  // seat can share a name, and painting a remote host's stranded baton under a local seat
+  // with no `[host]` label is worse than not joining at all. A remote row whose seat the
+  // fleet read did not answer for stays out: no signal is honest-unknown, never an
+  // assumed idle owner. A remote row already shown under NEEDS YOU is deduped out
+  // below, as a local one is. NOW stays local: it reads only this host's seat
+  // activity, so a remote row never joins it.
   const localQueueIds = new Set(
     [...snap.attention, ...snap.blocked, ...snap.inProgress, ...snap.pending, ...snap.recentlyFinished]
       .map((row) => row.qitemId),
@@ -494,13 +537,16 @@ export function buildPulseModel(snap: FleetSnapshot, nowMs: number = Date.now())
   // unlabelled and once labelled — the same id rule NEEDS YOU already applies.
   const remote = snap.fleetQueue.filter((row) => !localQueueIds.has(row.qitemId));
   const remoteWithState = (state: string) => remote.filter((row) => row.state === state);
-  const seatBySession = new Map(snap.seatActivity.map((s) => [s.session, s]));
+  const seatBySession = new Map<string, SeatActivitySummary>([
+    ...snap.seatActivity.map((s) => [seatKey(null, s.session), s] as [string, SeatActivitySummary]),
+    ...snap.remoteSeatActivity.map((s) => [seatKey(s.hostId, s.session), s] as [string, SeatActivitySummary]),
+  ]);
   const remoteNeedIds = new Set(
     snap.needs.filter((item) => item.hostId != null && item.hostId !== LOCAL_HOST_ID_SENTINEL).map((item) => item.qitemId ?? ""),
   );
   const attentionIds = new Set([...snap.attention.map(row => row.qitemId), ...remoteNeedIds]);
   const parked = parkedRows(
-    snap.inProgress.filter(row => !attentionIds.has(row.qitemId)),
+    [...snap.inProgress.filter(row => !attentionIds.has(row.qitemId)), ...remoteWithState("in-progress")],
     seatBySession,
     nowMs,
   );
@@ -515,6 +561,12 @@ export function buildPulseModel(snap: FleetSnapshot, nowMs: number = Date.now())
   // Composed BESIDE the items (hydrate), and previously rendered nowhere at all.
   const down = hostsDownRows(snap.hostsDown);
   if (down.length > 0) exceptions.push({ glyph: "✕", token: "error", label: "HOSTS DOWN", rows: down });
+
+  // ⚑ STALLED — the hub's verdict that a team holds open work and nothing has moved.
+  // Absent when nothing stalled AND when the read is unavailable; the two are told
+  // apart by snap.fleetProbed, which is why that flag exists.
+  const stalled = stalledRows(snap.stalled);
+  if (stalled.length > 0) exceptions.push({ glyph: "⚑", token: "warn", label: "STALLED", rows: stalled });
 
   const now = nowRows(snap.seatActivity, snap.inProgress, snap);
   const finished = finishedRows(snap.recentlyFinished, LANE_ROW_CAP, snap);
