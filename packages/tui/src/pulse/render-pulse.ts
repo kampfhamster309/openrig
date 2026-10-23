@@ -6,6 +6,7 @@
 import type { Token } from "../theme.js";
 import type { Action } from "../types.js";
 import type { PulseModel, PulseExceptionSection, PulseLane, PulseLaneRow } from "./pulse-model.js";
+import { hostLabel } from "./pulse-model.js";
 
 interface Seg { text: string; token?: Token; bold?: boolean; bg?: Token; inverse?: boolean }
 interface Line { text: string; segs?: Seg[]; selected?: boolean }
@@ -38,9 +39,13 @@ export function renderExceptionSection(section: PulseExceptionSection): Line[] {
     ];
   }
   const header = line([{ text: `${section.glyph} ${section.label} (${section.rows.length})`, token: section.token, bold: true }]);
-  const rows = section.rows.map((r) =>
-    line([
+  const rows = section.rows.flatMap((r) => {
+    const row = line([
       { text: ` ${r.glyph} `, token: r.token },
+      // Cross-host provenance BEFORE the subject: on a hub the first question is
+      // which machine owes the answer. A local row carries no host, so nothing here
+      // changes for an operator with no remote hosts.
+      ...(r.host ? [{ text: `${hostLabel(r.host)} `, token: "dim" as Token }] : []),
       // Founder Option-1: the who/what SUBJECT leads in BOLD (the mock's <b>). Bold
       // needs a color token to render in this pipeline (a bold-only seg is drawn as
       // plain ink), so the emphasis ink `bright` carries it — the detail (claim)
@@ -48,8 +53,12 @@ export function renderExceptionSection(section: PulseExceptionSection): Line[] {
       { text: r.subject, token: "bright", bold: true },
       { text: r.claim },
       { text: r.meta, token: "dim" },
-    ]),
-  );
+    ]);
+    // The address an operator types SOMEWHERE ELSE (a remote item's action cannot run
+    // against this daemon). Its own dim line, so a narrow terminal truncates the
+    // claim and still keeps the head of the command.
+    return r.hint ? [row, line([{ text: `   ${r.hint.trimStart()}`, token: "dim" }])] : [row];
+  });
   return [header, ...rows];
 }
 

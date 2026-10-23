@@ -167,15 +167,31 @@ export interface NeedsItem {
   qitemId?: string | null;
   evidenceRef?: string | null;
   unblocks?: string | null;
+  /** The composed age the host's own composer stamped (VERBATIM); absent when the
+   * host could not date the row. PULSE renders an honest "" age, never a guess. */
+  ageIso?: string | null;
 }
 
 /** Host/rig-down rows — composed BESIDE the Needs-You items at render, never
- * projected into the item shape (§4.A: composeNeedsYou supplies no host rows). */
+ * projected into the item shape (§4.A: composeNeedsYou supplies no host rows).
+ * A row whose `hostId` starts with RIG_DOWN_ID_PREFIX is a LOCAL RIG, not a host. */
 export interface HostDown {
   hostId: string;
   status: string;
   error?: string;
 }
+
+/** The fan-out contract's local sentinel (`daemon/domain/hosts/fanout-contract.ts`
+ * — LOCAL_HOST_ID). Every daemon stamps its OWN rows with this literal, never with
+ * its self-host id, so it is the one reliable "this row is mine" marker across hosts.
+ * Spelled ONCE and reused (hydrate's drop, the remote-label test, the topology filter).
+ */
+export const LOCAL_HOST_ID_SENTINEL = "local";
+
+/** hydrate stamps a rig-down row's id with this prefix, because a rig is not a host
+ * and the row has to say which it is. Consumers that mean HOSTS specifically filter on
+ * it rather than re-typing the string. */
+export const RIG_DOWN_ID_PREFIX = "rig:";
 
 /** TUI-local read shape for the PULSE exception joins — the subset of the
  * daemon QueueItem (queue-repository.ts) the two LIVE joins consume. Carried
@@ -203,6 +219,13 @@ export interface QueueRead {
    * per-row lookup) and stamps the owner session here; null when unresolved (gate
    * name / lookup miss) — the render falls back to the raw blockedOn, never fabricates. */
   blockerSession?: string | null;
+  /** Fleet provenance, present ONLY on a row that came from a REMOTE host through
+   * the attention-aggregate read (the aggregate stamps every local row with the
+   * `local` sentinel, and hydrate drops those — the local reads already carry them).
+   * The renderer prints it as the `[host]` label so an operator reading a hub can
+   * tell which machine owes the answer. Local rows carry no label at all, so an
+   * operator with no remote hosts sees no new labels. */
+  hostId?: string;
 }
 
 /** One seat's ps/activity summary — the PULSE ◌ PARKED WITH BATON join's right
@@ -389,6 +412,12 @@ export interface FleetSnapshot {
   specs: SpecEntry[];
   /** grounded composeNeedsYou union in daemon priority order, VERBATIM (PIN 3) */
   needs: NeedsItem[];
+  /** Cross-host queue rows from the attention-aggregate read, REMOTE ONLY (the
+   * aggregate stamps every local row with the `local` sentinel, and hydrate drops
+   * those — the local reads already carry them). Each row keeps its `hostId`. The TUI
+   * consumed this payload's `hosts` long before it consumed its `items`; this is the
+   * items leg. Empty when no remote host is subscribed — silence, not a failure. */
+  fleetQueue: QueueRead[];
   /** false until the human-queue read has answered — honest-unknown vs proven-empty */
   humanQueueProbed: boolean;
   /** PULSE ▲ NEEDS YOU source — the shipped attention read (already the exact

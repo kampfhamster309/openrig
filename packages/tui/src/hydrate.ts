@@ -20,6 +20,7 @@ import type { ConnectionsRead, ControlPlaneRead, SlackManifestRead } from "./con
 import { DaemonClient } from "./daemon-client.js";
 import { parse as parseYaml } from "yaml";
 import type { AgentRow, FleetSnapshot, HealthCoverage, HealthRecord, HostNode, NeedsItem, PodNode, QueueRead, RecentTransitionSnap, SeatActivitySummary, SliceDetailSnap, SpecEntry, ViewState } from "./types.js";
+import { LOCAL_HOST_ID_SENTINEL, RIG_DOWN_ID_PREFIX } from "./types.js";
 import { isHumanSeatSession } from "./pulse/pulse-model.js";
 
 // Narrow read-shapes: just the served fields this module consumes (names match
@@ -150,6 +151,7 @@ interface NeedsYouItemRead {
   summary: string;
   leg: string;
   where: string;
+  ageIso?: string | null;
   destinationSession: string | null;
   derived: { kind: string; evidence: string; threshold: string } | null;
   qitemId: string | null;
@@ -163,6 +165,9 @@ interface ReviewFleetRead {
 }
 interface AttentionAggregateRead {
   hosts?: Array<{ hostId: string; status: string; error?: string }>;
+  /** The fan-out's queue rows, each stamped with its `hostId`. The TUI consumed
+   * `hosts` long before these; `toFleetQueueRead` is the items leg. */
+  items?: unknown[];
 }
 interface StreamItemRead {
   tsEmitted: string;
@@ -201,6 +206,42 @@ function toQueueRead(item: QueueItemRead): QueueRead {
     body: item.body ?? "",
     claimedAt: item.claimedAt,
     tsUpdated: item.tsUpdated,
+  };
+}
+
+/** The fan-out contract's local sentinel lives in types.ts as ONE constant; this is
+ * the only place the TUI needs it, and it is what makes "no local row appears twice"
+ * structural rather than a filter each call-site has to remember. */
+
+/** One attention-aggregate item → a PULSE `QueueRead`, REMOTE rows only.
+ *
+ * The item is another daemon's own attention-list row carried verbatim through the
+ * fan-out with `hostId` stamped on, so it crosses a wire and a version boundary: the fields the joins actually read are CHECKED, and a row that fails is
+ * DROPPED rather than rendered as a blank line. Rows stamped `local` are dropped
+ * here, which is what makes "no local row appears twice" structural rather than a
+ * filter each call-site has to remember. */
+function toFleetQueueRead(raw: unknown): QueueRead | null {
+  if (typeof raw !== "object" || raw === null) return null;
+  const item = raw as Partial<QueueItemRead> & { hostId?: unknown };
+  if (typeof item.qitemId !== "string" || item.qitemId === "") return null;
+  if (typeof item.state !== "string" || typeof item.destinationSession !== "string") return null;
+  const hostId = typeof item.hostId === "string" ? item.hostId : "";
+  if (hostId === "" || hostId === LOCAL_HOST_ID_SENTINEL) return null;
+  const text = (value: unknown): string | null => (typeof value === "string" ? value : null);
+  return {
+    qitemId: item.qitemId,
+    sourceSession: text(item.sourceSession),
+    state: item.state,
+    destinationSession: item.destinationSession,
+    blockedOn: text(item.blockedOn),
+    handedOffTo: text(item.handedOffTo),
+    tier: text(item.tier),
+    tags: Array.isArray(item.tags) ? (item.tags.filter((t): t is string => typeof t === "string")) : null,
+    summary: text(item.summary),
+    body: typeof item.body === "string" ? item.body : "",
+    claimedAt: text(item.claimedAt),
+    tsUpdated: typeof item.tsUpdated === "string" ? item.tsUpdated : "",
+    hostId,
   };
 }
 
@@ -305,6 +346,7 @@ function toNeedsItem(item: NeedsYouItemRead): NeedsItem {
     qitemId: item.qitemId,
     evidenceRef: item.evidenceRef,
     unblocks: item.unblocks,
+    ageIso: item.ageIso ?? null,
     ...(item.hostId ? { hostId: item.hostId } : {}),
   };
 }
@@ -568,7 +610,7 @@ export async function hydrateSnapshot(
       const st = await safe<RigStatusRead>(`rig-status(${rig.name})`, () => client.rigStatus(rig.id));
       const seatDetail = st && st.seatsTotal != null ? `${st.seatsRunning ?? 0}/${st.seatsTotal} seats running` : undefined;
       rigsDown.push({
-        hostId: `rig:${rig.name}`,
+        hostId: `${RIG_DOWN_ID_PREFIX}${rig.name}`,
         status: st?.status ? `${rig.lifecycleState} (${st.status})` : rig.lifecycleState,
         ...(seatDetail ? { error: seatDetail } : {}),
       });
@@ -596,7 +638,7 @@ export async function hydrateSnapshot(
     rigs,
   };
   const remoteHosts: HostNode[] = aggHosts
-    .filter((h) => h.hostId !== "local")
+    .filter((h) => h.hostId !== LOCAL_HOST_ID_SENTINEL)
     .map((h) => ({ id: h.hostId, name: h.hostId, reachable: h.status === "ok", rigs: [] }));
 
   // Specs: RIG + AGENT land well by consuming the existing structured review
@@ -755,6 +797,7 @@ export async function hydrateSnapshot(
         }
       : {}),
     attention: (attention ?? []).map(toQueueRead),
+    fleetQueue: (agg?.items ?? []).map(toFleetQueueRead).filter((row): row is QueueRead => row !== null),
     queueCoverage: !seatQueueReads ? undefined
       : [attention, blocked, inProgress, pending].some(rows => rows === null) ? "unavailable"
       // Existing /list defaults cap the first three reads at 100; pending requests 50.

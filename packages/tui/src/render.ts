@@ -33,7 +33,7 @@ import type { ColorMode, Token } from "./theme.js";
 import { terminalLines } from "./terminals/terminal-model.js";
 import { detailPage, fieldLine, sectionRule, listItem, alignedRow, LABEL_W, wrapDetailLines } from "./detail.js";
 import { healthAgentLines, healthDetailLines, healthListLines, healthSummaryLine } from "./health/health-model.js";
-import type { Action, FleetSnapshot, LoadState, NeedsItem, RecentTransitionSnap, RowFlash, Screen, ViewState } from "./types.js";
+import type { Action, FleetSnapshot, LoadState, RecentTransitionSnap, RowFlash, Screen, ViewState } from "./types.js";
 
 interface ContentLine {
   text: string;
@@ -491,21 +491,6 @@ function specTabsLine(state: ViewState): ContentLine {
       const start = text.indexOf(label);
       return { start, end: start + label.length, action: { type: "tab", tab } };
     }),
-  };
-}
-
-function needsLine(prefix: string, item: NeedsItem, snap: FleetSnapshot): ContentLine {
-  // aligned columns (glance speed): kind · host · target · detail — same fact,
-  // same visual place, every row
-  const found = findAgentBySession(snap, item.target, item.hostId);
-  const cols = alignedRow([
-    [item.kind, 16],
-    [item.hostId ? `[${item.hostId}]` : "", 11],
-    [item.target, 34],
-  ]);
-  return {
-    text: `${prefix}${cols} ${item.detail}${found ? "  (open ▸)" : ""}`,
-    ...(found ? { action: { type: "drill", resource: "agent", name: found.agent.name, target: { host: found.host.name, rig: found.rig.name, pod: found.pod.name } } as const } : {}),
   };
 }
 
