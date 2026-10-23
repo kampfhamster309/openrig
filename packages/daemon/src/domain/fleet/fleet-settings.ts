@@ -29,6 +29,13 @@ export const FLEET_STALL_THRESHOLD_MINUTES_DEFAULT = 30;
 export const FLEET_HOST_TIMEOUT_MS_DEFAULT = 5_000;
 export const FLEET_FANOUT_CONCURRENCY_DEFAULT = 4;
 
+/** How long a fleet payload stays fresh, and how old it may get before a reader
+ *  stops being served it as stale. ONE pair of numbers for every fleet read: a
+ *  summary and a usage read that disagreed about what "fresh enough" means would
+ *  have the operator see two fleets at once. */
+export const FLEET_CACHE_MS = 3_000;
+export const FLEET_STALE_BOUND_MS = 60_000;
+
 /** The settings keys for the two knobs above. A hub with a slow team and a hub with
  *  thirty teams want different numbers, and neither should require a code change. */
 export const FLEET_HOST_TIMEOUT_MS_KEY = "fleet.host_timeout_ms";

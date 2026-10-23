@@ -24,10 +24,10 @@
 // `domain/review/fleet-compose.ts` follows.
 
 import { getSelfHostId, LOCAL_HOST_ID, type PerHostStatus } from "../hosts/fanout-contract.js";
-import type { HostRegistryLoadResult, HttpHostEntry } from "../hosts/hosts-registry-reader.js";
+import type { HostRegistryLoadResult } from "../hosts/hosts-registry-reader.js";
 import { resolveHost } from "../hosts/hosts-registry-reader.js";
-import { remoteJsonRequest, type RemoteJsonFailureKind } from "../hosts/remote-daemon-http.js";
-import { FLEET_FANOUT_CONCURRENCY_DEFAULT, FLEET_HOST_TIMEOUT_MS_DEFAULT, FLEET_STALL_THRESHOLD_MINUTES_DEFAULT } from "./fleet-settings.js";
+import { FLEET_CACHE_MS, FLEET_FANOUT_CONCURRENCY_DEFAULT, FLEET_HOST_TIMEOUT_MS_DEFAULT, FLEET_STALE_BOUND_MS, FLEET_STALL_THRESHOLD_MINUTES_DEFAULT } from "./fleet-settings.js";
+import { createSingleFlightCache, hostGet, mapWithConcurrency } from "./fleet-fanout.js";
 import type {
   FleetHostSummary,
   FleetProgress,
@@ -53,14 +53,16 @@ export const FLEET_HOST_TIMEOUT_MS = FLEET_HOST_TIMEOUT_MS_DEFAULT;
 export const FLEET_FANOUT_CONCURRENCY = FLEET_FANOUT_CONCURRENCY_DEFAULT;
 
 /** Short enough that the operator sees a real change within a poll, long enough
- *  that a TUI and a CLI polling at once cost ONE fan-out. */
-export const FLEET_SUMMARY_CACHE_MS = 3_000;
+ *  that a TUI and a CLI polling at once cost ONE fan-out. The value is shared with
+ *  every other fleet read (`FLEET_CACHE_MS`) so two fleet reads cannot serve the
+ *  operator payloads of different ages and call both of them current. */
+export const FLEET_SUMMARY_CACHE_MS = FLEET_CACHE_MS;
 
 /** How old a payload may get before stale-while-revalidate stops serving it. One
  *  failed read should be smoothed over; a fan-out that stays broken should not keep
  *  dressing up minutes-old state as a live fleet. Past this bound readers wait for the
  *  real run and meet its failure, which is the honest outcome. */
-export const FLEET_SUMMARY_STALE_BOUND_MS = 60_000;
+export const FLEET_SUMMARY_STALE_BOUND_MS = FLEET_STALE_BOUND_MS;
 
 /** Default stall threshold. The value and the settings key live together in
  *  `fleet-settings.ts` so the store and this module cannot drift. */
@@ -438,37 +440,6 @@ export function isBlockedOnHuman(blockedOn: string | null | undefined): boolean 
 
 function asArray(payload: unknown): Array<Record<string, unknown>> {
   return Array.isArray(payload) ? (payload as Array<Record<string, unknown>>) : [];
-}
-
-type RemoteLeg =
-  | { ok: true; payload: unknown }
-  | { ok: false; note: string; kind: RemoteJsonFailureKind; httpStatus?: number };
-
-/** One bounded remote GET under THIS HOST's own remaining budget. A failure is
- *  a value — never a throw, never a hang — and it keeps its transport KIND, so
- *  the closed per-host enum can tell an operator to rotate a bearer from one
- *  telling them to check the host. Its note is what `partialFailures` discloses. */
-async function hostGet(
-  host: HttpHostEntry,
-  path: string,
-  deadlineAt: number,
-  deps: FleetSummaryDeps,
-  label: string,
-): Promise<RemoteLeg> {
-  const remaining = deadlineAt - Date.now();
-  if (remaining <= 0) return { ok: false, kind: "timeout", note: `${label}: this host's own read budget was already spent` };
-  const res = await remoteJsonRequest(host, path, {
-    method: "GET",
-    timeoutMs: remaining,
-    fetchImpl: deps.fetchImpl,
-    env: deps.env,
-    readFile: deps.readFile,
-  });
-  if (res.ok) return { ok: true, payload: res.payload };
-  if (res.kind === "bearer") return { ok: false, kind: res.kind, note: `${label}: ${res.detail}` };
-  if (res.kind === "http") return { ok: false, kind: res.kind, httpStatus: res.status, note: `${label}: HTTP ${res.status}${res.detail ? ` ${res.detail}` : ""}` };
-  if (res.kind === "timeout") return { ok: false, kind: res.kind, note: `${label}: timed out with ${remaining}ms left of its own budget` };
-  return { ok: false, kind: res.kind, note: `${label}: ${res.detail}` };
 }
 
 interface RemoteHostOutcome {
@@ -907,18 +878,7 @@ export async function composeFleetSummary(deps: FleetSummaryDeps): Promise<Fleet
   }
 
   const hostIds = reg.registry.hosts.map((h) => h.id);
-  const outcomes = new Array<RemoteHostOutcome>(hostIds.length);
-  let next = 0;
-  const cap = Math.max(1, Math.min(concurrency, Math.max(hostIds.length, 1)));
-  const workers = Array.from({ length: cap }, async () => {
-    for (;;) {
-      const i = next;
-      if (i >= hostIds.length) return;
-      next += 1;
-      outcomes[i] = await readRemoteHost(hostIds[i]!, reg, deps, policy);
-    }
-  });
-  await Promise.all(workers);
+  const outcomes = await mapWithConcurrency(hostIds, concurrency, (hostId) => readRemoteHost(hostId, reg, deps, policy));
 
   // Registry order preserved (a deterministic payload).
   for (const outcome of outcomes) {
@@ -957,106 +917,29 @@ export interface FleetSummaryCache {
   clear(): void;
 }
 
-/** A payload is served from cache while younger than `ttlMs`. A reader that
- *  arrives mid-refresh gets the in-flight promise rather than starting a second
- *  fan-out — that is the whole cost argument for the read. */
+/** The summary's cache is the shared single-flight cache, typed to this read and
+ *  keyed on the stall threshold. The mechanism — ttl, stale-while-revalidate,
+ *  single-flight, the staleness bound — lives in `fleet-fanout.ts` because the
+ *  fleet usage read must answer a slow host the same way this one does; two
+ *  copies of that arithmetic is how two fleet reads come to disagree about what
+ *  "this host timed out" means.
+ *
+ *  The rule key is the threshold rather than a value closed over by the builder: a
+ *  verdict judged under the old rule must not be handed out as if the new one had
+ *  been applied, and a payload that states one threshold while its verdicts used
+ *  another is worse than one that states none. */
 export function createFleetSummaryCache(
   build: (thresholdMinutes: number) => Promise<FleetFanOutResult>,
-  opts: { ttlMs?: number; nowMs?: () => number } = {},
+  opts: { ttlMs?: number; nowMs?: () => number; maxRuleEntries?: number } = {},
   deps: { onBackgroundRefreshError?: (err: unknown) => void } = {},
 ): FleetSummaryCache {
-  const ttlMs = opts.ttlMs ?? FLEET_SUMMARY_CACHE_MS;
-  const now = opts.nowMs ?? Date.now;
-  // How old a payload may get before we stop serving it as stale. Twice the ttl is too
-  // tight to be useful across a slow poll; a minute is long enough that one bad read is
-  // smoothed over and short enough that a persistently broken fan-out is not dressed up
-  // as a healthy fleet indefinitely.
-  const staleBoundMs = FLEET_SUMMARY_STALE_BOUND_MS;
-  let cached: { payload: FleetSummaryPayload; at: number; thresholdMinutes: number } | null = null;
-  // The in-flight fan-out carries the rule it is being judged under, so a reader
-  // cannot join a run that is answering a different question than it asked.
-  let inflight: { promise: Promise<FleetSummaryPayload>; thresholdMinutes: number } | null = null;
-
-  const run = async (thresholdMinutes: number): Promise<FleetSummaryPayload> => {
-    const fanOut = await build(thresholdMinutes);
-    const at = now();
-    const payload: FleetSummaryPayload = {
-      ...fanOut,
-      fromCache: false,
-      cacheAgeMs: 0,
-      cacheStaleWhileRevalidate: false,
-      cacheTtlMs: ttlMs,
-    };
-    // Only a SUCCESS reaches here, so a failed fan-out cannot overwrite a good payload
-    // with nothing: the previous answer stays available to serve as stale.
-    cached = { payload, at, thresholdMinutes };
-    return payload;
-  };
-
-  return {
-    async read(fresh: boolean, thresholdMinutes: number): Promise<FleetSummaryPayload> {
-      const at = now();
-      const ruleChanged = cached !== null && cached.thresholdMinutes !== thresholdMinutes;
-      const freshEnough = cached !== null && !ruleChanged && at - cached.at < ttlMs;
-      if (!fresh && freshEnough) {
-        return { ...cached!.payload, fromCache: true, cacheAgeMs: at - cached!.at, cacheStaleWhileRevalidate: false };
-      }
-
-      // Stale-while-revalidate. Once ANY payload exists, a reader that did not ask
-      // for `fresh` gets it immediately — with its true age and the flag set — while
-      // one refresh runs behind it. Without this, every poll that outlasts the cache
-      // waits for the whole fan-out, and a reader with a fixed timeout gives up and
-      // loses its remote sections for that poll: the flicker this exists to remove.
-      // Cold start still waits, because there is nothing honest to serve.
-      //
-      // A CHANGED RULE is not eligible. Serving verdicts judged under a different
-      // threshold while claiming the new one is the exact misreport this whole
-      // threshold-keying exists to prevent, so that reader waits for the real run.
-      //
-      // Neither is a payload past the staleness bound. Serving an arbitrarily old
-      // answer forever would turn a persistently broken fan-out (a local leg throwing
-      // on a DB error, say) into a page that looks healthy while quietly showing
-      // minutes-old truth. Past the bound, readers wait for the real run and meet its
-      // failure, which is the honest outcome.
-      const tooStale = cached !== null && at - cached.at > staleBoundMs;
-      if (!fresh && cached !== null && !ruleChanged && !tooStale) {
-        const stale = { ...cached.payload, fromCache: true, cacheAgeMs: at - cached.at, cacheStaleWhileRevalidate: true };
-        if (!inflight || inflight.thresholdMinutes !== thresholdMinutes) {
-          const mine = run(thresholdMinutes).finally(() => {
-            // Only release the slot if it still holds THIS run; a parallel run that
-            // finished first must not null a slot a later reader is still waiting on.
-            if (inflight && inflight.promise === mine) inflight = null;
-          });
-          // Nobody awaits a background refresh — that is the point of serving the stale
-          // payload instead — so a failing fan-out would surface as an unhandled
-          // rejection in the daemon. Swallow it HERE, on the detached handle only: a
-          // reader that joins this run below still gets the rejection through
-          // `inflight.promise`, and the next read retries.
-          //
-          // Swallowed is not the same as silent. A refresh that keeps failing means the
-          // page is being served an increasingly stale answer, and a daemon that says
-          // nothing about that is hiding the one fact an operator would act on.
-          mine.catch((err: unknown) => {
-            deps.onBackgroundRefreshError?.(err);
-          });
-          inflight = { promise: mine, thresholdMinutes };
-        }
-        return stale;
-      }
-
-      if (inflight && inflight.thresholdMinutes === thresholdMinutes) {
-        // Another reader is already fanning out under the same rule. Join it.
-        return inflight.promise;
-      }
-      const mine = run(thresholdMinutes).finally(() => {
-        if (inflight && inflight.promise === mine) inflight = null;
-      });
-      inflight = { promise: mine, thresholdMinutes };
-      return mine;
-    },
-    clear() {
-      cached = null;
-      inflight = null;
-    },
-  };
+  // `FleetFanOutResult` is the payload MINUS the cache fields, so the cache's
+  // stamped output is the payload; the intersection is structural, and the cast
+  // states that rather than re-deriving the payload type here.
+  return createSingleFlightCache<FleetFanOutResult, number>(build, {
+    ttlMs: opts.ttlMs ?? FLEET_SUMMARY_CACHE_MS,
+    staleBoundMs: FLEET_SUMMARY_STALE_BOUND_MS,
+    nowMs: opts.nowMs,
+    maxRuleEntries: opts.maxRuleEntries,
+  }, deps) as unknown as FleetSummaryCache;
 }

@@ -852,6 +852,52 @@ describe("createFleetSummaryCache", () => {
     expect(String(seen[0])).toMatch(/refresh exploded/);
   });
 
+  it("a cold read that fails reports to its reader, not as a background refresh", async () => {
+    // The catch belongs to the detached refresh only. A cold read has no stale payload
+    // to serve, so the reader awaits this promise and meets the failure itself — and a
+    // log line claiming "background refresh failed; serving stale until the bound" on
+    // that path is false on both counts.
+    const seen: unknown[] = [];
+    const cache = createFleetSummaryCache(
+      async () => { throw new Error("cold failure"); },
+      { ttlMs: 1_000, nowMs: () => NOW },
+      { onBackgroundRefreshError: (err) => seen.push(err) },
+    );
+    await expect(cache.read(false, 30)).rejects.toThrow(/cold failure/);
+    await new Promise((r) => setTimeout(r, 10));
+    expect(seen).toEqual([]);
+  });
+
+  it("keeps one entry per rule, so readers asking different rules share nothing and evict nothing", async () => {
+    // The usage rule is the window, which is a per-reader flag: the TUI polls 1h while a
+    // person reads 24h. With a single slot every switch was a rule change, so neither
+    // reader got a cache hit or stale service and both waited for a full fan-out.
+    let calls = 0;
+    const cache = createFleetSummaryCache(async () => { calls += 1; return build(); }, { ttlMs: 60_000 });
+    await cache.read(false, 30);
+    await cache.read(false, 1_440);
+    expect(calls).toBe(2);
+    const a = await cache.read(false, 30);
+    const b = await cache.read(false, 1_440);
+    expect(calls).toBe(2);
+    expect(a.fromCache).toBe(true);
+    expect(b.fromCache).toBe(true);
+  });
+
+  it("bounds the per-rule entries instead of growing with every rule ever asked", async () => {
+    let calls = 0;
+    const cache = createFleetSummaryCache(async () => { calls += 1; return build(); }, { ttlMs: 60_000, maxRuleEntries: 2 });
+    await cache.read(false, 1);
+    await cache.read(false, 2);
+    expect(calls).toBe(2);
+    await cache.read(false, 3); // evicts rule 1 (least recently used)
+    expect(calls).toBe(3);
+    await cache.read(false, 2); // still cached
+    expect(calls).toBe(3);
+    await cache.read(false, 1); // evicted, so it fans out again
+    expect(calls).toBe(4);
+  });
+
   it("clear() forgets the payload (test/teardown hook)", async () => {
     let calls = 0;
     const cache = createFleetSummaryCache(async () => { calls += 1; return build(); }, { ttlMs: 60_000 });

@@ -1,9 +1,12 @@
-// GET /api/fleet/summary — the ONE fleet read.
+// The fleet read surface: GET /api/fleet/summary and GET /api/fleet/usage.
 //
-// One daemon-side fan-out answering, for every host the operator registered:
-// is it reachable, what rigs and seats does it have, what is open on its queue
-// (in EVERY open state, with what it is blocked on), and — the signal nothing
-// else gave — has it stopped making progress.
+// One daemon-side fan-out MACHINERY (domain/fleet/fleet-fanout.ts) behind both,
+// answering, for every host the operator registered:
+//   /summary — is it reachable, what rigs and seats does it have, what is open on
+//     its queue (in EVERY open state, with what it is blocked on), and — the signal
+//     nothing else gave — has it stopped making progress.
+//   /usage — what every team is using, composed from the usage read every pod
+//     already serves, summed only where the numbers honestly add.
 //
 // The local host is composed in-process from the same services the shipped
 // routes use; remote hosts are read over the shared bearer transport using only
@@ -43,6 +46,19 @@ import {
   FLEET_HOST_TIMEOUT_MS_KEY,
   FLEET_STALL_THRESHOLD_MINUTES_KEY,
 } from "../domain/fleet/fleet-settings.js";
+import { computeTopBurn } from "../domain/usage-series.js";
+import {
+  composeFleetUsage,
+  createFleetUsageCache,
+  type FleetUsageCache,
+  type UsageLeg,
+} from "../domain/fleet/fleet-usage.js";
+import type { FleetUsageWindow } from "../domain/fleet/fleet-usage.js";
+
+/** The usage cache, per route module / daemon process, for the same reason the
+ *  summary's is: one fan-out serves every reader, and a test that builds a fresh
+ *  app gets a fresh cache. */
+const usageCaches = new WeakMap<Hono, FleetUsageCache>();
 
 /** The cache lives per route module, which is per daemon process. A test that
  *  builds a fresh app gets a fresh cache; a production daemon has exactly one,
@@ -92,6 +108,30 @@ export function resolveHostTimeoutMs(store: SettingsStore | undefined): number {
 
 export function resolveFanoutConcurrency(store: SettingsStore | undefined): number {
   return resolvePositiveMinutes(store, FLEET_FANOUT_CONCURRENCY_KEY, FLEET_FANOUT_CONCURRENCY_DEFAULT);
+}
+
+/** The usage window, validated exactly as the single-host route validates it — the
+ *  hub must not accept a window its own remote legs would reject with a 400. A bad
+ *  value is a 400 naming the parameter, never a silent default that leaves the
+ *  reader holding numbers for a window nobody asked for. */
+function resolveUsageWindow(raw: string | undefined): { windowHours: number } | { error: string } {
+  const value = raw === undefined || raw === "" ? 1 : Number(raw);
+  if (!Number.isFinite(value) || value <= 0) {
+    return { error: `invalid window_hours "${raw}" — must be a positive number of hours` };
+  }
+  if (!Number.isFinite(new Date(Date.now() - value * 3_600_000).getTime())) {
+    return { error: `invalid window_hours "${raw}" — exceeds the supported date range` };
+  }
+  return { windowHours: value };
+}
+
+function resolveUsageTop(raw: string | undefined): { top: number | undefined } | { error: string } {
+  if (raw === undefined || raw === "") return { top: undefined };
+  const value = Number(raw);
+  if (!Number.isFinite(value) || value < 1) {
+    return { error: `invalid top "${raw}" — must be a positive count` };
+  }
+  return { top: value };
 }
 
 /** The LOCAL host's facts, read from the same services `/api/ps` and
@@ -235,6 +275,69 @@ export function fleetRoutes(): Hono {
     // under, so it is what gets echoed. A reader never renders a rule that was not
     // applied, and never has to guess which one produced the verdicts.
     return c.json(payload);
+  });
+
+  // GET /api/fleet/usage — what every team is using, read from the hub.
+  //
+  // WHAT THESE NUMBERS ARE, and they are worth stating because a reader will
+  // otherwise assume more precision than exists: they are SAMPLED readings of each
+  // seat's context window and provider window, good for "which team is burning
+  // fastest right now". They are NOT exact token or cost accounting — nothing here
+  // is metered against a bill, and a seat that was idle between samples shows less
+  // than it used. A host that did not answer is reported as unknown and adds
+  // nothing to a total; it is never shown as zero.
+  app.get("/usage", async (c) => {
+    const deps = getDeps(c);
+    if (!deps.rigRepo) return c.json({ error: "fleet_usage_unavailable" }, 503);
+    const window = resolveUsageWindow(c.req.query("window_hours"));
+    if ("error" in window) return c.json({ code: "fleet_usage_invalid_request", error: window.error }, 400);
+    const top = resolveUsageTop(c.req.query("top"));
+    if ("error" in top) return c.json({ code: "fleet_usage_invalid_request", error: top.error }, 400);
+    const fresh = c.req.query("fresh") === "1";
+    const db = deps.rigRepo.db;
+
+    let cache = usageCaches.get(app);
+    if (!cache) {
+      cache = createFleetUsageCache(
+        (windowHours) => composeFleetUsage({
+          // The LOCAL host in-process, the same ruling the summary's local leg
+          // follows. On a hub this is usually empty — a hub has no seats — and an
+          // operator running this daemon as their only host gets their own teams.
+          readLocalUsage: (w: FleetUsageWindow): UsageLeg => {
+            try {
+              return { ok: true, body: computeTopBurn(db, { windowHours: w.windowHours, nowIso: new Date().toISOString() }) };
+            } catch (err) {
+              // No samples table, an unreadable db — either way this host's usage is
+              // UNKNOWN, which is a different fact from "this host used nothing".
+              return { ok: false, reason: `this daemon's own usage samples could not be read: ${(err as Error)?.message ?? String(err)}` };
+            }
+          },
+          loadRegistry: deps.registryLoader,
+          registryExists: deps.registryProbe,
+          windowHours,
+          hostTimeoutMs: resolveHostTimeoutMs(deps.settingsStore),
+          concurrency: resolveFanoutConcurrency(deps.settingsStore),
+          fetchImpl: deps.fetchImpl,
+        }),
+        {},
+        {
+          onBackgroundRefreshError: (err) => {
+            console.warn(`[fleet/usage] background refresh failed; serving stale until the bound: ${(err as Error)?.message ?? String(err)}`);
+          },
+        },
+      );
+      usageCaches.set(app, cache);
+    }
+    const payload = await cache.read(fresh, String(window.windowHours));
+    // The cap is applied AFTER the cache, because it is a view over a ranking the
+    // fan-out already completed, not a rule it was judged under. A reader asking for
+    // 5 seats and a reader asking for 10 then share one fan-out instead of
+    // invalidating each other's payload. `topCap` is echoed so a reader never
+    // renders a cut list as the whole fleet, and `totalSeatsRanked` says how much
+    // of the fleet the cut left out.
+    if (top.top === undefined) return c.json(payload);
+    const cap = Math.max(1, Math.floor(top.top));
+    return c.json({ ...payload, top: payload.top.slice(0, cap), topCap: cap });
   });
 
   return app;
