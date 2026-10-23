@@ -65,7 +65,8 @@ HUB_POD="${RIG_DISPATCH_HUB_POD:-hub-0}"
 _hub_npm_root=""
 
 hub_ready() {
-  [ "$(k get pod "$HUB_POD" -o jsonpath='{.status.conditions[?(@.type==\"Ready\")].status}' 2>/dev/null)" = "True" ]
+  "$KUBECTL" -n "$NS" get pod "$HUB_POD" -o json 2>/dev/null |
+    jq -e 'any(.status.conditions[]?; .type == "Ready" and .status == "True")' >/dev/null 2>&1
 }
 
 hub_exec() { "$KUBECTL" -n "$NS" exec -i "$HUB_POD" -c daemon -- "$@"; }
@@ -79,7 +80,9 @@ team_bearer() { k get secret "$(name_of "$1")" -o jsonpath='{.data.bearer}' | ba
 # The hub image has no PyYAML. The CLI's own `yaml` dependency is the same parser `rig host add`
 # writes with, so the registry is edited with it.
 hub_npm_root() {
-  [ -n "$_hub_npm_root" ] || _hub_npm_root=$(hub_exec sh -c 'npm root -g' 2>/dev/null | tail -n1)
+  # </dev/null matters: this is often called while a pipeline has stdin open, and
+  # `kubectl exec -i` would otherwise read the script meant for the next command.
+  [ -n "$_hub_npm_root" ] || _hub_npm_root=$(hub_exec sh -c 'npm root -g' </dev/null 2>/dev/null | tail -n1)
   printf '%s' "$_hub_npm_root"
 }
 
@@ -87,7 +90,8 @@ hub_npm_root() {
 #   HUB_MODE=has    exit 0 if HUB_HOST_ID is registered, 1 if it is not
 #   HUB_MODE=remove drop that entry and rewrite the file at 0600
 hub_registry() {
-  local mode=$1 host=$2
+  local mode=$1 host=$2 root
+  root=$(hub_npm_root)
   printf '%s\n' '
 const fs = require("fs"), path = require("path");
 const file = path.join(process.env.OPENRIG_HOME || process.env.HOME + "/.openrig", "hosts.yaml");
@@ -108,7 +112,7 @@ if (kept.length === hosts.length) { console.log("absent"); process.exit(0); }
 doc.hosts = kept;
 fs.writeFileSync(file, YAML.stringify(doc), { mode: 0o600 });
 console.log("removed " + id);
-' | hub_exec env NPM_ROOT="$(hub_npm_root)" HUB_MODE="$mode" HUB_HOST_ID="$host" node -
+' | hub_exec env NPM_ROOT="$root" HUB_MODE="$mode" HUB_HOST_ID="$host" node -
 }
 
 hub_register() {
@@ -132,6 +136,10 @@ hub_register() {
     hub_exec rig host add --id "$host" --transport http --url "$url" --bearer-file "$bf" \
       --notes "ticket $ticket, rig ${rig:-none}" >/dev/null \
       || die "the hub refused to register $host"
+    # Re-read rather than trust the verb: a subscription for a host missing from
+    # hosts.yaml makes the hub report the team as unreachable forever.
+    hub_registry has "$host" >/dev/null 2>&1 \
+      || die "$host is still not in the hub's hosts.yaml after rig host add"
     log "registered $host with the hub at $url"
   fi
   # Without the subscription the hub lists the host but never reads its queue state.
@@ -504,8 +512,16 @@ cmd_collect() {
 
 cmd_answer() {
   [ $# -ge 3 ] || usage
-  local slug; slug=$(slug_of "$1")
-  inpod "$slug" rig queue resolve "$2" --decision "${*:3}" --json
+  local slug sts rig lead session
+  slug=$(slug_of "$1")
+  sts=$(sts_json "$slug") || die "$1 has no team"
+  rig=$(annotation "$sts" rig)
+  lead=$(annotation "$sts" lead || true); [ -n "$lead" ] || lead=orch.lead
+  # `rig queue resolve` takes its actor from the seat env (X-OpenRig-Session), and a bare
+  # `kubectl exec` shell has none, so name the ticket's lead explicitly. --actor is ignored.
+  session=$(lead_session "$slug" "$rig" "$lead")
+  [ -n "$session" ] || die "no seat '$lead' in rig $rig; cannot answer as a seat"
+  inpod "$slug" env OPENRIG_SESSION_NAME="$session" rig queue resolve "$2" --decision "${*:3}" --json
 }
 
 cmd_delete() {
