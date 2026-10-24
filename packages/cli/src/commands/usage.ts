@@ -387,8 +387,12 @@ export function usageCommand(depsOverride?: UsageDeps): Command {
     if (json) {
       console.log(JSON.stringify(res.data, null, 2));
     } else {
-      const p = (res.data ?? {}) as { error?: unknown };
-      console.error(p.error ?? `${label} failed (HTTP ${res.status})`);
+      // Prefer a body's own explanation over its error CODE: a refusal like
+      // `read_through_path_not_allowed` names the boundary, while the `message`
+      // field says what to do about it. Codes are for machines; this is for a person.
+      const p = (res.data ?? {}) as { error?: unknown; message?: unknown };
+      const detail = p.message ?? p.error ?? `${label} failed (HTTP ${res.status})`;
+      console.error(detail);
     }
     process.exitCode = res.status >= 500 ? 2 : 1;
     return true;
@@ -463,14 +467,15 @@ export function usageCommand(depsOverride?: UsageDeps): Command {
 
   cmd
     .command("series")
-    .description("raw per-seat usage samples, oldest first")
+    .description("raw per-seat usage samples, oldest first — sampled readings, not exact token or cost accounting")
     .option("--seat <session>", "filter to one seat session")
     .option("--lane <lane>", "context | provider_window")
     .option("--since <iso>", "absolute lower bound on captured_at (inclusive)")
     .option("--until <iso>", "absolute upper bound on captured_at (exclusive)")
     .option("--limit <n>", "max rows")
+    .option("--host <id>", "read one REMOTE host's series through the hub's read-through (the hub is the only door; a team pod is not reachable directly)")
     .option("--json", "machine-readable (verbatim route payload)")
-    .action(async (opts: { seat?: string; lane?: string; since?: string; until?: string; limit?: string; json?: boolean }) => {
+    .action(async (opts: { seat?: string; lane?: string; since?: string; until?: string; limit?: string; host?: string; json?: boolean }) => {
       const deps = getDeps();
       const client = await getClient(deps);
       if (!client) return;
@@ -480,6 +485,11 @@ export function usageCommand(depsOverride?: UsageDeps): Command {
       if (opts.since) params.set("since", opts.since);
       if (opts.until) params.set("until", opts.until);
       if (opts.limit) params.set("limit", opts.limit);
+      // The hub forwards this one allowlisted read to the registered host; the CLI
+      // never dials the pod itself, because a team pod is cluster-internal and the
+      // operator's terminal cannot reach it. The hub strips the envelope before the
+      // origin ever sees it, so the pod needs no knowledge of this command.
+      if (opts.host) params.set("host", opts.host);
       const qs = params.toString();
       const res = await client.get<{ rows: Array<Record<string, unknown>> }>(
         `/api/telemetry/usage/series${qs ? `?${qs}` : ""}`,
@@ -490,6 +500,9 @@ export function usageCommand(depsOverride?: UsageDeps): Command {
         return;
       }
       const rows = res.data.rows;
+      // Say which host these came from: the same seat name can exist on two teams,
+      // and a bare sample list read as local history would be a quiet misattribution.
+      if (opts.host) console.log(`usage series from host [${opts.host}]`);
       if (rows.length === 0) {
         console.log("no samples match — the series is empty for this filter");
         return;

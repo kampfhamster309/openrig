@@ -47,6 +47,30 @@ function makeDeps(factory: (url: string) => DaemonClient, hosts = HOSTS): UsageD
   } as unknown as UsageDeps;
 }
 
+/** Deps whose lifecycle probe reports a RUNNING daemon, for the paths that go through
+ *  `getClient` (the single-host reads and `series`). The `--all-hosts` paths address
+ *  the hub directly and do not need it. */
+function runningDeps(factory: (url: string) => DaemonClient, hosts = HOSTS): UsageDeps {
+  const state = { pid: 123, port: 7433, db: "test.sqlite", startedAt: "2026-03-26T00:00:00Z" };
+  const lifecycleDeps = {
+    spawn: () => ({ pid: 1, unref: () => {} }),
+    fetch: async () => ({ ok: true }),
+    kill: () => true,
+    readFile: (p: string) => (p === STATE_FILE ? JSON.stringify(state) : null),
+    writeFile: () => {},
+    removeFile: () => {},
+    exists: (p: string) => p === STATE_FILE,
+    mkdirp: () => {},
+    openForAppend: () => 3,
+    isProcessAlive: () => true,
+  } as unknown as LifecycleDeps;
+  return {
+    lifecycleDeps,
+    clientFactory: factory,
+    hostRegistryLoader: () => ({ ok: true, registry: { hosts } }),
+  } as unknown as UsageDeps;
+}
+
 async function run(deps: UsageDeps, args: string[]): Promise<void> {
   const prog = new Command();
   prog.exitOverride();
@@ -247,6 +271,54 @@ describe("rig usage top --all-hosts — the fallback (an older local daemon)", (
       ["hosts", "items", "source", "targetedHostIds", "top", "topCap", "totalSeatsRanked", "totals", "unknown", "windowHours"].sort(),
     );
     expect(parsed.totals).toMatchObject({ hostsAnswered: 3, hostsTargeted: 3 });
+  });
+});
+
+describe("rig usage series --host — the hub is the only door", () => {
+  it("addresses the LOCAL daemon with host=, never the pod itself", async () => {
+    // Team pods are cluster-internal; the operator's terminal reaches the hub and the
+    // hub forwards. A CLI that dialed the pod directly would work nowhere this is used.
+    const factory = makeFactory((url) =>
+      url.includes("/api/telemetry/usage/series") ? { status: 200, data: { rows: [] } } : undefined);
+    const text = (await capture(() => run(runningDeps(factory), ["series", "--host", "alpha", "--seat", "dev-build@a"]))).join("\n");
+
+    const series = factory._calls.filter((u) => u.includes("/api/telemetry/usage/series"));
+    expect(series).toHaveLength(1);
+    expect(series[0]).toContain(LOCAL);          // the hub answered it
+    expect(series[0]).toContain("host=alpha");   // the envelope rides as a param
+    expect(series[0]).toContain("seat="); // the filters ride along with the envelope
+    expect(factory._calls.some((u) => u.includes("alpha.test"))).toBe(false); // no direct dial
+    expect(text).toContain("usage series from host [alpha]");
+  });
+
+  it("without --host nothing is addressed remotely", async () => {
+    const factory = makeFactory((url) =>
+      url.includes("/api/telemetry/usage/series") ? { status: 200, data: { rows: [] } } : undefined);
+    await capture(() => run(runningDeps(factory), ["series", "--seat", "dev-build@a"]));
+    const series = factory._calls.filter((u) => u.includes("/api/telemetry/usage/series"));
+    expect(series).toHaveLength(1);
+    expect(series[0]).not.toContain("host=");
+  });
+
+  it("a hub that refuses the path says why, not just the code", async () => {
+    // An OLDER hub without the allowlist entry answers this with the MH-3 refusal.
+    // The code alone is opaque to a person; the body's message names the boundary.
+    const factory = makeFactory(() => ({
+      status: 403,
+      data: { error: "read_through_path_not_allowed", boundary: "MH-3", message: "acting on a remote host is the MH-3 routing lane; the MH-2 read-through forwards allowlisted GET reads only" },
+    }));
+    const text = (await capture(() => run(runningDeps(factory), ["series", "--host", "alpha"]))).join("\n");
+    expect(text).toContain("read-through forwards allowlisted GET reads only");
+    expect(process.exitCode).toBe(1);
+  });
+
+  it("--json passes the remote payload through verbatim", async () => {
+    const rows = [{ capturedAt: "2026-10-24T01:00:00.000Z", seatSession: "dev-build@a", lane: "context", totalInputTokens: 10, totalOutputTokens: 5, usedPercentage: 3 }];
+    const factory = makeFactory(() => ({ status: 200, data: { rows } }));
+    const out: string[] = [];
+    vi.spyOn(console, "log").mockImplementation((...a: unknown[]) => { out.push(a.map(String).join(" ")); });
+    await run(runningDeps(factory), ["series", "--host", "alpha", "--json"]);
+    expect(JSON.parse(out.join("\n"))).toEqual({ rows });
   });
 });
 

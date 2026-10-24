@@ -100,6 +100,8 @@ describe("READ_THROUGH_ALLOWLIST matcher (arch P1 — the named closed set)", ()
       "/api/missions/release-0.4.6",
       "/api/specs/library",
       "/api/specs/library/rig-spec-1/review",
+      // Fleet usage: one seat's read-only usage history on a registered host.
+      "/api/telemetry/usage/series",
     ];
     for (const p of positives) expect(isReadThroughPath(p), p).toBe(true);
   });
@@ -121,6 +123,16 @@ describe("READ_THROUGH_ALLOWLIST matcher (arch P1 — the named closed set)", ()
       "/api/rigs/x/nodes/y/focus",
       "/api/rigs/x/nodes/y/open-cmux",
       "/api/rigs/x/nodes/y/anything/deeper",
+      // THE TOOTH ON THE USAGE WIDENING: exactly one telemetry path was added, not
+      // the family. `top` reaches the fleet through the hub's own fan-out rather than
+      // this edge, and the event streams are a different read class entirely — so a
+      // neighbour of the allowlisted path must still be REFUSED, and a deeper shape
+      // under it must not match by accident.
+      "/api/telemetry/usage/top",
+      "/api/telemetry/v1/events",
+      "/api/telemetry/v1/queue-transitions",
+      "/api/telemetry/usage/series/extra",
+      "/api/telemetry/usage",
     ];
     for (const p of negatives) expect(isReadThroughPath(p), p).toBe(false);
   });
@@ -142,6 +154,7 @@ describe("READ_THROUGH_ALLOWLIST matcher (arch P1 — the named closed set)", ()
       "/api/rigs/:rigId/nodes",
       "/api/rigs/:rigId/nodes/:logicalId", // rev1-r2 B2, arch-ruled Option A
       "/api/ps",
+      "/api/telemetry/usage/series", // fleet usage: read-only per-seat history, deliberate widening
       "/api/slices",
       "/api/slices/:name",
       "/api/slices/:name/doc/*",
@@ -244,6 +257,30 @@ describe("hostReadThrough — forward mechanics (arch P2 strip-is-total + P3 ver
       expect(call.method).toBe("GET");
       expect(call.authorization).toBe("Bearer test-token");
     }));
+
+  it("the usage-series widening FORWARDS for real: seat + lane params ride through, host stripped", () =>
+    withBearerEnv(async () => {
+      const { app, fetchCalls, localHits } = makeApp();
+      const res = await app.request(
+        "/api/telemetry/usage/series?seat=dev-build%40team&lane=context&limit=50&host=vps-a",
+      );
+      expect(res.status).toBe(200);
+      expect(localHits).toEqual([]); // the local handler never ran — this is a remote read
+      expect(fetchCalls).toHaveLength(1);
+      const call = fetchCalls[0]!;
+      expect(call.url).toBe("http://vps-a:7433/api/telemetry/usage/series?seat=dev-build%40team&lane=context&limit=50");
+      expect(call.url).not.toContain("host="); // strip-is-total: the origin never sees the envelope
+      expect(call.method).toBe("GET");
+      expect(call.authorization).toBe("Bearer test-token");
+    }));
+
+  it("a NEIGHBOURING telemetry path is still refused, so the widening is one path not a family", async () => {
+    const { app, fetchCalls } = makeApp();
+    const res = await app.request("/api/telemetry/usage/top?window_hours=1&host=vps-a");
+    expect(res.status).toBe(403);
+    expect(((await res.json()) as { error: string }).error).toBe("read_through_path_not_allowed");
+    expect(fetchCalls).toHaveLength(0); // refused at the edge; nothing was dialed
+  });
 
   it("origin 404 passes through VERBATIM — status, content-type, body; never re-wrapped", () =>
     withBearerEnv(async () => {
