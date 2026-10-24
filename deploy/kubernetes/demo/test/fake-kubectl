@@ -1,0 +1,167 @@
+#!/usr/bin/env bash
+# fake-kubectl -- what deploy/kubernetes/demo/{prepare,cleanup}.sh see when there is no cluster.
+#
+# It answers the handful of reads those two scripts make and records every call, so the test asserts
+# what the scripts ASKED FOR: which teams they named, in what order, what they wrote to the hub, and
+# what they refused to touch. That is what "idempotent", "restores the threshold" and "refuses anything
+# that is not a DEMO team" actually mean; a cluster would only show them one run at a time.
+#
+# State lives in $DEMO_FAKE_STATE as sourced key=value lines the test writes -- plain shell identifiers
+# only, because the file is sourced:
+#   teams="t-demo-a t-demo-b"   which team StatefulSets exist
+#   secrets="t-demo-a"          which team Secrets exist (they survive a bare `kubectl delete statefulset`)
+#   pvcs="home-t-demo-a-0"      which team volumes exist
+#   phase_DEMO_A=blocked        what `rig-dispatch status` will say for that ticket
+#   open_DEMO_A=blocked         the state of that ticket's queue item, or `none`
+#   hosts=0 bearers=0 bindings=0 subs=0   the hub's registry, as counts
+#   hub_readable=1              0 makes every hub read fail, as a dead hub would
+#   missing="config.json"       hub files that do not exist (a fresh hub has no bindings file yet)
+#   feed_prefs=0                1 puts the hub's GLOBAL feed preferences under feed.subscriptions
+#   bad_json=0                  1 makes an existing file unparseable, which IS a real error
+#   threshold=30                fleet.stall_threshold_minutes right now
+#   collect_fails=1             make `rig-dispatch collect` fail, as an unreachable pod would
+: "${DEMO_FAKE_STATE:?fake-kubectl: no state file}"
+: "${DEMO_FAKE_CALLS:?fake-kubectl: no call log}"
+printf 'kubectl %s\n' "$*" >> "$DEMO_FAKE_CALLS"
+
+# shellcheck disable=SC1090
+. "$DEMO_FAKE_STATE"
+teams=${teams:-}
+secrets=${secrets:-}
+pvcs=${pvcs:-}
+threshold=${threshold:-30}
+collect_fails=${collect_fails:-0}
+hub_readable=${hub_readable:-1}
+missing=${missing:-}
+feed_prefs=${feed_prefs:-0}
+bad_json=${bad_json:-0}
+
+# A file the hub never wrote. The real read asks `[ -e f ] || exit 0` first, so an absent file answers
+# empty and succeeds -- only a dead hub or an unparseable file is a failure. The fake has to make the same
+# distinction or the suite cannot see the difference.
+hub_absent() { # <filename> -> 0 when the test says this file does not exist
+  local m
+  for m in $missing; do [ "$m" = "$1" ] && return 0; done
+  return 1
+}
+
+# Drop the leading "-n <ns>" the scripts always pass.
+[ "${1:-}" = "-n" ] && shift 2
+
+in_list() { # <needle> <list>
+  local x
+  for x in $2; do [ "$x" = "$1" ] && return 0; done
+  return 1
+}
+
+has_team() { # <name>
+  in_list "$1" "$teams"
+}
+
+# The hub's $HOME/.openrig, built from the state file. Files named in `missing` are NOT created, which is
+# how a fresh hub looks before it has written anything.
+build_hub_home() {
+  FAKE_HUB_HOME=${FAKE_HUB_HOME:-$(mktemp -d)}
+  # Rebuilt from scratch every call: a file left over from the previous run would be served as if this
+  # run's state had asked for it, which is the opposite of what `missing` means.
+  rm -rf "$FAKE_HUB_HOME"
+  mkdir -p "$FAKE_HUB_HOME/.openrig"
+  local body=
+
+  if ! hub_absent hosts.yaml; then
+    if [ "${hosts:-0}" != 0 ]; then printf '  - id: t-demo-a\n    transport: http\n'
+    else printf 'hosts: []\n'; fi > "$FAKE_HUB_HOME/.openrig/hosts.yaml"
+  fi
+
+  if ! hub_absent hosts.d; then
+    mkdir -p "$FAKE_HUB_HOME/.openrig/hosts.d"
+    local i=0
+    while [ "$i" -lt "${bearers:-0}" ]; do
+      : > "$FAKE_HUB_HOME/.openrig/hosts.d/t-demo-$((i + 97)).bearer"; i=$((i + 1)); done
+  fi
+
+  if ! hub_absent host-bindings.json; then
+    if [ "$bad_json" = 1 ]; then printf 'not json\n' > "$FAKE_HUB_HOME/.openrig/host-bindings.json"
+    elif [ "${bindings:-0}" != 0 ]; then printf '{"version":1,"bindings":{"t-demo-a":"x"}}\n' > "$FAKE_HUB_HOME/.openrig/host-bindings.json"
+    else printf '{"version":1,"bindings":{}}\n' > "$FAKE_HUB_HOME/.openrig/host-bindings.json"; fi
+  fi
+
+  # `feed_prefs` adds the hub's GLOBAL feed preferences to the same object as the per-host nodes -- those
+  # are booleans, not hosts, and a counter that counts every key there reads any hub with a preference set
+  # as permanently not-empty.
+  if ! hub_absent config.json; then
+    [ "$feed_prefs" = 1 ] && body='"actionRequired":true,"approvals":true,"progress":false,'
+    if [ "$bad_json" = 1 ]; then printf 'not json\n' > "$FAKE_HUB_HOME/.openrig/config.json"
+    elif [ "${subs:-0}" != 0 ]; then
+      printf '{"feed":{"subscriptions":{%s"t-demo-a":{"enabled":true}}}}\n' "$body" > "$FAKE_HUB_HOME/.openrig/config.json"
+    else
+      printf '{"feed":{"subscriptions":{%s}}}\n' "${body%,}" > "$FAKE_HUB_HOME/.openrig/config.json"
+    fi
+  fi
+}
+
+# The hub's own CLI, as the scripts see it. Every branch answers a real read; a hub that is not there
+# fails here rather than answering "empty", because a caller has to be able to tell those apart.
+hub() {
+  local joined="$*"
+  if [ "$hub_readable" != 1 ]; then
+    printf 'fake-kubectl: the hub pod would not answer\n' >&2
+    exit 1
+  fi
+
+  # The four registry reads are executed FOR REAL against the fixture home, so the script's own existence
+  # guard is what decides the answer. Answering them by pattern would hide exactly the bug the guard is
+  # here for: a fake that always serves all four files cannot tell "the hub never wrote that file" from
+  # "the hub would not answer", and the two have opposite consequences.
+  if [ "${1:-}" = sh ] && [ "${2:-}" = -c ]; then
+    case "${3:-}" in
+      *.openrig/hosts.yaml*|*.openrig/hosts.d*|*.openrig/host-bindings.json*|*.openrig/config.json*)
+        build_hub_home
+        HOME="$FAKE_HUB_HOME" sh -c "$3"
+        exit $? ;;
+    esac
+  fi
+
+  case "$joined" in
+    *"rig config get"*) printf '%s\n' "$threshold" ;;
+    *"rig config set"*)
+      printf 'config-set %s\n' "${!#}" >> "$DEMO_FAKE_CALLS"
+      threshold=${!#}
+      sed -i "s/^threshold=.*/threshold=$threshold/" "$DEMO_FAKE_STATE" 2>/dev/null ||
+        printf 'threshold=%s\n' "$threshold" >> "$DEMO_FAKE_STATE" ;;
+    *) printf 'fake-kubectl: unhandled hub command: %s\n' "$joined" >&2; exit 1 ;;
+  esac
+}
+
+# The volume a ticket's label selector would find. A team's volume is named home-<team>-0, so the slug
+# is what ties them; the residue check depends on the selector actually filtering.
+pvcs_for_ticket() { # <slug>
+  local p
+  for p in $pvcs; do case "$p" in *"-$1-"*) printf '%s\n' "$p" ;; esac; done
+}
+
+case "$*" in
+  "get pod hub-0") exit 0 ;;
+  "wait --for=condition=Ready pod/hub-0"*) exit 0 ;;
+  *"get statefulsets -l openrig.dev/role=team"*)
+    for t in $teams; do printf '%s\n' "$t"; done ;;
+  "get statefulset t-"*)
+    has_team "$3" && printf 'statefulset.apps/%s\n' "$3" ;;
+  "apply -k "*) exit 0 ;;
+
+  # A team Secret: it outlives `kubectl delete statefulset`, which is the whole point of the residue check.
+  "get secret t-"*)
+    in_list "$3" "$secrets" && printf 'secret/%s\n' "$3" ;;
+  "get secrets "*)
+    for s in $secrets; do printf '%s\n' "$s"; done ;;
+  "delete secret "*) exit 0 ;;
+
+  # Volumes, by whichever selector the caller used: by ticket (the residue path) or by role (the end state).
+  "get pvc -l openrig.dev/ticket="*)
+    sel=${*#*openrig.dev/ticket=}; sel=${sel%% *}
+    pvcs_for_ticket "$sel" | sed 's|^|persistentvolumeclaim/|' ;;
+  "get pvc -l "*) for p in ${pvcs:-}; do printf '%s\n' "$p"; done ;;
+  "delete pvc "*) exit 0 ;;
+  "exec hub-0 -c daemon -- "*) shift 5; hub "$@" ;;
+  *) printf 'fake-kubectl: unhandled: %s\n' "$*" >&2; exit 1 ;;
+esac
