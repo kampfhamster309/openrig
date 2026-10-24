@@ -1,5 +1,5 @@
 import { composeHumanUpdates, type DeliveredHumanUpdates } from "./attention/attention-model.js";
-import { fleetSummaryReaderTimeoutMs } from "@openrig/daemon/fleet";
+import { attentionAggregateReaderTimeoutMs, fleetSummaryReaderTimeoutMs } from "@openrig/daemon/fleet";
 import { readTerminals } from "./terminals/terminal-model.js";
 import { fileTargetForPath } from "./reading.js";
 // Snapshot hydrator: maps the §4.A daemon reads (via DaemonClient, the one
@@ -727,10 +727,15 @@ export async function hydrateSnapshot(
           usage: await readFleetUsage(client, summary.payload, fleetRetention),
         }));
 
+  // The aggregate is a fan-out too: its wait follows the hosts the last fleet read named, so a
+  // team that takes its whole budget comes back marked unreachable instead of taking every
+  // other host down with it. Cold start has no count yet and gets the rule's floor.
+  const aggregateWaitMs = attentionAggregateReaderTimeoutMs((fleetRetention?.last?.targetedHostIds ?? []).length);
+
   const [instanceHealth, healthProjection, agg, summaries, library, review, streamItems, attention, blocked, inProgress, pending, fleetReadsResult, recentlyFinished, scopesRead, executionRead, sliceDetailRead, connectionsRead, seatEffortRead] = await Promise.all([
     safe<InstanceHealthRead>("health", () => client.health()),
     !healthRequested ? Promise.resolve(null) : safe<HealthProjectionRead>("health-findings", () => client.healthFindings()),
-    !broadReads ? Promise.resolve(null) : safe<AttentionAggregateRead>("attention-aggregate", () => client.attentionAggregate()),
+    !broadReads ? Promise.resolve(null) : safe<AttentionAggregateRead>("attention-aggregate", () => client.attentionAggregate(aggregateWaitMs)),
     readingOnly ? Promise.resolve(null) : safe<RigSummaryRead[]>("rigs-summary", () => client.rigsSummary()),
     (wantsSpecs || wantsConnections) ? safe<SpecLibraryRead[]>("specs-library", () => client.specsLibrary()) : Promise.resolve(null),
     !broadReads ? Promise.resolve(null) : safe<ReviewFleetRead>("review-fleet", () => client.reviewFleet()),
@@ -884,13 +889,14 @@ export async function hydrateSnapshot(
   // hosts, and it rode `broadReads` alone, so a remote host existed only in PULSE and
   // vanished the moment it was drilled (drilling switches to the table tab, which reads
   // narrowly). A daemon that runs NO rigs of its own is a hub, and the fleet view IS
-  // its product, so the topology scope reads the aggregate for it. Quietly: a failing
-  // aggregate leaves the local host alone rather than naming an error on every focused
-  // view. A machine that runs its own rigs pays nothing extra — that is where the
-  // 24-rig landing cost guard (navigation-continuity) lives, and it stays exact.
+  // its product, so the topology scope reads the aggregate for it. A failure is NAMED: on a
+  // hub this read is the only source of every remote host, and a quiet failure emptied the
+  // whole fleet from the view with nothing on screen to say why. A machine that runs its own
+  // rigs pays nothing extra — that is where the 24-rig landing cost guard
+  // (navigation-continuity) lives, and it stays exact.
   let fleetAgg = agg;
   if (fleetAgg === null && wantsTopologyScope && (summaries?.length ?? 0) === 0) {
-    fleetAgg = await client.attentionAggregate().catch(() => null) as AttentionAggregateRead | null;
+    fleetAgg = await safe<AttentionAggregateRead>("attention-aggregate", () => client.attentionAggregate(aggregateWaitMs));
   }
   const aggHosts = fleetAgg?.hosts ?? [];
   const localHost: HostNode = {

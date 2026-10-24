@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { DaemonClient } from "../src/daemon-client.js";
 import { hydrateSnapshot, type HydrateViewContext } from "../src/hydrate.js";
 import { renderScreen } from "../src/render.js";
@@ -301,7 +301,9 @@ describe("who pays for the read that names the remote hosts", () => {
     expect(snap.hosts[0]!.rigs.map((r) => r.name)).toEqual(["myrig"]);
   });
 
-  it("a hub whose aggregate read fails keeps its local host and names nothing", async () => {
+  it("a hub whose aggregate read fails keeps its local host and names the failure", async () => {
+    // On a hub this read is the only source of every remote host. A quiet failure emptied the
+    // whole fleet from the view with nothing on screen to say why.
     const fetchImpl = (async (url: unknown) => {
       const route = String(url).replace("http://x", "");
       if (route === "/api/queue/attention-aggregate") return { ok: false, status: 503, json: async () => ({}) } as Response;
@@ -311,7 +313,47 @@ describe("who pays for the read that names the remote hosts", () => {
 
     const snap = await hydrateSnapshot(new DaemonClient({ baseUrl: "http://x", fetchImpl }), undefined, undefined, undefined, undefined, pulse({ viewTab: "table" }));
     expect(snap.hosts.map((h) => h.name)).toEqual(["hub-0"]);
-    expect(snap.readErrors).toEqual([]);
+    expect(snap.readErrors).toEqual([expect.stringContaining("attention-aggregate")]);
+  });
+});
+
+describe("how long a hub's aggregate read waits", () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  /** The wait each route was given, read from the AbortSignal its request carried. */
+  function timedHub(): { client: DaemonClient; waits: Map<string, number> } {
+    const ms = new WeakMap<AbortSignal, number>();
+    const real = AbortSignal.timeout.bind(AbortSignal);
+    vi.spyOn(AbortSignal, "timeout").mockImplementation((t: number) => { const signal = real(t); ms.set(signal, t); return signal; });
+    const waits = new Map<string, number>();
+    const fetchImpl = (async (url: unknown, init?: RequestInit) => {
+      const route = String(url).replace("http://x", "");
+      if (init?.signal) waits.set(route, ms.get(init.signal) ?? -1);
+      if (!(route in FIXTURES)) throw new Error(`unexpected route in test: ${route}`);
+      return { ok: true, json: async () => FIXTURES[route] } as Response;
+    }) as typeof fetch;
+    return { client: new DaemonClient({ baseUrl: "http://x", fetchImpl }), waits };
+  }
+
+  it("outlasts one team taking its whole 5 s budget, on the topology table and in PULSE", async () => {
+    // The hub gives each team 5 s and answers a moment after that, with the slow team marked
+    // unreachable. A reader on the client's 5 s default gave up first and lost every host.
+    for (const view of [pulse({ viewTab: "table" }), pulse()]) {
+      const { client, waits } = timedHub();
+      const snap = await hydrateSnapshot(client, undefined, undefined, undefined, undefined, view);
+      expect(waits.get("/api/queue/attention-aggregate")).toBeGreaterThanOrEqual(20_000);
+      expect(snap.hosts.map((h) => h.name)).toContain(REMOTE_HOST);
+      vi.restoreAllMocks();
+    }
+  });
+
+  it("grows with the hosts the last fleet read named", async () => {
+    const { client, waits } = timedHub();
+    const targetedHostIds = ["local", ...Array.from({ length: 13 }, (_, i) => `t-${i}`)];
+    await hydrateSnapshot(client, undefined, undefined, undefined, undefined, pulse({ viewTab: "table" }),
+      { last: { targetedHostIds } as never, lastUsage: null });
+    // Fourteen hosts at four at a time is four waves of 5 s, plus the reader's margin.
+    expect(waits.get("/api/queue/attention-aggregate")).toBe(30_000);
   });
 });
 

@@ -9,6 +9,9 @@
  * own worst case is the rule, and it lives here so the CLI and the TUI cannot drift
  * from it or from each other.
  */
+import { fleetSummaryReaderTimeoutMs } from "./domain/fleet/fleet-settings.js";
+import { ATTENTION_FANOUT_CONCURRENCY, ATTENTION_READ_TIMEOUT_MS } from "./domain/feed/attention-settings.js";
+
 export {
   fleetSummaryReaderTimeoutMs,
   FLEET_HOST_TIMEOUT_MS_DEFAULT,
@@ -33,3 +36,14 @@ export {
   ZERO_USAGE_TOTALS,
 } from "./domain/fleet/fleet-usage-math.js";
 export type { UsageLeg } from "./domain/fleet/fleet-usage-math.js";
+
+/** How long a READER waits for `GET /api/queue/attention-aggregate`, by the same rule as the
+ *  fleet summary: that route also answers only after every host leg has finished, each leg
+ *  bounded by ATTENTION_READ_TIMEOUT_MS, at most ATTENTION_FANOUT_CONCURRENCY at a time.
+ *
+ *  A reader on the client's 5 s default loses the race to any host that takes the whole
+ *  budget: the hub answers a moment after 5 s, with that host correctly marked unreachable,
+ *  and the reader has already given up on every host at once. */
+export function attentionAggregateReaderTimeoutMs(hostCount: number): number {
+  return fleetSummaryReaderTimeoutMs(hostCount, ATTENTION_READ_TIMEOUT_MS, ATTENTION_FANOUT_CONCURRENCY);
+}

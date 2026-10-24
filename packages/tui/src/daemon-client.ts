@@ -460,8 +460,10 @@ export class DaemonClient {
     return this.post("/api/mission-control/action", input) as Promise<{ verb: string; qitemId: string; closedQitem: unknown;
       answer?: { outcome: "recorded" | "answered"; unanswered: string[]; message?: string } }>;
   }
-  attentionAggregate() {
-    return this.get(`/api/queue/attention-aggregate`);
+  /** The hub fans this out to every subscribed host, so the caller passes a wait derived from
+   * that fan-out (attentionAggregateReaderTimeoutMs), not the 5 s default one leg may use up. */
+  attentionAggregate(timeoutMs?: number) {
+    return this.get(`/api/queue/attention-aggregate`, this.fetchImpl, timeoutMs);
   }
   /** The hub-side fleet summary: ONE fan-out that answers reachability, rigs, seats,
    * open work and the stall verdict for every registered host. OPTIONAL on purpose —

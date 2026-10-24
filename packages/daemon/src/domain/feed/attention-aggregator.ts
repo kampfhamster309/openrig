@@ -24,13 +24,9 @@ import type { HostRegistryLoadResult } from "../hosts/hosts-registry-reader.js";
 import { resolveHost } from "../hosts/hosts-registry-reader.js";
 import { remoteJsonRequest } from "../hosts/remote-daemon-http.js";
 
-/** The aggregation READ deadline class (per-host bound). Distinct from the
- *  up-leaf's long-running budget by design — named here, passed explicitly. */
-export const ATTENTION_READ_TIMEOUT_MS = 5_000;
+import { ATTENTION_FANOUT_CONCURRENCY, ATTENTION_READ_TIMEOUT_MS } from "./attention-settings.js";
 
-/** Fixed fan-out cap — a poll across a handful of hosts; adaptive
- *  throttling is out of scope (same v1 posture as the topology walker). */
-export const ATTENTION_FANOUT_CONCURRENCY = 4;
+export { ATTENTION_FANOUT_CONCURRENCY, ATTENTION_READ_TIMEOUT_MS } from "./attention-settings.js";
 
 export type AttentionItem = Record<string, unknown>;
 
