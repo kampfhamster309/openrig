@@ -21,6 +21,7 @@ and `jq`.
 | `collect <ticket>` | `--archive <dir>` / `--dir <root>`, `--into <local git repo>` | 0, or 1 when the archive or the bundle failed |
 | `report <ticket>` \| `--all` | `--dir <root>`, `--json` | 0, or 1 when there is no archive to report from |
 | `delete <ticket>` | `--dir <root>`, `--force` | 0 deleted, 1 refused by the guard or failed |
+| `hub-sync` | `--dry-run` | Repairs the hub's registry against the team StatefulSets in the namespace: an entry the dispatcher wrote with no team behind it is unregistered completely, a handed-over and Ready team that is missing or incomplete is registered or completed, a team not handed over or not Ready is left alone, and the bearer file, subscription and alias left behind by an unregister that stopped halfway are found from their own names unless an entry still claims them. Names every finding. A team StatefulSet or pod read that fails aborts the run before it touches anything, and each team is read again immediately before it is unregistered -- where only a NotFound counts as gone, so a re-check that failed for another reason leaves that team registered and says nobody knows. With no Ready hub pod it reads and touches nothing. Exits 0 when the registry matches afterwards (re-read, not remembered), 1 when a difference stands or a repair failed, 3 when there is no Ready hub pod. `--dry-run` changes nothing and reports the same codes, so it works as a check. |
 
 No arguments prints the usage and exits 2; an unknown command or option exits 1.
 
@@ -42,6 +43,8 @@ No arguments prints the usage and exits 2; an unknown command or option exits 1.
 | `RIG_DISPATCH_WATCH_TICK` | `1` | Seconds between checks of a quiet stream for the verdict and the deadline. |
 | `RIG_DISPATCH_WATCH_BACKSTOP` | `180` | Seconds of quiet after which `watch` reads the status anyway. |
 | `RIG_DISPATCH_EVENTS_MAX_TIME` | `300` | Seconds one stream may last before it is reopened from the stored id. |
+| `RIG_DISPATCH_HUB_LOCK` | `/home/openrig/.openrig/.registry.lock` (in the hub pod) | The file every hub registry edit is serialized under, in the hub's own volume beside the files it protects. One lock, taken by `start`, `delete` and `hub-sync`, so no two of them rewrite `hosts.yaml` or the settings at the same moment. |
+| `RIG_DISPATCH_HUB_LOCK_TIMEOUT` | `60` | Seconds a hub registry edit waits for that lock before it gives up and says the hub is busy. Raise it only if edits really do queue for longer than this. |
 
 ### Objects, labels and annotations
 
@@ -263,12 +266,30 @@ hosts:
 entry takes `url` and at most one of `bearer_env` or `bearer_file`. The fleet reads dial only `http`
 entries and report `ssh` entries as `unsupported-transport`. There is no `rig host remove`.
 
+`hub-sync` decides what belongs to the dispatcher in two ways. An entry whose `id` names a team
+StatefulSet in the namespace is that team's entry, whatever it currently holds, so a wrong `transport`,
+`url` or `bearer_file` is repaired, and so is a bearer file whose contents no longer match the team's
+Secret. An entry with no team behind it is removed only when it is exactly what
+`start` writes: `t-<slug>`, `transport: http`, `url: http://t-<slug>-0.teams.<ns>.svc:7433` and
+`bearer_file: /home/openrig/.openrig/hosts.d/t-<slug>.bearer`. Anything else -- another transport, a
+host you registered by hand, or a `t-` id pointing somewhere else -- is reported and left alone.
+
+The same bar applies to the parts that live outside `hosts.yaml`. A bearer file, a
+`feed.subscriptions.<id>.enabled` node or a `host-bindings.json` alias that no entry claims and no team
+StatefulSet backs is removed when its id is `t-<slug>` for a slug `slug_of` could have produced, because
+with nothing pointing at it that name is the only thing left to vouch for it. "No entry claims it" is the
+wide question, not the narrow one: an entry claims the id it holds, the bearer file it names and the alias
+whose binding points back at it, because those are the parts an unregister of that name would remove -- so
+a host you registered by hand keeps its token even when the file it lives in is named like a team's. A
+leftover whose id is not shaped like a team's is left alone either way.
+
 ## Tests
 
 | What | Command |
 |---|---|
 | Dispatcher archive, report, delete guard, answer | `bash deploy/kubernetes/dispatcher/test/archive-test.sh` |
 | Dispatcher watch and resume | `bash deploy/kubernetes/dispatcher/test/watch-test.sh` |
+| Dispatcher `hub-sync`, hub registry ownership, registry lock | `bash deploy/kubernetes/dispatcher/test/hub-sync-test.sh` |
 | Daemon fleet reads, metrics, read-through | `cd packages/daemon && npx vitest run test/fleet-summary.test.ts test/fleet-usage.test.ts test/fleet-usage-route.test.ts test/fleet-metrics.test.ts test/fleet-metrics-route.test.ts test/host-read-through.test.ts test/browser-boundary-routes.test.ts` |
 | CLI fleet commands | `cd packages/cli && npx vitest run test/usage-fleet.test.ts` |
 | TUI | `cd packages/tui && npx vitest run` |

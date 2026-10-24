@@ -142,6 +142,7 @@ Deployment commits (all under `deploy/kubernetes/`):
 | `9daa57f78`, `299127dff` | [HUB-TEST.md](../HUB-TEST.md): what the hub was observed to do, with evidence, and its failure paths. |
 | `abcdd69d0`, `88b127e40`, `462068342` | The ticket archive, the delete guard, `report`, and `answer` through the hub. |
 | `d210d573b` | `rig-dispatch watch`: following a team's events with resume. |
+| `87232db28` | `rig-dispatch hub-sync`: repairing the hub's registry against the teams that exist, and one lock around every registry edit in the hub pod. |
 | `71300a97a`, `571c086ec` | Image pins. |
 
 Each feature was proven live against real team pods in the test cluster before it was merged here; the
@@ -166,8 +167,12 @@ evidence for the hub is in [HUB-TEST.md](../HUB-TEST.md).
   from an LLM gateway with one key per team; the deployment supports pointing seats at one
   (`ANTHROPIC_BASE_URL`, `OPENAI_BASE_URL`) but does not include it.
 - **Who answered.** Answers are recorded as "a human, relayed from the hub", not as a named person.
-- **Reconciling the hub.** A team that was deleted while the hub was down stays registered until
-  removed by hand ([operating.md](operating.md#the-hub-and-registration)).
+- **Reconciling the hub by itself.** `hub-sync` repairs the hub's registry when it drifts, but nothing
+  runs it: a team deleted while the hub was down stays registered until someone runs
+  `$D hub-sync` ([operating.md](operating.md#the-hub-and-registration)). There is no controller, no
+  periodic sync, and `start`, `delete` and `watch --all` do not call it -- one ticket's command
+  rewriting another ticket's registration is a larger blast radius than the drift it would fix, and a
+  command that did it could not keep its own exit codes.
 - **A queue for tickets beyond capacity.** `start` waits for the pod and times out; it does not queue.
 - **Prometheus access to the hub.** `/metrics` exists; how a scraper reaches the loopback-bound hub is a
   deploy choice, described in [monitoring.md](monitoring.md#scraping-metrics-with-prometheus).

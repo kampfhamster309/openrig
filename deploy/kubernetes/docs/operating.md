@@ -262,16 +262,46 @@ volume for `hosts.yaml`, `config.json` and one bearer file per team. What it sho
   `feed.subscriptions.t-<slug>.enabled true`, so the hub reads the team's queue state and not just its
   reachability. `delete` unregisters it with `rig config reset` and removes the team's alias from
   `host-bindings.json`. Both steps are idempotent. With no Ready hub pod they are skipped, and the
-  dispatcher works as without a hub.
+  dispatcher works as without a hub. When that keeping-in-step is missed, `hub-sync` repairs it.
 - **Registration comes after the hand-over, on purpose.** A hub that is Ready but failing (no
   `pods/exec`, a full volume, a `hosts.yaml` that `rig host add` refuses) must never leave a team running
   without its ticket. `start` hands the ticket over first, then registers, and still exits non-zero with
   a clear error if registration fails.
+- **`hub-sync` repairs the registry when it drifts.** A team's registration is four things that have to
+  move together -- its `hosts.yaml` entry, its bearer file, its `feed.subscriptions.t-<slug>.enabled`,
+  and its alias in `host-bindings.json` -- and only `start` and `delete` move them. So a hub that was
+  not Ready, a StatefulSet removed some other way, or two edits that interleaved leaves the hub
+  disagreeing with the cluster until something repairs it:
+
+  ```bash
+  $D hub-sync --dry-run    # what disagrees; changes nothing
+  $D hub-sync              # repair, then re-read and confirm
+  ```
+
+  It registers a team that was handed over and is Ready but is missing or incomplete -- no bearer file,
+  a bearer file that is empty or no longer holds what the team's Secret holds, the subscription off, a
+  transport, url or bearer path that is not what `start` writes -- it unregisters an entry whose team is
+  gone, and it leaves alone a team that was not handed over or whose pod is not Ready, saying which it
+  found and what it did. It also finishes an unregister that stopped halfway: when a `delete` removed the
+  `hosts.yaml` entry and then failed, the bearer file, the subscription and the alias are left with no
+  entry pointing at them, and those are found from their own names rather than missed. It exits 0 only
+  when a fresh read of both the hub and the cluster says they agree, and running it twice does nothing
+  the second time. Exit codes are in [reference.md](reference.md#commands).
+
+  A cluster read that fails stops the whole run before it touches anything, and says which read failed.
+  That is the important one to be strict about: a list that did not answer is not a cluster with no teams
+  in it, and treating it that way would unregister every live team and then report a match.
+
+  It touches only what the dispatcher wrote: an entry whose id names a team that exists, an entry that is
+  exactly what `start` writes, or a leftover part whose `t-<slug>` name no entry claims. A host you
+  registered by hand is left alone, including one whose id happens to begin with `t-`.
 - **A hub that is down at the wrong moment leaves residue.** If the hub is not Ready when `start` runs,
   the team is not registered: run `start <ticket>` again once the hub is Ready; it resumes without
   handing the ticket over twice. If the hub is not Ready when `delete` runs, the team is gone but the hub
-  keeps its host, bearer file and subscription. Both cases log what is left and how to clean it. There is
-  no automatic reconcile yet, so remove a stale host by hand:
+  keeps its host, bearer file and subscription. Both cases log what is left and name `hub-sync`, which
+  is the way to clean up: run it once the hub is Ready.
+
+  Cleaning by hand is the fallback, for when the dispatcher cannot reach the hub at all:
 
   ```bash
   kubectl -n $NS exec -i hub-0 -c daemon -- rig config reset feed.subscriptions.t-<slug>.enabled
@@ -280,10 +310,13 @@ volume for `hosts.yaml`, `config.json` and one bearer file per team. What it sho
   # and the t-<slug> alias from /home/openrig/.openrig/host-bindings.json, if it has one
   ```
 
-- **Do not run `start` and `delete` for different tickets at the same moment.** `rig host add` writes
-  last-wins, and unregistering rewrites the whole `hosts.yaml`, so a concurrent pair can drop one entry.
-  The rewrite is atomic, so the daemon never reads a half-written file, but the lost entry is real.
-  Running `start <ticket>` again restores it.
+- **Registry edits are serialized in the hub.** Every edit `start`, `delete` and `hub-sync` make runs
+  under one lock in the hub's own volume, so a `start` and a `delete` for two different tickets cannot
+  each read a `hosts.yaml` the other has not written yet and drop an entry. A second edit waits its
+  turn; if it waits longer than `RIG_DISPATCH_HUB_LOCK_TIMEOUT` (default 60s) it gives up and says the
+  hub is busy, which is a different thing from the edit having failed. One command is still several
+  edits, so a crash in the middle can leave a team half-registered, and `hub-sync` is what repairs
+  that.
 - **Restarts.** The hub's registry, bearer files and settings are on its volume and survive a restart or
   an image change. Its fleet cache is in memory and refills on the first read.
 

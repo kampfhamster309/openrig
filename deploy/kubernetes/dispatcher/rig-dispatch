@@ -73,8 +73,10 @@ default_image() {
 #
 # The hub (../hub) is an OpenRig daemon with no rigs whose hosts.yaml lists every team pod, so one
 # TUI shows every team at once. The dispatcher keeps it in step: `start` registers a team once its
-# pod is Ready, `delete` unregisters it. With no Ready hub pod in the namespace every helper here is
-# a no-op and the dispatcher behaves exactly as it did in stage 1.
+# pod is Ready, `delete` unregisters it, and `hub-sync` repairs the two when they have drifted -- a
+# hub that was not Ready, a StatefulSet removed by some other route, an edit that failed halfway. With
+# no Ready hub pod in the namespace every helper here is a no-op and the dispatcher behaves exactly as
+# it did in stage 1. Every mutation below runs under one lock in the hub's volume; the reads do not.
 
 HUB_POD="${RIG_DISPATCH_HUB_POD:-hub-0}"
 _hub_npm_root=""
