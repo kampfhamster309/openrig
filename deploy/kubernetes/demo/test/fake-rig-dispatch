@@ -35,8 +35,13 @@ case "$cmd" in
     ostate=$(sed -n "s/^$okey=//p" "$DEMO_FAKE_STATE" | tail -n1)
     if [ -z "$ostate" ] || [ "$ostate" = none ]; then open='[]'
     else open="[{\"qitemId\":\"qitem-$ticket\",\"state\":\"$ostate\",\"destination\":\"orch.lead@$(printf '%s' "$ticket" | tr '[:upper:]' '[:lower:]')\"}]"; fi
-    printf '[{"slug":"%s","phase":"%s","open":%s}]\n' \
-      "$(printf '%s' "$ticket" | tr '[:upper:]' '[:lower:]')" "$phase" "$open"
+    # The seats, because a repair has to be addressed to a running one. A team that closed its row and
+    # stopped still has a running seat at an idle prompt -- that is the state the rehearsal measured.
+    skey="seats_$(printf '%s' "$ticket" | tr '[:lower:]-' '[:upper:]_')"
+    seats=$(sed -n "s/^$skey=//p" "$DEMO_FAKE_STATE" | tail -n1)
+    [ -n "$seats" ] || seats='[{"session":"orch-lead@demo-one","status":"running"}]'
+    printf '[{"slug":"%s","phase":"%s","open":%s,"seats":%s}]\n' \
+      "$(printf '%s' "$ticket" | tr '[:upper:]' '[:lower:]')" "$phase" "$open" "$seats"
     ;;
   start)
     ticket=${1:-}

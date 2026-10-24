@@ -53,3 +53,7 @@ Add the new flag to the `README.md` section you wrote.
 Run `sh test/run.sh` and see every check pass — yours and the ones already there. Commit on the branch
 the contract names, then write the result file the contract names. Touch only `bin/top-words.sh`,
 `test/top-words.sh`, `test/run.sh`, `data/two.txt` and `README.md`.
+
+**In that order.** The commit exists, then `result.json` names its sha, then the queue item closes. A
+closed row with an uncommitted tree and no result file is not a finished ticket, and nothing will come to
+ask you for the rest.

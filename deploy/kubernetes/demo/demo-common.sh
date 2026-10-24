@@ -25,11 +25,16 @@ DEMO_REPO="${DEMO_REPO:-https://github.com/kampfhamster309/openrig-demo}"
 DEMO_REF="${DEMO_REF:-main}"
 
 # One seat per team, from the kit's one-seat spec, with requests small enough that three teams fit on
-# one small cluster together. These are the provisional values: the rehearsal measures what a team
-# really uses (kubectl top pod) and the run sheet says what it found.
+# one small cluster together. Measured in rehearsal 1: sampled every 15s from each team
+# container's own cgroup over the whole life of three teams: the worst `memory.peak` was 441Mi (t-demo-b),
+# and `kubectl top` -- one instantaneous sample -- read about 25% under that, so it is the wrong instrument
+# for a limit. `rig-dispatch` writes requests.{cpu,memory} and limits.memory only, so --memory IS the OOM
+# line and --cpu is a request with no cap (a working team was measured bursting to 623m against a 200m
+# request and was not throttled). 896Mi is 2x the worst peak, and it takes three teams from 4.5Gi of
+# requests down to 2.6Gi on a cluster that has to fit them all at once.
 DEMO_SPEC="${DEMO_SPEC:-/etc/openrig-kit/rig-one.yaml}"
 DEMO_CPU="${DEMO_CPU:-200m}"
-DEMO_MEMORY="${DEMO_MEMORY:-1536Mi}"
+DEMO_MEMORY="${DEMO_MEMORY:-896Mi}"
 DEMO_STORAGE="${DEMO_STORAGE:-2Gi}"
 
 # The stall threshold the demo lowers the hub to, and where the value it replaces is remembered.
@@ -186,6 +191,61 @@ team_phase() { # <ticket> -> phase, or "absent"
   jq -r '.[0].phase // "absent"' <<<"$out" 2>/dev/null || printf 'absent'
 }
 
+# Has this team written the file that says it is finished? The path is the dispatcher's own WORK/result.json.
+# The read closes its own stdin: nothing here means to send any.
+team_result_missing() { # <ticket> -> 0 when /home/openrig/work/result.json is not there
+  local slug
+  slug=$(demo_ticket "$1" | tr '[:upper:]' '[:lower:]')
+  ! "$KUBECTL" -n "$NS" exec "t-$slug-0" -c daemon -- sh -c 'test -f /home/openrig/work/result.json' \
+      </dev/null >/dev/null 2>&1
+}
+
+# The seat the dispatcher handed the brief to, so a repair can be addressed to something real.
+team_lead_session() { # <ticket> -> session name, or empty
+  local out
+  out=$("$DISPATCH" status "$(demo_ticket "$1")" --json 2>/dev/null) || return 0
+  jq -r '[.[] | (.seats // [])[] | select(.status == "running") | .session] | first // empty' <<<"$out" 2>/dev/null
+}
+
+# A one-seat team can close its own queue row and stop with the change UNCOMMITTED and no result file.
+# Measured in the rehearsal, not imagined: DEMO-B's seat claimed its row at 21:16:25 and closed it at
+# 21:16:26 with the note "...Uncommitted.", and never wrote the file. `prepare.sh` waits on the result
+# file, so that team would have sat there for the whole timeout with nothing on screen but a phase, and
+# the script's only message would have named the phase -- which was not the problem. So: name the state,
+# send the one message a person watching would send, and keep waiting. One send, not a loop: a seat that
+# will not finish after being told once will not finish after being told five times, and each one costs a
+# model call.
+nudge_finish() { # <ticket> -> 0 when the ask reached a running seat; non-zero when there was no seat or the send failed
+  local slug session
+  slug=$(demo_ticket "$1" | tr '[:upper:]' '[:lower:]')
+  session=$(team_lead_session "$1")
+  [ -n "$session" ] || { log "$1: its queue row is closed and there is no result file, and no running seat to ask. Read it with: $DISPATCH status $1 --json"; return 1; }
+  log "$1: its queue row is closed and there is no result file, so its commit is probably missing too -- asking the seat for the last two contract steps"
+  "$KUBECTL" -n "$NS" exec "t-$slug-0" -c daemon -- rig send "$session" \
+    "From the dispatcher: your queue item is closed, but the change is uncommitted and /home/openrig/work/result.json does not exist, so this ticket is not finished. Do the last two contract steps now: (1) in /home/openrig/work/project, create branch ticket/$slug if it is not current and commit the change; (2) write /home/openrig/work/result.json as {\"status\":\"done\",\"branch\":\"ticket/$slug\",\"commit\":\"<sha>\",\"summary\":\"...\"}. Do not redo the work." \
+    </dev/null >/dev/null 2>&1
+}
+
+# Wait for a team to write its result file, repairing the one measured way it can fail to arrive.
+# Prints the phase it ended on; non-zero when the timeout ran out.
+wait_result() { # <ticket> [timeout]
+  local ticket=$1 timeout="${2:-$DEMO_WAIT_SECONDS}" phase deadline nudged=0
+  deadline=$((SECONDS + timeout))
+  while :; do
+    phase=$(team_phase "$ticket")
+    if grep -qE '^result:(done|failed)$' <<<"$phase"; then printf '%s\n' "$phase"; return 0; fi
+    if [ "$nudged" = 0 ] && team_result_missing "$ticket" && \
+       [ "$("$DISPATCH" status "$ticket" --json 2>/dev/null | jq -r '[(.[] | (.open // [])[])] | length' 2>/dev/null)" = "0" ]; then
+      # One attempt per wait, spent whether or not it found a seat: a team with no running seat does not
+      # come back by waiting, and re-logging that every 15s is up to 80 identical lines before the timeout.
+      nudge_finish "$ticket" || true
+      nudged=1
+    fi
+    [ "$SECONDS" -lt "$deadline" ] || { printf '%s\n' "$phase"; return 1; }
+    sleep "$DEMO_WAIT_POLL"
+  done
+}
+
 # Wait until one ticket's phase matches an extended regex. Prints the phase it ended on, and returns
 # non-zero when it ran out of time -- the caller says what that means for its own step.
 wait_phase() { # <ticket> <extended-regex> [timeout]
@@ -203,8 +263,19 @@ wait_phase() { # <ticket> <extended-regex> [timeout]
 # the presenter's own terminal, where the audience can see them.
 print_view_commands() {
   cat <<EOF
+export CLIENT=<your build of the hub's commit>/packages/cli   # the run sheet says how to build it
 kubectl -n $NS port-forward pod/$HUB_POD $DEMO_PORT:7433 &
 OPENRIG_HOME=$DEMO_HOME OPENRIG_URL=http://127.0.0.1:$DEMO_PORT \\
-  node "\$(npm root -g)/@openrig/cli/tui/dist/main.js" --url http://127.0.0.1:$DEMO_PORT
+  node "\$CLIENT/tui/dist/main.js" --url http://127.0.0.1:$DEMO_PORT
+EOF
+  cat <<EOF
+
+Never drop --url: without it the TUI opens your own daemon on 7433, not the hub's.
+
+Check that build is the hub's build, not merely the same version number. The TUI has no --version of its
+own, so read the CLI out of the same build it comes from:
+  HUB_SHA=\$($KUBECTL -n $NS get pod $HUB_POD -o jsonpath='{.spec.containers[0].image}'); HUB_SHA=\${HUB_SHA##*:}; HUB_SHA=\${HUB_SHA#*-}; HUB_SHA=\${HUB_SHA:0:8}
+  CLIENT_SHA=\$(node "\$CLIENT/dist/bin-wrapper.js" --version | sed -n 's/.*(\\([0-9a-f]\\{7,\\}\\).*/\\1/p')
+  [ "\$CLIENT_SHA" = "\$HUB_SHA" ] && echo "client build matches the hub: \$CLIENT_SHA" || echo "MISMATCH: client \${CLIENT_SHA:-unstamped} vs hub \$HUB_SHA"
 EOF
 }

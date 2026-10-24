@@ -20,6 +20,10 @@
 #   bad_json=0                  1 makes an existing file unparseable, which IS a real error
 #   threshold=30                fleet.stall_threshold_minutes right now
 #   collect_fails=1             make `rig-dispatch collect` fail, as an unreachable pod would
+#   result_DEMO_B=1             0 means the seat closed its row without writing its result file
+#   heeds_nudge=0               1 makes a `rig send` to the seat produce that result file, as a seat that
+#                               takes the repair does
+#   seats_DEMO_A=[{...}]        the seat list `status --json` reports, if not the default running lead
 : "${DEMO_FAKE_STATE:?fake-kubectl: no state file}"
 : "${DEMO_FAKE_CALLS:?fake-kubectl: no call log}"
 printf 'kubectl %s\n' "$*" >> "$DEMO_FAKE_CALLS"
@@ -163,5 +167,35 @@ case "$*" in
   "get pvc -l "*) for p in ${pvcs:-}; do printf '%s\n' "$p"; done ;;
   "delete pvc "*) exit 0 ;;
   "exec hub-0 -c daemon -- "*) shift 5; hub "$@" ;;
+
+  # A team pod read. The only one the demo scripts make is `test -f /home/openrig/work/result.json`, and
+  # the answer comes from state so a test can put a team in the measured state of "row closed, nothing
+  # written". `result_DEMO_B=0` means the seat never wrote its result file.
+  "exec t-demo-"*" -c daemon -- sh -c "*)
+    pod=$2
+    tk=$(printf '%s' "${pod#t-demo-}" | tr '[:lower:]' '[:upper:]')
+    tk="result_DEMO_${tk%-*}"
+    val=$(sed -n "s|^$tk=||p" "$DEMO_FAKE_STATE" | tail -n1)
+    [ -n "$val" ] || val=1
+    [ "$val" = 1 ] && exit 0
+    exit 1 ;;
+
+  # The repair path. `rig send` to the seat is recorded so the test can assert it was addressed to a real
+  # session, and a seat that heeds it writes its result file -- which is what the rehearsal's seat did.
+  "exec t-demo-"*" -c daemon -- rig send "*)
+    pod=$2
+    tk=$(printf '%s' "${pod#t-demo-}" | tr '[:lower:]' '[:upper:]')
+    tk="result_DEMO_${tk%-*}"
+    printf 'rig-send-to %s\n' "$8" >> "$DEMO_FAKE_CALLS"
+    if [ "${heeds_nudge:-0}" = 1 ]; then
+      # The seat does the two steps it skipped: the commit lands, the file names it, so the phase moves.
+      pk="phase_DEMO_${tk#result_DEMO_}"
+      for kv in "$tk=1" "$pk=result:done"; do
+        key=${kv%%=*}; val=${kv#*=}
+        if grep -q "^$key=" "$DEMO_FAKE_STATE"; then sed -i "s|^$key=.*|$key=$val|" "$DEMO_FAKE_STATE"
+        else printf '%s=%s\n' "$key" "$val" >> "$DEMO_FAKE_STATE"; fi
+      done
+    fi
+    printf 'Sent\n' ; exit 0 ;;
   *) printf 'fake-kubectl: unhandled: %s\n' "$*" >&2; exit 1 ;;
 esac

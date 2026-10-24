@@ -25,3 +25,9 @@ Add to `test/run.sh`, in the same style as the checks already there:
 
 Run `sh test/run.sh`, see every check pass, commit on the branch the contract names, and write the
 result file the contract names. Touch only `bin/wordcount.sh` and `test/run.sh`.
+
+**In that order, and nothing before it.** The commit exists, then `result.json` names its sha, then the
+queue item closes — never the other way round. A closed row with an uncommitted tree and no result file is
+not a finished ticket: the person running this demo is waiting on the result file, and nothing will come
+to ask you for the rest. If you find yourself with a passing suite and no commit, that is the step you
+skipped; make the commit now.

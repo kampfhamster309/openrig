@@ -68,7 +68,11 @@ fi
 log "DEMO-A has a queue item parked on human@host, which is what the audience will answer"
 
 log "waiting for DEMO-B to finish (up to $((DEMO_WAIT_SECONDS / 60))m)"
-phase=$(wait_phase DEMO-B 'result:done') || die "DEMO-B did not finish in $((DEMO_WAIT_SECONDS / 60))m (last phase: $phase). Read it with: $DISPATCH status DEMO-B --json"
+# Not `wait_phase` alone. A one-seat team can close its own row and stop with the tree uncommitted and no
+# result file -- measured in the rehearsal -- and a phase-only wait would sit through the whole timeout and
+# then name the phase, which is not the fault. `wait_result` notices that state, asks the seat for the two
+# contract steps it skipped, and keeps waiting.
+phase=$(wait_result DEMO-B) || die "DEMO-B did not finish in $((DEMO_WAIT_SECONDS / 60))m (last phase: $phase). If its row is closed and the tree is uncommitted, the seat skipped its commit and its result file -- read it with: $DISPATCH status DEMO-B --json"
 log "DEMO-B is done, which is what the archive-and-delete step shows"
 
 # 7. The presenter's own commands. These run in the presenter's terminal, not here.

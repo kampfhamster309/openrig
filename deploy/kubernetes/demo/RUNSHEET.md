@@ -5,9 +5,10 @@ meant to be pasted. Times are for the whole step, including the typing.
 
 **What you are showing.** One command turns a ticket into a running team of agents in its own pod, one
 hub shows every team at once, a human answer goes back into the team and is recorded as a human answer,
-a quiet team is caught as stalled, a finished team is archived before it can be deleted, and a team
-destroyed behind the hub's back is reconciled. Three teams: **DEMO-A** is waiting for a decision,
-**DEMO-B** is finished, **DEMO-C** is started live and is still working.
+a team parked on a human answer is caught as stalled while it waits, a finished team is archived before it
+can be deleted, and a team destroyed behind the hub's back is reconciled. Three teams: **DEMO-A** is
+waiting for a decision, **DEMO-B** is finished, **DEMO-C** is started live on stage and keeps working
+after its command returns — it may well finish before the talk ends, and step 5 says what that means.
 
 Set these once, in the terminal you present from. Run everything **from this directory**
 (`deploy/kubernetes/demo`) — that is what makes the dispatcher path below work without a machine-specific
@@ -16,11 +17,47 @@ absolute path in it:
 ```bash
 export NS=openrig
 export D=../dispatcher/rig-dispatch    # the dispatcher, one directory over
+export ARCH=$HOME/tmp/demo-archive     # one archive dir, used by all of step 6
+export CLIENT=$HOME/tmp/openrig-hub-build/packages/cli   # your build of the hub's commit (see below)
 ```
 
 > If you present from somewhere else, set `D` to wherever the dispatcher is. Everything below assumes
 > `jq`, `kubectl` and `KUBECONFIG` pointing at the cluster, which you already had working when you ran
 > `prepare.sh`. Do not set `Q_A` here — it comes after `prepare.sh`, which is step 1 below.
+
+**Your own OpenRig client must be the hub's build.** After step 2 every `rig` command on this sheet runs
+*inside* hub-0 or inside a team pod, so those are the hub's build by construction. The one client that is
+yours is the **TUI** you start in step 2, and it talks to the hub's routes: a client that is merely "also
+0.7.0" can be a different commit and lack what the hub serves. The published npm release is not
+automatically the hub's build — in rehearsal 1 `@openrig/cli@0.7.0` on npm was a different commit from the
+image, and it had no `usage top --all-hosts` at all.
+
+Build it from the commit the hub image tag names (the tag is `0.7.0-<sha>`), in a scratch worktree:
+
+```bash
+git -C <an openrig checkout> worktree add --detach "$HOME/tmp/openrig-hub-build" <the sha the tag names>
+cd "$HOME/tmp/openrig-hub-build" && npm ci && npm run build:package
+```
+
+`build:package`, not plain `npm run build`: the stamp that makes `--version` name a commit is written by
+the packaging script, and an unstamped build prints `0.7.0` with no commit at all.
+
+Then check it against the hub, mechanically, before you present. The TUI has no `--version` of its own (it
+ignores an unknown flag and opens the UI), so the check reads the CLI from the same build the TUI comes
+from:
+
+```bash
+HUB_TAG=$(kubectl -n $NS get pod hub-0 -o jsonpath='{.spec.containers[0].image}'); HUB_TAG=${HUB_TAG##*:}
+HUB_SHA=${HUB_TAG#*-}; HUB_SHA=${HUB_SHA:0:8}
+CLIENT_SHA=$(node "$CLIENT/dist/bin-wrapper.js" --version | sed -n 's/.*(\([0-9a-f]\{7,\}\).*/\1/p')
+[ "$CLIENT_SHA" = "$HUB_SHA" ] && echo "client build matches the hub: $CLIENT_SHA" \
+  || echo "MISMATCH: client ${CLIENT_SHA:-unstamped} vs hub $HUB_SHA — build it from the hub's commit"
+```
+
+If they disagree, say so and fix the build rather than presenting a step you know will error. (`rig tui`
+hands its own build to the TUI, which compares it with the daemon's `/healthz` and stops its background
+reads on a mismatch. Started by path — which is what this sheet does, because `rig tui` takes no `--url` —
+it cannot check, so the check above is the one that matters.)
 
 ---
 
@@ -33,10 +70,16 @@ An hour before, in a plain terminal:
    DEMO-B one at a time, and waits until A is waiting for a human and B is done. It prints the next two
    commands when it is finished. Expect a few minutes; it is starting two pods and two agents.
 2. Start the port-forward it printed: `kubectl -n $NS port-forward pod/hub-0 17433:7433 &`
-3. Start the hub TUI it printed, in the window you will present, and leave it on **PULSE**:
-   `OPENRIG_HOME=$HOME/.openrig-hub-view OPENRIG_URL=http://127.0.0.1:17433 node "$(npm root -g)/@openrig/cli/tui/dist/main.js" --url http://127.0.0.1:17433`
-   The title line names the host it reads. If it says something other than `hub-0`, you are looking at
-   a local daemon: `Ctrl-C`, check `OPENRIG_URL` is set, start it again.
+3. Start the hub TUI it printed, in the window you will present:
+   `OPENRIG_HOME=$HOME/.openrig-hub-view OPENRIG_URL=http://127.0.0.1:17433 node "$CLIENT/tui/dist/main.js" --url http://127.0.0.1:17433`
+   **Always pass `--url`.** Without it the TUI opens your own local daemon on 7433, not the hub. The
+   explorer should name `hub-0`. If it names your own machine, `Ctrl-C`, check `OPENRIG_URL` and `--url`
+   are both set, and start it again.
+
+   It opens on **Start and return**. On a hub that answers quickly it moves on to the ordinary views by
+   itself in a moment; if the screen is still up, press **`w`** ("Skip startup · ordinary views"), and `S`
+   opens it again from any view. PULSE is a tab, not a page: type **`tab pulse`** in the `cmd` line (a
+   `:` jumps to a section instead).
 4. Open a second window for the commands, and a third for `watch` in step 4.
 5. `./cleanup.sh` and `./prepare.sh` again if anything looks off. `prepare.sh` is safe to re-run.
 6. Now read the ticket id the rest of the talk needs, and put it where you can see it:
@@ -50,8 +93,9 @@ An hour before, in a plain terminal:
    last rehearsal points at a row that no longer exists. Step 3 types this id into the TUI, so leave it
    on screen.
 
-Right before you start: DEMO-A is under **NEEDS YOU**, DEMO-B shows `result:done`, and nothing else is
-running. `$D status` prints all three.
+Right before you start: DEMO-A is under **NEEDS YOU** in PULSE (`tab pulse`), DEMO-B shows `result:done`,
+and nothing else is running. `$D status` prints all three, and
+`$D status DEMO-A --json | jq '.[0].open'` is the same fact without the TUI.
 
 ---
 
@@ -60,7 +104,7 @@ running. `$D status` prints all three.
 ```bash
 $D start DEMO-C --repo https://github.com/kampfhamster309/openrig-demo --ref main \
    --spec /etc/openrig-kit/rig-one.yaml --brief-file ./briefs/DEMO-C.md \
-   --cpu 200m --memory 1536Mi --storage 2Gi
+   --cpu 200m --memory 896Mi --storage 2Gi
 ```
 
 **Audience sees.** The dispatcher create a Secret and a StatefulSet, wait for the pod, run `rig up`
@@ -80,55 +124,102 @@ Claude Code lead. It keeps working after the command returns, which is the point
 
 ## 2. The hub sees every team — 3 min
 
-In the TUI window:
+**Open the TUI first — this is its step.** Three things, in this order:
 
-- **PULSE** — `DEMO-A`'s question is under **NEEDS YOU**, with a dim `[t-demo-a]` label on the row: that
-  label is which team pod it came from. It is also under **⚑ STALLED**, and this is the moment that is true:
-  it parked an hour ago, it holds open work, and a parked row makes no queue transitions. Say so here, and
-  say why — step 5 refers back to this row, because after step 3 answers it the stall clock has restarted.
-- Press into **TOPOLOGY** and expand `t-demo-c` — a remote team opens into its rig and its seats, the
-  same as a local one, because the hub reads each team's daemon over the cluster network.
-- Back on the main page, above the seat table, **FLEET USAGE · last 1h** — what the teams have spent.
-  It is a block on the hub's own instance page, not a page of its own, and it renders only while the hub
-  has remote hosts registered: with no team up it shows nothing at all, which is not a fault.
+1. **PULSE** — type `tab pulse` in the `cmd` line. `DEMO-A` sits under **▲ NEEDS YOU** with a dim
+   `[t-demo-a]` label in front of its summary, and the same row is under **⚑ STALLED** with
+   `Nm since last progress, 1 open`. Say both: the team is waiting for you *and* the hub has already
+   called it stalled, and that is not a contradiction — a parked row is open work that makes no queue
+   transitions. Step 5 comes back to what the second badge means.
+2. **TOPOLOGY** — in the explorer, open `hub-0` and then a remote host: it expands into its rig and its
+   seats, each with its state. A remote rig prints `reach: read-only from here · rig capture|send
+   <seat>@<rig>@<host>` where a local one offers a terminal, because the terminal would open on the wrong
+   machine.
+3. **FLEET USAGE** — `hub-0`'s own instance page, above the seat table, headed
+   `FLEET USAGE · last 1h`: the top seats across every host by tokens and tokens/hour, with
+   `N of M hosts answered`.
 
-Then the same reads from the command line, which is what the TUI is doing:
+**Then the same facts as text, from the hub.** These are the hub's own fan-out, so run them **as the
+hub**. Do not run them from your terminal with `OPENRIG_URL` pointed at the port-forward: `--all-hosts`
+fans out from the host registry in `OPENRIG_HOME` on *your* machine, and `OPENRIG_URL` does not change
+that, so a fresh demo home answers `host registry not found …/hosts.yaml`. The hub's registry is the one
+that holds the teams.
 
 ```bash
-OPENRIG_HOME=$HOME/.openrig-hub-view OPENRIG_URL=http://127.0.0.1:17433 rig ps --all-hosts --nodes -A
-OPENRIG_HOME=$HOME/.openrig-hub-view OPENRIG_URL=http://127.0.0.1:17433 rig usage top --all-hosts
+kubectl -n $NS exec hub-0 -c daemon -- rig ps --all-hosts --nodes -A
+kubectl -n $NS exec hub-0 -c daemon -- rig usage top --all-hosts
 ```
 
 `--nodes` across hosts needs the `-A`: without it `rig ps` refuses and prints the ladder it wants
 (`per-node fan-out requires the FULL explicit ladder`). That is the command's rule, not a fault here.
 
-**Audience sees.** Every seat of every team in one screen, each row carrying its team, and usage that
-adds up across hosts. No agent runs on your machine.
+Say what the audience is looking at: every seat of every team, and a token-burn table that adds up across
+hosts. No agent runs on your machine. `rig ps` answers per host, so it prints a `[host=t-demo-a]` block
+per team; `usage top` is the one that labels each seat row with its `[host]`.
+
+**And this is where the stall is true.** `DEMO-A` parked its question an hour ago, it holds open work,
+and a parked row makes no queue transitions — which is exactly what the hub counts as progress. Show it
+as a number now, while it holds:
+
+```bash
+curl -s 'localhost:17433/metrics?fresh=1' | grep -E 'openrig_fleet_(host|rig)_stalled|stall_threshold'
+```
+
+Expect `openrig_fleet_host_stalled{host="t-demo-a"} 1` next to
+`openrig_fleet_stall_threshold_seconds 180`. Step 5 comes back to what that number means, after step 3
+has answered the row and restarted its clock.
+
+Say honestly that this read is the rule applied, not something a rehearsal has yet seen at this point in
+the run: in rehearsal 1 the only `1` that came back was later, and it belonged to a row that had
+re-parked (step 3 explains how). The rule is what makes it safe to promise here — open work includes a
+row parked on a human, the only progress source is a queue transition, and a system actor's note is not
+one. Rehearsal 2 takes this reading at this point in the run, before anything is answered.
+
+The `?fresh=1` is not decoration. The verdict is computed from a cached fleet read, and in rehearsal 1 a
+scrape still said `0` about twenty seconds after the row had passed the threshold while a fresh read said
+`1` in the same second; a non-fresh read may be served a payload up to about a minute old while a refresh
+runs. Without it, say "the next fleet read will say 1" and move on.
 
 **If it does not appear.**
-- The TUI shows your own rigs: `OPENRIG_URL` is not set in that window. Restart it with the line above.
-- A team is `unreachable`: the port-forward died (it dies when the machine sleeps). `kill %1`, start it
-  again, wait ten seconds.
-- The CLI lists hosts that are not teams: it used your local registry. Use the `OPENRIG_HOME=` prefix
-  exactly as written — that is the whole trick.
-- Fallback that needs no port-forward at all: `kubectl -n $NS exec hub-0 -c daemon -- rig ps
-  --all-hosts --nodes -A`.
+- `host registry not found` — you ran it from your terminal instead of through `exec hub-0`. That is the
+  form above; use it.
+- A team is `FAILED (remote-daemon-unreachable)`: the port-forward died (it dies when the machine sleeps).
+  `kill %1`, start it again, wait ten seconds.
+- No `stalled` line at all for a team with open work: the hub has no verdict yet and leaves the line out
+  rather than writing 0. Wait for the next fleet read.
+- `curl` refuses: the port-forward died. Restart it.
+- **FLEET USAGE is missing** from `hub-0`'s page: the block is absent while no remote host is registered,
+  while the usage read has not answered for the first time, or if the page you are on is not the local
+  instance's. With teams registered it should be there; if it is not, name it as a fault and read
+  `rig usage top --all-hosts` in the hub instead, which is the same numbers.
+- PULSE shows no NEEDS YOU row for DEMO-A: the aggregate read is the hub's, and it is slow when a team is
+  slow — the TUI now waits as long as that fan-out may take and names a failed read in the status line
+  rather than quietly showing you one host. If the status line names a failure, say what it names.
 
 ---
 
 ## 3. Answer the team, as a human — 3 min
 
-From the TUI, on the NEEDS YOU row:
+From the TUI, on the NEEDS YOU row (PULSE, `tab pulse`):
 
 ```
 answer <qitem> Use '<words> <lines>' (B)
 ```
 
-or from the shell:
+A row the fleet read showed on another host is routed there, so this answers DEMO-A's row on `t-demo-a`
+from the hub. Or from the shell:
 
 ```bash
-$D answer DEMO-A "$Q_A" "Use '<words> <lines>' (B)"
+$D answer DEMO-A "$Q_A" "Use '<words> <lines>' (B)" | jq -c '{verb: .verb, reason: .closedQitem.resolution}'
 ```
+
+Type one of the two literal orders, with the letter that names it. The team takes the words literally:
+in the rehearsal an answer that quoted option A's order under option B's letter came back as a re-park
+saying "those conflict: A = …; B = … Which do you want?" — which is the team being right, and a wasted
+minute on stage. The `jq` is there because `answer` prints the whole queue row, which is several hundred
+lines of JSON on a projector; it keeps the two fields the audience needs, the verb and the decision that
+closed the row. Piping costs you `answer`'s exit code, which is the thing that tells you the hub path was
+refused — with `set -o pipefail` in your shell it still fails the line, otherwise read the output.
 
 Then show what the team now has, and who it thinks it came from:
 
@@ -177,44 +268,49 @@ progress as *queue transitions* and nothing else — a seat redrawing a spinner,
 a heartbeat from the watchdog: none of it counts. A scope is stalled when it holds open work and no queue
 transition landed inside the threshold. `prepare.sh` lowered that threshold to 3 minutes.
 
-DEMO-C is sized so that at this point in the talk it is **still working and has not touched its queue for
-over three minutes**: the brief is two parts, and the first rehearsal should time it past the eight minutes
-step 5 lands at. That is the assumption being tested here, and the rehearsal is where it is confirmed. In
-the TUI, **PULSE → ⚑ STALLED** shows `<rig> — Nm since last progress, N open · threshold 3m`. The same
-verdict, as a number:
+The subject is the row you already saw in step 2: **`DEMO-A` parked, holding open work, making no queue
+transitions.** Step 2 showed that verdict twice — as the **⚑ STALLED** row in PULSE ("`Nm since last
+progress, 1 open`") and as the metric line (`openrig_fleet_host_stalled{host="t-demo-a"} 1`). This step
+says what the two of them mean.
 
-```bash
-curl -s localhost:17433/metrics | grep -E 'openrig_fleet_(host|rig)_stalled|stall_threshold'
-```
+Say the sentence from the step 2 read. Do **not** go pointing at `DEMO-A` again here: step 3 answered it,
+and that answer is itself a queue transition made by a human, which restarts its stall clock. By step 5 it
+has been a few minutes of answered, working, maybe finished — no badge, and saying otherwise would be wrong.
 
-**Audience sees.** The stall, twice: once as a sentence in the TUI and once as a metric line, from the
-same hub, with no Prometheus anywhere near it.
+**Do not promise `DEMO-C` as the stalled team.** The rehearsal measured it: `DEMO-C`'s row went
+`pending` → `in-progress` → `done` in **44 seconds**, both parts of its brief included. A scope with no
+open work is never stalled, so at step 5 it correctly has no badge. If it is still working when you get
+here, say that it is working and that a *quiet* team with open work is what the badge is for; if it has
+finished, say that finishing is why it is not stalled. Either way the stall you demonstrated is the parked
+row in step 2, and that is the honest version.
+
+**Audience sees.** Nothing new on screen. This is the explanation of what step 2 showed — the badge and the
+number, from the same hub, with no Prometheus anywhere near it. Say that you are referring back rather than
+promising a second live read.
 
 **If it does not appear.**
-- The fallback is a **callback, not a live check**. Do not go pointing at DEMO-A now: step 3 answered it, and
-  that answer is itself a queue transition made by a human, which restarts its stall clock. By step 5 it has
-  been four minutes of answered, working, maybe finished — no badge, and saying otherwise would be wrong.
-  Instead, refer back: "you saw this on DEMO-A in step 2 — that row was NEEDS YOU and STALLED at the same
-  time, for exactly this reason." It was genuinely stalled there: parked on a human, holding open work, and
-  a parked row makes no queue transitions.
-- DEMO-C finished early and closed its item: a scope with no open work is never stalled, and no badge is
-  correct. Use the step 2 callback above.
-- DEMO-C is working but its clock keeps restarting: the orchestrator seat posting progress notes onto its
+- The fallback is a **callback, not a live check**. Refer back: "you saw this on DEMO-A in step 2 — that
+  row was NEEDS YOU and STALLED at the same time, for exactly this reason." It was genuinely stalled there:
+  parked on a human, holding open work, and a parked row makes no queue transitions.
+- `DEMO-C` is working but its clock keeps restarting: the orchestrator seat posting progress notes onto its
   own item counts as queue transitions, and each one resets the timer. That is the rule working, not a
-  fault — and it is why the rehearsal counts C's transitions, not only its minutes.
+  fault — and it is why the rehearsal counted C's transitions, not only its minutes.
 - No `stalled` line at all for a team with open work: the hub has no verdict yet, and leaves the line out
   rather than writing 0. Wait for the next fleet read.
-- `curl` refuses: the port-forward died. Restart it.
 
 ---
 
 ## 6. A finished team: archive, then delete — 3 min
 
+All four commands name the **same** archive directory (`$ARCH`, set at the top). `collect` writes where
+`--archive` says; `report` and `delete` look where `--dir` says, and default to `./tickets`. Give them
+different places and the delete is refused on stage for an archive that is sitting in the other one.
+
 ```bash
-$D delete DEMO-B            # refused, on purpose
-$D collect DEMO-B --archive ~/tmp/demo-archive
-$D report DEMO-B
-$D delete DEMO-B
+$D delete DEMO-B                              # refused, on purpose
+$D collect DEMO-B --archive "$ARCH"
+$D report DEMO-B --dir "$ARCH"
+$D delete DEMO-B --dir "$ARCH"
 ```
 
 `--archive` is what the sheet uses on purpose. `--into <dir>` is the other form and it means "a git
@@ -229,9 +325,11 @@ let go.
 
 **If it does not appear.**
 - `delete` succeeds the first time: DEMO-B was already archived by an earlier run. Say so and show
-  `$D report DEMO-B` anyway.
-- `collect` fails: the pod is gone. `$D delete DEMO-B --force` and note that the history was lost —
-  which is exactly the lesson the guard exists for.
+  `$D report DEMO-B --dir "$ARCH"` anyway.
+- `collect` fails: the pod is gone. `$D delete DEMO-B --force --dir "$ARCH"` and note that the history was
+  lost — which is exactly the lesson the guard exists for.
+- `report` says `no archive for demo-b under ./tickets`: the two commands were given different directories.
+  Pass `--dir "$ARCH"`, the one `collect` wrote to.
 - `report` is thin: review rounds are counted from seats whose names start with `review`, and a
   one-seat team has none. Say that this team was one seat on purpose.
 
@@ -241,22 +339,25 @@ let go.
 
 ```bash
 kubectl -n $NS delete statefulset t-demo-c --wait=false
-# the TUI: t-demo-c goes unreachable, then its rows go away
+# the hub says so within seconds; read it from the CLI
+kubectl -n $NS exec hub-0 -c daemon -- rig ps --all-hosts
 $D hub-sync --dry-run
 $D hub-sync
 ```
 
-**Audience sees.** The hub said "unreachable" the moment the pod went, not after a human noticed.
-`--dry-run` prints what it would reconcile — the team is registered there and nothing backs it — and
-`hub-sync` fixes it. The TUI is clean again.
+**Audience sees.** The hub said "unreachable" the moment the pod went, not after a human noticed. In the
+rehearsal that read came back inside twelve seconds as
+`[host=t-demo-c] FAILED (remote-daemon-unreachable): host did not answer its health probe`. `--dry-run`
+prints what it would reconcile — the team is registered there and nothing backs it — and `hub-sync` fixes
+it, after which `rig ps --all-hosts` no longer names the team at all.
 
 Expect `--dry-run` to **exit 1** here. Drift is what it reports, and a non-zero exit is it doing its job —
-say that before you run it, so a red exit code on screen is not read as a failure.
+say that before you run it, so a red exit code on screen is not read as a failure. (Pipe it through `tail`
+and `$?` becomes `tail`'s; check the code on the command itself.)
 
 **If it does not appear.**
-- The TUI still shows it: the fleet cache is up to a minute old. Re-read from the CLI instead —
-  `OPENRIG_HOME=$HOME/.openrig-hub-view OPENRIG_URL=http://127.0.0.1:17433 rig ps --all-hosts` — and the
-  row is gone there even while the TUI still holds its last good frame.
+- The hub still lists it: the fleet cache is up to a minute old. Re-read with a fresh fan-out rather than
+  trusting the last frame — `kubectl -n $NS exec hub-0 -c daemon -- rig ps --all-hosts`.
 - `hub-sync --dry-run` says nothing to do: it already reconciled, or the StatefulSet is still there.
   `kubectl -n $NS get statefulset t-demo-c` to check.
 - Fallback if `hub-sync` itself is the thing that is broken: clean it by hand as
