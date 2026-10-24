@@ -58,7 +58,14 @@ slug_of() {
 
 name_of() { printf 't-%s' "$1"; }
 pod_of() { printf 't-%s-0' "$1"; }
-inpod() { local slug=$1; shift; k exec -i "$(pod_of "$slug")" -c daemon -- "$@"; }
+# `kubectl exec -i` copies the caller's stdin into the pod whether or not the command inside it ever
+# reads, and whatever it takes is gone from the caller. So a pod read made while the caller is reading
+# a stream drinks that stream: it ate the rest of a hub repair's input on a real cluster, and it ate
+# `watch`'s own event stream the same way -- the status probe runs inside the loop that reads the
+# stream. Rather than leave every caller to remember, the read closes stdin here and a caller that
+# really means to send stdin says so by name (`inpod_stdin`, below).
+inpod() { local slug=$1; shift; k exec -i "$(pod_of "$slug")" -c daemon -- "$@" </dev/null; }
+inpod_stdin() { local slug=$1; shift; k exec -i "$(pod_of "$slug")" -c daemon -- "$@"; }
 sts_json() { k get statefulset "$(name_of "$1")" -o json 2>/dev/null; }
 annotation() { jq -r --arg k "$ANN/$2" '.metadata.annotations[$k] // empty' <<<"$1"; }
 annotate() { k annotate --overwrite statefulset "$(name_of "$1")" "$ANN/$2=$3" >/dev/null; }
@@ -86,7 +93,11 @@ hub_ready() {
     jq -e 'any(.status.conditions[]?; .type == "Ready" and .status == "True")' >/dev/null 2>&1
 }
 
-hub_exec() { "$KUBECTL" -n "$NS" exec -i "$HUB_POD" -c daemon -- "$@"; }
+# Same rule as `inpod`: stdin is closed unless the caller says otherwise with `hub_exec_stdin`. The
+# hub's node scripts and the bearer write are the ones that do, and `hub_edit` passes stdin through on
+# purpose, which is why its own callers pass `</dev/null` when they are only running a command.
+hub_exec() { "$KUBECTL" -n "$NS" exec -i "$HUB_POD" -c daemon -- "$@" </dev/null; }
+hub_exec_stdin() { "$KUBECTL" -n "$NS" exec -i "$HUB_POD" -c daemon -- "$@"; }
 
 # What the hub dials. A bearer is required: the team pod binds 0.0.0.0, and sending one also
 # satisfies the daemon's Host-header check, so the teams need no OPENRIG_ALLOWED_HOSTS.
@@ -97,8 +108,8 @@ team_bearer() { k get secret "$(name_of "$1")" -o jsonpath='{.data.bearer}' | ba
 # The hub image has no PyYAML. The CLI's own `yaml` dependency is the same parser `rig host add`
 # writes with, so the registry is edited with it.
 hub_npm_root() {
-  # </dev/null matters: this is often called while a pipeline has stdin open, and
-  # `kubectl exec -i` would otherwise read the script meant for the next command.
+  # Kept explicit even though `hub_exec` closes stdin now: this one is often called while a pipeline
+  # has stdin open, and it is the read that first ate the script meant for the command after it.
   [ -n "$_hub_npm_root" ] || _hub_npm_root=$(hub_exec sh -c 'npm root -g' </dev/null 2>/dev/null | tail -n1)
   printf '%s' "$_hub_npm_root"
 }
@@ -147,7 +158,7 @@ HUB_LOCK_TIMEOUT="${RIG_DISPATCH_HUB_LOCK_TIMEOUT:-60}"
 # protects, and stdin passes through untouched because the bearer travels on it and must not appear in
 # any command line.
 hub_locked() {
-  hub_exec sh -c '
+  hub_exec_stdin sh -c '
     to=$1; lock=$2; shift 2
     exec 9>>"$lock" || exit 96
     flock -w "$to" 9 || exit 97
@@ -207,7 +218,7 @@ console.log(JSON.stringify({
   bindings,
   subscriptions: subs,
 }));
-' | hub_exec env NPM_ROOT="$root" node -
+' | hub_exec_stdin env NPM_ROOT="$root" node -
 }
 
 # The per-host subscription is what makes the hub read that team's queue at all; a host without it is
@@ -217,9 +228,10 @@ console.log(JSON.stringify({
 # unset, false and whatever the CLI prints for a key nobody ever set, without my guessing which.
 hub_subscription() { # <host id> -> true | false
   local v=""
-  # </dev/null: `kubectl exec -i` copies the caller's stdin into the pod whether or not the command
-  # inside reads it, so a read like this one would drink whatever the caller was reading -- and on a
-  # real cluster a repair's hub calls ate the rest of hub-sync's plan that way.
+  # Belt and braces with `hub_exec`, which closes stdin for every hub read now. The live drain was
+  # `sync_apply`'s repair calls: on a real cluster they drank the rest of the input `hub-sync` was
+  # reading, because `kubectl exec -i` copies the caller's stdin into the pod whether or not the
+  # command inside it ever reads.
   v=$(hub_exec rig config get "feed.subscriptions.$1.enabled" 2>/dev/null </dev/null | tail -n1) || true
   if [ "${v:-}" = true ]; then printf true; else printf false; fi
 }
@@ -239,7 +251,8 @@ hub_registry() {
   root=$(hub_npm_root)
   # Reading needs no lock. Writing does: both writers read hosts.yaml, change it in memory and write
   # the whole file back, so the one that finishes last silently drops what the other just added.
-  if [ "$mode" = has ]; then runner=hub_exec; else runner=hub_edit; fi
+  # Both branches take the node script on stdin, which is why `has` names the stdin-passing read.
+  if [ "$mode" = has ]; then runner=hub_exec_stdin; else runner=hub_edit; fi
   printf '%s%s\n' "$HUB_NODE_PRELUDE" '
 const mode = process.env.HUB_MODE, id = process.env.HUB_HOST_ID;
 if (!fs.existsSync(yamlFile)) process.exit(mode === "has" ? 1 : 0);
@@ -876,7 +889,7 @@ cmd_start() {
     rig=$(annotation "$sts" rig)
     session=$(lead_session "$slug" "$rig" "$lead")
     [ -n "$session" ] || die "no seat '$lead' in rig $rig (use --lead <logicalId>)"
-    brief_with_contract "$slug" "$brief" | inpod "$slug" sh -c "cat > $WORK/brief.md"
+    brief_with_contract "$slug" "$brief" | inpod_stdin "$slug" sh -c "cat > $WORK/brief.md"
     qitem=$(inpod "$slug" rig queue create --source "dispatcher@$NS" --destination "$session" \
       --tags "ticket:$slug" --summary "$(annotation "$sts" ticket-key): $(head -n1 "$brief" | sed 's/^#* *//' | cut -c1-100)" \
       --body-file "$WORK/brief.md" --json | jq -r '.qitemId // .qitem.qitemId // empty')

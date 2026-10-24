@@ -25,6 +25,9 @@ cp "$HERE/fake-kubectl" "$BIN/kubectl"
 chmod +x "$BIN/kubectl" "$HERE/fake-kubectl"
 export PATH="$BIN:$PATH"
 export FAKE_FIXTURES=$FIXTURES
+# Marks every fake kubectl this run starts, so the reader check below can tell its own processes from
+# another run's. See ./fake-kubectl.
+export FAKE_RUN_TAG="$(basename "$WORK")-$$"
 
 PASS=0
 FAILED=0
@@ -68,9 +71,12 @@ run_watch() {
 
 # leftover_readers -- how many fake-kubectl stream readers are still running. A `kubectl exec` that
 # outlives its watch leaves an in-pod curl open on the team's daemon, so the reader has to die with
-# the command that started it.
+# the command that started it. Counted through this run's marker rather than by the pattern alone:
+# `ps` sees the whole machine, so a machine-wide count makes two concurrent runs of this test each fail
+# on the other's readers -- a false failure, and the kind that teaches people to ignore a check.
 leftover_readers() {
-  ps -eo args 2>/dev/null | grep "exec -i t-demo-0" | grep -v grep | wc -l | tr -d ' '
+  ps -eo args 2>/dev/null | grep "exec -i t-demo-0" | grep -F "$FAKE_RUN_TAG" | grep -v grep |
+    wc -l | tr -d ' '
 }
 
 printf '# terminal event, on a stream that never ends\n'
@@ -95,6 +101,21 @@ eq "a block alone does not end the ticket" 4 "$RC"
 in_err "names the queue item that needs a human" "qitem-b is blocked"
 in_err "says what a block means" "a human may be needed"
 in_err "still reads the ticket status after the block" "working (human)"
+
+printf '# a status probe must not drink the stream it is watching\n'
+# The probe is a `kubectl exec -i` like every other pod read, and it runs INSIDE the loop that reads
+# the event stream. Real kubectl copies the caller's stdin into the pod whether or not the command
+# inside it reads, so a probe that inherits the stream eats the events still sitting in the pipe.
+# Here that is the terminal one: the fake drains stdin the way the real kubectl does, so without the
+# read closing stdin the verdict is delivered and lost, and the watch waits out its deadline for an
+# event that already came and went. FAKE_NO_RESULT keeps the verdict off the probe so only the stream
+# can bring it, and the backstop is pushed past the timeout so the event is the only probe trigger.
+ENVV=(FAKE_EVENTS=events-steal.sse FAKE_NO_RESULT=1 RIG_DISPATCH_WATCH_BACKSTOP=999); SEED_LINE=""
+run_watch steal DEMO --reconnect 1 --timeout 3
+in_err "the event after the probe still arrives" "qitem-a reached done"
+eq "and its id is stored, not skipped" "qitem-a 2" "$(cat "$STATE/demo.id" 2>/dev/null)"
+in_err "the probe ran and said what it saw" "working (human)"
+eq "the watch is waiting on a verdict, not on a stolen event" 4 "$RC"
 
 printf '# the deadline is honoured while the stream is open\n'
 # Nothing arrives at all, so nothing can trigger a reconcile: the only thing that can end this watch
@@ -152,6 +173,40 @@ eq "--all reaches the verdict of the one team pod" 0 "$RC"
 in_err "--all names the team it watched" "qitem-a reached done"
 sleep 1
 eq "--all leaves no reader behind either" "0" "$(leftover_readers)"
+
+printf '# no caller sends stdin through a helper that closes it\n'
+# `inpod` and `hub_exec` close stdin themselves; a caller that means to send stdin has to say so with
+# the `_stdin` variant. The way that gets forgotten is always the same shape -- a pipe, a heredoc or a
+# redirect into the plain name, which then sends nothing at all and usually exits 0 doing it. The one
+# sender here with no test of its own is `start`'s brief handover: a silent empty send would leave the
+# team with an empty brief and a queue item quoting an empty first line, and every test would stay
+# green. So the rule is checked against the source, not only against behaviour.
+# A name ends at a non-word character, not only at whitespace: `runner=hub_exec;` is exactly the bug and
+# a `[[:space:]]$` boundary would walk past it.
+GUARD=""
+guard_scan() { # <regex> -- the lines that match, with their numbers, minus comments
+  grep -nE "$1" "$DISPATCH" | grep -vE '^[0-9]+:[[:space:]]*#' || true
+}
+GUARD=$(guard_scan '\|&?[[:space:]]*(inpod|hub_exec)([^[:alnum:]_]|$)')
+GUARD="${GUARD}${GUARD:+
+}$(guard_scan '(^|[[:space:]])(inpod|hub_exec)([^[:alnum:]_]|$).*<<')"
+GUARD="${GUARD}${GUARD:+
+}$(guard_scan '[[:alnum:]_]+=(inpod|hub_exec)([^[:alnum:]_]|$)')"
+if [ -z "$GUARD" ]; then
+  ok "nothing pipes, heredocs or assigns its way into a helper that closes stdin"
+else
+  bad "a caller sends stdin through a helper that closes it: $(tr '\n' '|' <<<"$GUARD" | head -c 300)"
+fi
+# The indirect form is the one a plain grep on the call sites misses: `runner=hub_exec` and then a pipe
+# into "$runner". Naming the helper as a value is only ever done to run it with a pipe, so the
+# assignment above is what catches it -- and the registry rewrite is the place that does it, so if that
+# line ever changes shape the check above has silently stopped covering the indirect case.
+if [ -n "$(guard_scan '[[:alnum:]_]+=hub_exec_stdin([^[:alnum:]_]|$)')" ] &&
+   [ -n "$(grep -nF '| "$runner"' "$DISPATCH")" ]; then
+  ok "the runner assigned by name is the sending one, and something still pipes through it"
+else
+  bad "the runner-by-name pattern no longer looks like the runner-by-name pattern; re-read the guard above"
+fi
 
 printf '\n%s passed, %s failed\n' "$PASS" "$FAILED"
 [ "$FAILED" = 0 ] || exit 1

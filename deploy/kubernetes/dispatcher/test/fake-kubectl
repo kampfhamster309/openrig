@@ -12,7 +12,7 @@
 # FAKE_SHOW_BLOCKED, FAKE_WATERMARK_EVENTS, FAKE_WATERMARK_TRANSITIONS, FAKE_STS_CREATED,
 # FAKE_STS_EXISTS, FAKE_FAIL_STS_LIST, FAKE_FAIL_STS_GET, FAKE_FAIL_POD_LIST, FAKE_STS_LIST2,
 # FAKE_POD_LIST2,
-# FAKE_EVENTS, FAKE_EVENTS2, FAKE_EVENTS3, FAKE_EVENTS_SEEN, FAKE_EVENTS_FAIL.
+# FAKE_EVENTS, FAKE_EVENTS2, FAKE_EVENTS3, FAKE_EVENTS_SEEN, FAKE_EVENTS_FAIL, FAKE_RUN_TAG.
 #
 # With FAKE_HUB_HOME set, calls aimed at the hub pod stop being recorded answers and become real work
 # on a real directory -- see "the hub's own side" below. FAKE_NPM_ROOT says where the `yaml` stand-in
@@ -21,6 +21,17 @@ set -u
 
 : "${FAKE_FIXTURES:?fake-kubectl needs FAKE_FIXTURES}"
 : "${FAKE_CALLS:?fake-kubectl needs FAKE_CALLS}"
+
+# One re-exec, before the call is logged, that puts this run's marker in argv[0]. A stream reader that
+# outlived its watch is looked for with `ps`, and `ps` sees the whole machine: with no marker, two runs
+# of the same test -- two worktrees, two terminals -- each see the other's readers and both fail the
+# "no reader left behind" checks. With one, each counts only its own. Unset FAKE_RUN_TAG and nothing
+# changes. Before the log line, so a call is still recorded once.
+if [ -n "${FAKE_RUN_TAG:-}" ] && [ -z "${FAKE_RUN_TAGGED:-}" ]; then
+  export FAKE_RUN_TAGGED=1
+  exec -a "fake-kubectl $FAKE_RUN_TAG" "$0" "$@"
+fi
+
 printf '%s\n' "$*" >> "$FAKE_CALLS"
 
 # The hub's registry is real state, so the node scripts the dispatcher pipes in are really run against
