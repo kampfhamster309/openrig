@@ -10,4 +10,4 @@ resources:
 images:
   - name: openrig-host
     newName: ghcr.io/kampfhamster309/openrig-host
-    newTag: 0.6.10-6e8027ea4
+    newTag: 0.7.0-4abf6df1f

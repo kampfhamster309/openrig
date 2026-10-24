@@ -5,7 +5,8 @@
 > is right; please fix the page. Every path, symbol, count and command below was checked against
 > commit `c750304f` (0.6.6 development). Each count shows the command that produced it, so you
 > can re-run it. The section "The fleet and the Kubernetes deployment" was checked against commit
-> `990570367` on the `kubernetes-integration` branch.
+> `990570367` on the `kubernetes-integration` branch, and again after merging it onto upstream `main`
+> (`e69ede7a4`, 0.7.0).
 
 ## What OpenRig is
 
@@ -41,7 +42,8 @@ the `exports` field of `packages/daemon/package.json` (21 at this commit), for e
 uses 19 of them and the TUI uses 2. In development they resolve through the npm workspace. At
 package time `scripts/rewrite-daemon-imports.mjs` rewrites them to the shipped `daemon/dist` copy
 and fails the build on a specifier with no `exports` entry. To share new daemon code, add a
-`*-surface.ts` file and an `exports` entry. The `kubernetes-integration` branch adds a 22nd,
+`*-surface.ts` file and an `exports` entry. The `kubernetes-integration` branch adds one more
+(24 on upstream `main` at `e69ede7a4`, 25 with it),
 `@openrig/daemon/fleet` (`packages/daemon/src/fleet-surface.ts`), used by the CLI and the TUI (see
 "The fleet and the Kubernetes deployment").
 
