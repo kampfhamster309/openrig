@@ -68,7 +68,8 @@ Each step is explained in [docs/setup.md](docs/setup.md).
 ```bash
 bash deploy/kubernetes/dispatcher/test/archive-test.sh
 bash deploy/kubernetes/dispatcher/test/watch-test.sh
+bash deploy/kubernetes/dispatcher/test/hub-sync-test.sh
 ```
 
-Both use a fake `kubectl` and need no cluster. The OpenRig tests for the fleet reads, CLI and TUI are
+All three use a fake `kubectl` and need no cluster. The OpenRig tests for the fleet reads, CLI and TUI are
 listed in [docs/reference.md](docs/reference.md#tests).
