@@ -1,5 +1,10 @@
 # The hub, tested on the cluster
 
+> **Historical record.** This is the first test of the hub, run before the TUI, fleet summary, fleet
+> usage and answering changes on this branch, with the image named below. The gaps it records for the
+> TUI (remote hosts without rigs, NEEDS YOU from the hub's own queue only) are closed since. For the
+> current behaviour, see [docs/monitoring.md](docs/monitoring.md).
+
 Stage 2 of `docs/proposals/factory-on-kubernetes.md`: an OpenRig daemon in the cluster that runs no
 rigs, whose `hosts.yaml` lists every team pod, so one point of truth shows every team. Built in
 [`hub/`](hub/), wired into [`dispatcher/rig-dispatch`](dispatcher/rig-dispatch), network rules in

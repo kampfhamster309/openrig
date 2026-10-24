@@ -21,7 +21,7 @@
 # RIG_DISPATCH_IMAGE (default: the image pinned in ../kustomization.yaml), RIG_DISPATCH_HUB_POD
 # (default hub-0; the hub to register teams with. No Ready hub pod there: registration is skipped).
 # Archive: RIG_DISPATCH_ARCHIVE_DIR (default ./tickets, --dir wins), RIG_DISPATCH_QUEUE_LIMIT
-# (default 100000 rows of queue history), RIG_DISPATCH_MAX_PAGES (default 200 pages per paged read).
+# (default 100000 rows of queue history), RIG_DISPATCH_MAX_PAGES (default 100000 pages per paged read).
 # Watch: RIG_DISPATCH_WATCH_DIR (default ~/.rig-dispatch/watch) holds the last event id per ticket,
 # and RIG_DISPATCH_EVENTS_URL overrides where the event stream is (default the pod's own loopback).
 # RIG_DISPATCH_WATCH_TICK (default 1s) is how often a quiet stream is re-checked for the verdict and
