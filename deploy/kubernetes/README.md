@@ -77,6 +77,8 @@ D=deploy/kubernetes/dispatcher/rig-dispatch
 $D start PROJ-123 --repo https://github.com/org/repo.git --ref main --brief-file proj-123.md
 $D status                      # every ticket: phase, seat activity, open queue items, result summary
 $D wait PROJ-123               # exit 0 done, 1 failed, 3 needs-human, 4 timeout
+$D watch PROJ-123              # same exit codes, driven by the team's events instead of polling
+$D watch --all --collect       # every team at once, collecting each one that finishes
 $D answer PROJ-123 <qitem> "Use the existing retry helper."
 $D archive PROJ-123            # copy the ticket's history out to ./tickets/proj-123
 $D collect PROJ-123 --into ~/src/repo   # archive, then bundle the result branch and fetch it
@@ -96,6 +98,53 @@ $D delete PROJ-123             # refuses unless the ticket has a complete archiv
   can be repeated. `start` on an existing ticket resumes; `wait` restores the rig if the pod restarted.
 - **Defaults:** `dispatcher/team.env` holds env every team pod gets; `--env NAME=VALUE` adds per ticket.
   The image defaults to the tag in `kustomization.yaml`; `RIG_DISPATCH_IMAGE` or `--image` overrides it.
+
+### Watching a ticket instead of polling it
+
+`wait` learns what a team did by asking again every 30s. Each team daemon already publishes its queue
+state machine as server-sent events on `GET /api/events`, so `watch` subscribes to that stream over
+pod-local loopback (the same `kubectl exec` path every other command uses) and reacts when a queue
+item reaches a terminal state or becomes blocked on a person. It prints the transition as it happens,
+reads the ticket's phase once to say what it means, and exits with `wait`'s codes: 0 done,
+3 needs-human, 1 any other failure, 4 timeout. `--collect` runs `collect` for a ticket that
+finished, `--all` watches every team pod at once, and `--state-dir` moves the resume store (default
+`~/.rig-dispatch/watch`, or `RIG_DISPATCH_WATCH_DIR`).
+
+A queue item reaching a terminal state is not the ticket finishing — seats close rows at every
+handoff — so a watch reports those transitions and takes the ticket's own verdict from the same read
+`status` uses, which is the only place `result.json` is seen.
+
+**Resume, and its limit.** The last event id seen is stored per ticket **instance** — beside the
+`openrig.dev/qitem` id `start` writes — and sent back as `Last-Event-ID`, so a dropped stream or a
+restarted watcher continues where it stopped. The team daemon replays from its own database — an
+append-only `events` table whose ids are never reused — so on one volume replay reaches everything
+since the first event, including across a daemon restart. An id belonging to a different instance is
+dropped and the watch starts from 0, because a ticket key that was deleted and started again gets a
+fresh store beginning at 1, and `delete` removes the stored id for the same reason.
+
+What a stored id cannot do is tell a fresh volume from a quiet stream, and the daemon gives no way to
+ask. Replaying from `Last-Event-ID: N` returns only `seq > N`, so on a pod that came back on a new
+volume it sends **nothing at all** until its own ids pass N: the stream goes silent rather than short.
+Nothing in the stream reveals that, and no route publishes the daemon's current highest id. So the
+watch does not rely on seeing it. What bounds it is a slow status read — a **backstop** probe, every
+`RIG_DISPATCH_WATCH_BACKSTOP` seconds (default 180) that the stream has been quiet — which reports the
+ticket as it now stands and is logged as the backstop rather than as an event. Two cheap consistency
+checks remain on the ids themselves (an id that fails to move forward, a replay starting above
+last+1); against this daemon neither can be produced, and they are kept only in case that changes.
+
+Every case where the events do not arrive is bounded the same way: the deadline is checked while the
+stream is open, so `--timeout` is honoured even when nothing at all comes. Polling stays the fallback,
+not the default — after three attempts that produce no stream at all, `watch` says so and hands the
+ticket to `wait`. One stream is also bounded by `--max-time` (`RIG_DISPATCH_EVENTS_MAX_TIME`, default
+300s) so a reader whose `kubectl` died cannot outlive it; resume makes that reconnect free.
+
+**A named limit: one unreadable row blocks replay from before it.** The daemon's live delivery path
+catches a malformed event, emits `event.delivery_poisoned` and moves on, but its replay path does not
+catch it. So if such a row exists above the stored id, every reconnect from that id fails before any
+event is sent. The watch survives this degraded rather than stuck: it either reconnects quietly every
+`--reconnect` seconds or, after three dead connections, falls back to polling under a misleading
+"would not stay open" line — and either way the backstop status read still reports the ticket. So it
+costs latency, not correctness, and there is no mechanism here to detect the poisoned row itself.
 
 ## Keeping a ticket after its pod is gone: the archive
 
@@ -264,6 +313,24 @@ kubectl -n openrig exec -i hub-0 -c daemon -- rig host list
   fleet read. That gap is stage 3.1 and 3.2, and [HUB-TEST.md](HUB-TEST.md) records the evidence. Use
   the `kubectl exec` reads below for the teams; the TUI is for the hub itself. The TUI must be no older
   than the hub's daemon in any case — an old one does not call `/api/review/fleet` at all.
+
+### Scraping the hub's `/metrics` with Prometheus
+
+The hub publishes the whole fleet as one Prometheus scrape target at `GET /metrics`, built from the
+same fleet reads the operator's views use, so a scrape with a warm cache causes no fan-out of its
+own. The hub binds `127.0.0.1:7433` inside its pod, so nothing in the cluster can reach it directly,
+and three routes exist — none of them built here. The one that changes nothing is a long-lived
+`kubectl -n openrig port-forward pod/hub-0 7433:7433` on the scraper's host pointed at
+`http://127.0.0.1:7433/metrics`: no image or manifest change and no bearer, but it is a supervised
+process that dies with the pod and it needs `pods/portforward` forever. The one that fits the deploy
+best is a sidecar container in the hub pod: a sidecar shares the pod network namespace, so it can
+read `127.0.0.1:7433/metrics` and re-publish it on the pod address for an ordinary pod scrape, which
+keeps the loopback bind and still needs no bearer. The third is to bind the hub on `0.0.0.0` and set
+`OPENRIG_AUTH_BEARER_TOKEN`, which is the posture the daemon already requires of a wider bind —
+Prometheus then sends it in `scrape_config.authorization` — but the hub holds every team's bearer
+file, so widening its bind means the NetworkPolicy and secret review the loopback choice was made to
+avoid. Whichever is chosen, a scrape is a read of the hub's cached fleet view: use the plain path with
+no query parameters and a normal 30–60s interval.
 
 ## How the pieces fit
 

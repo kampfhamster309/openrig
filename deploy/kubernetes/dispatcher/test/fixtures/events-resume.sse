@@ -1,0 +1,3 @@
+id: 3
+data: {"type":"queue.updated","qitemId":"qitem-a","fromState":"in-progress","toState":"done","closureReason":"handed_off_to","closureTarget":"dispatcher@openrig","actorSession":"dev.build@demo","summary":"build the thing"}
+

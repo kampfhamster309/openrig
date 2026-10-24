@@ -1,0 +1,6 @@
+id: 1
+data: {"type":"queue.claimed","qitemId":"qitem-a","destinationSession":"dev.build@demo","claimedAt":"2026-10-24T10:00:00Z","closureRequiredAt":null,"summary":"build the thing"}
+
+id: 2
+data: {"type":"queue.updated","qitemId":"qitem-b","fromState":"pending","toState":"in-progress","closureReason":null,"closureTarget":null,"actorSession":"review.r1@demo","summary":"review the thing"}
+

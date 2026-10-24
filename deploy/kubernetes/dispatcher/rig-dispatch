@@ -4,6 +4,7 @@
 #   rig-dispatch start   <ticket> --repo <url> --brief-file <file> [options]
 #   rig-dispatch status  [<ticket>] [--json]
 #   rig-dispatch wait    <ticket> [--timeout <seconds>] [--stall <minutes>]
+#   rig-dispatch watch   <ticket>|--all [--collect] [--archive <dir>] [--timeout <seconds>]
 #   rig-dispatch archive <ticket> [--dir <root>]
 #   rig-dispatch collect <ticket> [--archive <dir>] [--into <local git repo>]
 #   rig-dispatch report  <ticket>|--all [--dir <root>] [--json]
@@ -12,13 +13,20 @@
 #
 # State lives in Kubernetes labels and annotations and in the team pod, so every command can be
 # run again. The dispatcher reaches team pods only through `kubectl exec`; inside the pod, `rig`
-# talks to its own daemon over loopback.
+# talks to its own daemon over loopback. `watch` is the one command that also keeps state on the
+# dispatcher's own machine: the last event id per ticket, so a restarted watcher resumes the team's
+# event stream where it stopped instead of from the beginning.
 #
 # Environment: KUBECONFIG, KUBECTL (default kubectl), RIG_DISPATCH_NAMESPACE (default openrig),
 # RIG_DISPATCH_IMAGE (default: the image pinned in ../kustomization.yaml), RIG_DISPATCH_HUB_POD
 # (default hub-0; the hub to register teams with. No Ready hub pod there: registration is skipped).
 # Archive: RIG_DISPATCH_ARCHIVE_DIR (default ./tickets, --dir wins), RIG_DISPATCH_QUEUE_LIMIT
 # (default 100000 rows of queue history), RIG_DISPATCH_MAX_PAGES (default 200 pages per paged read).
+# Watch: RIG_DISPATCH_WATCH_DIR (default ~/.rig-dispatch/watch) holds the last event id per ticket,
+# and RIG_DISPATCH_EVENTS_URL overrides where the event stream is (default the pod's own loopback).
+# RIG_DISPATCH_WATCH_TICK (default 1s) is how often a quiet stream is re-checked for the verdict and
+# the deadline; RIG_DISPATCH_WATCH_BACKSTOP (default 180s) is how often a quiet stream also gets a
+# status read anyway; RIG_DISPATCH_EVENTS_MAX_TIME (default 300s) bounds one stream.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -34,7 +42,7 @@ k() { "$KUBECTL" -n "$NS" "$@"; }
 need() { command -v "$1" >/dev/null || die "$1 is required"; }
 need jq; need "$KUBECTL"
 
-usage() { sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
+usage() { sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
 
 # PROJ-123 -> proj-123: a DNS label that is also a valid OpenRig host id (no dots).
 slug_of() {
@@ -512,6 +520,326 @@ cmd_wait() {
     [ $SECONDS -lt $deadline ] || { log "timed out after ${timeout}s"; return 4; }
     sleep "$interval"
   done
+}
+
+# --- watch -------------------------------------------------------------------------------------
+#
+# `wait` learns what a team did by asking again every 30s. The team's own daemon already publishes
+# its queue state machine as server-sent events on /api/events, so `watch` listens instead and
+# reacts when a queue item reaches a terminal state or a human is needed. Polling stays here as the
+# fallback for a pod that will not hold a stream, not the way this normally works.
+#
+# Resume. The last event id seen is stored per ticket INSTANCE -- together with the qitem id `start`
+# writes -- and sent back as Last-Event-ID, so a dropped stream or a restarted watcher continues where
+# it stopped instead of from the beginning. The team daemon replays from its own database -- an
+# append-only events table whose ids are never reused -- so on one volume replay reaches everything
+# since the first event, including across a daemon restart.
+#
+# What a stored id cannot do is tell a fresh volume from a quiet stream. A pod that came back on a new
+# volume starts its ids again at 1, and the daemon replays only seq > the id it was given, so it sends
+# nothing at all until its own ids pass that number: the stream goes silent, it does not come back
+# short. So "an id that fails to move forward" cannot be observed from the stream (the daemon drops
+# those rows itself) and a hole in an AUTOINCREMENT range with no deletes cannot be produced. Both are
+# still checked, because they cost nothing and a future daemon could change that, but neither is what
+# the watch relies on. What bounds every case where the events do not arrive is the backstop: a slow
+# status read, run while the stream is quiet, which reports the ticket however it stands. A quiet
+# stream is not evidence of anything on its own, so it is left alone until a backstop is due.
+#
+# A queue item reaching a terminal state is not the ticket finishing: seats close rows at every
+# handoff. The ticket's verdict is its result file, which no event carries, so the phase a watch
+# reports comes from the same read `status` uses -- one definition, not a second one invented here.
+
+WATCH_DIR="${RIG_DISPATCH_WATCH_DIR:-$HOME/.rig-dispatch/watch}"
+EVENTS_URL="${RIG_DISPATCH_EVENTS_URL:-http://127.0.0.1:7433/api/events}"
+# How long one read waits before looking again at whether the ticket has its verdict. A stream that
+# is quiet is not a stream that ended, so this is a check interval and not a timeout on the ticket.
+WATCH_TICK="${RIG_DISPATCH_WATCH_TICK:-1}"
+# How often a quiet stream gets a status read anyway. Events are the primary path; this is what
+# bounds the cases where the event that would have ended the watch never comes.
+WATCH_BACKSTOP="${RIG_DISPATCH_WATCH_BACKSTOP:-180}"
+# The in-pod curl's own ceiling. A reader whose kubectl died cannot outlive it for long, and resume
+# makes the reconnect free, so a bounded stream costs nothing but a short gap.
+EVENTS_MAX_TIME="${RIG_DISPATCH_EVENTS_MAX_TIME:-300}"
+
+W_LAST=0; W_BASE=0; W_FRESH=1; W_GAP=""; W_PHASE=""; W_SAW=0; W_QITEM=""; W_RC=0
+W_DEADLINE=0; W_LASTPROBE=0; W_PIDFILE=""; W_TOKEN=""
+
+watch_file() { printf '%s/%s.id' "$WATCH_DIR" "$1"; }
+
+# The store holds "<qitem> <id>". An id is only worth resuming for the ticket instance that wrote it:
+# a ticket key that is deleted and started again gets a fresh event store beginning at 1, and resuming
+# the old high id there would make the daemon replay nothing at all -- the new team's events would all
+# land below the number the watcher insisted on. So a stored id from another instance is dropped.
+watch_last_id() { # <slug> <qitem>
+  local f v="" q=""
+  f=$(watch_file "$1")
+  if [ -f "$f" ]; then read -r q v <"$f" 2>/dev/null || true; fi
+  v=$(printf '%s' "$v" | tr -dc '0-9'); [ -n "$v" ] || v=0
+  if [ "$v" != 0 ] && [ "$q" != "$2" ]; then
+    log "$2: the stored id $v belongs to ticket instance ${q:-none}, not ${2:-none}, so this watch starts from 0"
+    v=0
+  fi
+  printf '%s' "$v"
+}
+
+watch_save_id() { # <slug> <qitem> <id>
+  printf '%s %s\n' "$2" "$3" >"$(watch_file "$1")" 2>/dev/null ||
+    log "watch: could not store event id $3 for $1"
+}
+
+# Stops the reader this watch started: the `kubectl exec` and, through it, the curl inside the pod.
+# Killing kubectl does not reach the in-pod curl -- that half is bounded by --max-time -- but it does
+# stop the local reader from outliving the watch that made it. The recorded pid is the subshell that
+# ran the stream, and kubectl is its child, so the child goes first: that is also what lets the
+# substitution report the stream's exit status on the way out instead of being cut off before it did.
+watch_stop_reader() {
+  local p i=0 slug=${1:-}
+  if [ -n "$slug" ]; then watch_reap_inpod "$slug"; fi
+  [ -n "$W_PIDFILE" ] && [ -f "$W_PIDFILE" ] || return 0
+  p=$(head -n1 "$W_PIDFILE" 2>/dev/null | tr -dc '0-9')
+  [ -n "$p" ] || return 0
+  if pkill -P "$p" >/dev/null 2>&1; then :; else kill "$p" 2>/dev/null || return 0; fi
+  while [ "$i" -lt 10 ] && kill -0 "$p" 2>/dev/null; do sleep 0.1; i=$((i + 1)); done
+  kill "$p" 2>/dev/null
+  return 0
+}
+
+# One SSE stream over pod-local loopback -- the same path every other command uses to reach the
+# team daemon, and the same posture: an IP-literal Host needs no bearer. The stream is deliberately
+# unfiltered, because the daemon stores queue events with no rig id, so a ?rigId= query would
+# replay none of them.
+#
+# The reader header names this watcher's own curl to the reap below. Killing `kubectl exec` does not
+# reach the process it started inside the pod, and a curl on a quiet stream never writes, so it never
+# notices its stdout has gone away and simply stays open on the team's daemon. The token is per watch,
+# so reaping one watcher's reader cannot disturb another's on the same pod.
+watch_stream() {
+  local slug=$1 last=$2
+  local -a hdr=(-H 'Accept: text/event-stream' -H "X-Rig-Dispatch-Reader: $W_TOKEN")
+  if [ "$last" -gt 0 ]; then hdr+=(-H "Last-Event-ID: $last"); fi
+  inpod "$slug" curl -sS -N -f --connect-timeout 10 --max-time "$EVENTS_MAX_TIME" \
+    "${hdr[@]}" "$EVENTS_URL"
+}
+
+# Reaps the in-pod half of the reader. Best effort: if this cannot be done the curl still dies on its
+# own --max-time, which is why that bound stays even though it is the slow answer.
+watch_reap_inpod() { # <slug>
+  local slug=$1
+  [ -n "$W_TOKEN" ] || return 0
+  # The bracket is not decoration: without it the pattern matches the very shell running it.
+  inpod "$slug" sh -c "pkill -f 'X-Rig-Dispatch-[R]eader: $W_TOKEN' >/dev/null 2>&1 || true" \
+    </dev/null 2>/dev/null || true
+  return 0
+}
+
+# Reads one stream until it ends, the ticket has its verdict, or the watch runs out of time.
+#
+# All three have to be able to end the read on their own. A team's stream stays open for as long as the
+# pod does, so a read that ran to the end of the stream would sit there after the terminal event with
+# nothing left to arrive, and would sit there forever if no event ever came. So each read is given
+# WATCH_TICK seconds, and a read that times out is the only moment there is to ask the two questions
+# that matter: is the answer already in (stop), and is the deadline or a backstop due (act, then stop
+# or keep waiting). A timeout is not the end of the stream either, and a line cut in half by one is
+# kept in $line rather than dropped.
+#
+# Bash reads from a process substitution rather than a pipe so the ids it stores outlive the loop,
+# and the stream's exit status comes back through a file. The substitution records the pid of the
+# reader it backgrounded, because nothing else can reach it afterwards: a substitution is not a job,
+# so it is not in $! and not in the shell's job table.
+watch_read() { # <slug> <ticket> <rcfile>
+  local slug=$1 ticket=$2 rcfile=$3
+  local line="" chunk="" id="" data="" rc sp sp_rc
+  W_FRESH=1; W_SAW=0
+  while :; do
+    chunk=""
+    IFS= read -r -t "$WATCH_TICK" chunk
+    rc=$?
+    line="$line$chunk"
+    if [ "$rc" -gt 128 ]; then          # timed out: the stream is open and quiet
+      [ -n "$W_PHASE" ] && break        # the ticket has its verdict: stop watching
+      [ "$SECONDS" -lt "$W_DEADLINE" ] || break   # the deadline is honoured mid-stream
+      if [ "$WATCH_BACKSTOP" -gt 0 ] && [ $((SECONDS - W_LASTPROBE)) -ge "$WATCH_BACKSTOP" ]; then
+        W_LASTPROBE=$SECONDS
+        watch_reconcile "$slug" "$ticket" "backstop"
+      fi
+      continue                          # otherwise keep waiting on the same stream
+    fi
+    [ "$rc" = 0 ] || break              # EOF or a dead stream: whatever is left is not a line
+    case "$line" in
+      id:*) id=${line#id:}; id=${id//[[:space:]]/} ;;
+      data:*) data=${line#data:}; data=${data# } ;;
+      '')
+        if [ -n "$data" ]; then
+          watch_event "$slug" "$ticket" "$id" "$data"
+          id=""; data=""
+        fi ;;
+    esac
+    line=""
+  # `wait "$sp"` and not a bare `wait`: with no operand bash waits for everything and returns 0, which
+  # would report a stream that died at once as a stream that ended cleanly, and hide the case the
+  # polling fallback exists for. And the status is captured with `|| sp_rc=$?` rather than read from
+  # `$?`, because a bare failing `wait` under `set -e` ends this subshell before it can write it.
+  done < <(watch_stream "$slug" "$W_BASE" & sp=$!; printf '%s' "$sp" >"$W_PIDFILE"; \
+           sp_rc=0; wait "$sp" || sp_rc=$?; printf '%s' "$sp_rc" >"$rcfile")
+  # Whatever ended the loop, the reader is this watch's own process and it does not get to outlive it.
+  watch_stop_reader "$slug"
+}
+
+# One status read, through the same probe `status` uses, so what a watch reports is what `status`
+# would say at that moment. Sets W_PHASE once the ticket has a verdict.
+watch_reconcile() {
+  local slug=$1 ticket=$2 why=$3 p phase
+  p=$(probe "$slug") || { log "$ticket: the status read failed during the $why check"; return 0; }
+  phase=$(jq -r '.phase // "?"' <<<"$p")
+  case "$phase" in
+    result:*) W_PHASE=$phase; log "$ticket: $phase ($why)"; jq .result <<<"$p" ;;
+    absent) W_PHASE=absent; log "$ticket: the team is gone ($why)" ;;
+    *) log "$ticket: $phase ($why)" ;;
+  esac
+}
+
+watch_event() { # <slug> <ticket> <event id> <json>
+  local slug=$1 ticket=$2 id=$3 data=$4
+  case "$id" in ''|*[!0-9]*) return 0 ;; esac
+  watch_handle "$slug" "$ticket" "$id" "$data"
+  # Stored only after the event has been acted on, the status read it may have triggered included. A
+  # watcher killed mid-reconcile must replay this event when it comes back, not be told it already saw
+  # it: probe takes several kubectl round trips, which is long enough to be killed inside.
+  watch_save_id "$slug" "$W_QITEM" "$id"
+}
+
+watch_handle() { # <slug> <ticket> <event id> <json>
+  local slug=$1 ticket=$2 id=$3 data=$4
+  local prev=$W_LAST
+  if [ "$id" -le "$prev" ]; then
+    W_GAP="event id $id did not move past $prev, so the team's event store was replaced"
+  elif [ "$W_FRESH" = 1 ] && [ "$prev" -gt 0 ] && [ "$id" -gt $((prev + 1)) ]; then
+    W_GAP="replay resumed at $id, not at $((prev + 1)), so the events between them are gone from the team's store"
+  fi
+  W_FRESH=0; W_SAW=1; W_LAST=$id
+  # The gap path answers with a status read instead of the event, which is the stronger of the two:
+  # it reports the ticket as it is now, so the event that revealed the gap cannot be missed.
+  if [ -n "$W_GAP" ]; then
+    log "$ticket: replay gap: $W_GAP; falling back to one status poll"
+    W_GAP=""
+    watch_reconcile "$slug" "$ticket" "replay gap"
+    return 0
+  fi
+  local type to from qitem kind
+  type=$(jq -r '.type // ""' <<<"$data" 2>/dev/null) || return 0
+  case "$type" in queue.*) ;; *) return 0 ;; esac
+  to=$(jq -r '.toState // ""' <<<"$data")
+  from=$(jq -r '.fromState // ""' <<<"$data")
+  qitem=$(jq -r '.qitemId // ""' <<<"$data")
+  case "$to" in
+    done|handed-off|canceled|failed|denied) kind=terminal ;;
+    blocked) kind=human ;;
+    *) return 0 ;;
+  esac
+  if [ "$kind" = terminal ]; then
+    log "$ticket: queue item $qitem reached $to (from ${from:-?})"
+  else
+    log "$ticket: queue item $qitem is blocked (from ${from:-?}): a human may be needed"
+  fi
+  # Only these two can end a ticket: its own row closing, or the team stopping for a person. Other
+  # rows close at every handoff while the ticket is still running.
+  if [ "$qitem" = "$W_QITEM" ] || [ "$kind" = human ]; then
+    watch_reconcile "$slug" "$ticket" "$kind"
+  fi
+}
+
+# Watches one ticket to its verdict. Exit codes are `wait`'s: 0 done, 3 needs a human, 1 any other
+# failure, 4 timeout.
+watch_ticket() { # <slug> <ticket> <collect 0|1> <archive> <timeout> <interval> <reconnect>
+  local slug=$1 ticket=$2 do_collect=$3 archive=$4 timeout=$5 interval=$6 reconnect=$7
+  local sts key fails=0 started rc=1 crc=0 tmpd rcfile
+  sts=$(sts_json "$slug" || true)
+  [ -n "$sts" ] || die "$ticket has no team"
+  key=$(annotation "$sts" ticket-key); [ -n "$key" ] || key=$ticket
+  W_QITEM=$(annotation "$sts" qitem)
+  W_TOKEN=$(head -c 8 /dev/urandom | od -An -tx1 | tr -d ' \n')
+  W_LAST=$(watch_last_id "$slug" "$W_QITEM")
+  W_PHASE=""
+  W_DEADLINE=$((SECONDS + timeout)); W_LASTPROBE=$SECONDS
+  tmpd=$(mktemp -d)
+  rcfile="$tmpd/rc"; W_PIDFILE="$tmpd/reader.pid"
+  # Killed rather than finished: the reader is a child of this shell's process substitution, so it is
+  # reachable only from here. Under --all each team runs in its own subshell and sets its own trap.
+  trap 'watch_stop_reader "$slug"; rm -rf "$tmpd"' INT TERM
+  log "$key: watching events from id $W_LAST (stored in $(watch_file "$slug"))"
+  while :; do
+    W_BASE=$W_LAST
+    started=$SECONDS
+    watch_read "$slug" "$key" "$rcfile" || true    # `|| true` is load-bearing: under `set -e` a failed command substitution in an assignment kills
+    # the script, and there is no rc file at all when this watch stopped the stream itself.
+    W_RC=$(cat "$rcfile" 2>/dev/null || true); [ -n "$W_RC" ] || W_RC=0
+    [ -z "$W_PHASE" ] || break
+    [ "$SECONDS" -lt "$W_DEADLINE" ] || { log "$key: timed out after ${timeout}s"; rm -rf "$tmpd"; return 4; }
+    # A stream that will not stay open at all is not a stream: three attempts, then the polling read.
+    # A curl that ran the whole --max-time is not one of those -- it had a working connection and a
+    # quiet stream, which is the normal case -- so only a stream that died quickly counts here.
+    if [ "$W_SAW" = 0 ] && [ "$W_RC" != 0 ] && [ "$((SECONDS - started))" -lt "$EVENTS_MAX_TIME" ]; then
+      fails=$((fails + 1))
+      if [ "$fails" -ge 3 ]; then
+        log "$key: the events stream would not stay open ($fails attempts, last exit $W_RC); falling back to polling"
+        rc=0
+        cmd_wait "$ticket" --timeout "$((W_DEADLINE - SECONDS))" --interval "$interval" || rc=$?
+        rm -rf "$tmpd"; trap - INT TERM
+        return $rc
+      fi
+    else
+      fails=0
+    fi
+    sleep "$reconnect"
+  done
+  rm -rf "$tmpd"; trap - INT TERM
+  case "$W_PHASE" in
+    result:done) rc=0 ;;
+    result:needs-human) rc=3 ;;
+    *) rc=1 ;;
+  esac
+  if [ "$W_PHASE" = result:done ] && [ "$do_collect" = 1 ]; then
+    if [ -n "$archive" ]; then cmd_collect "$ticket" --archive "$archive" || crc=$?
+    else cmd_collect "$ticket" || crc=$?; fi
+    if [ "$crc" != 0 ]; then log "$key: collect failed (exit $crc)"; rc=$crc; fi
+  fi
+  return $rc
+}
+
+cmd_watch() {
+  local ticket="" all=0 do_collect=0 archive="" timeout=7200 interval=30 reconnect=3
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --all) all=1; shift ;;
+      --collect) do_collect=1; shift ;;
+      --archive|--dir) archive=$2; shift 2 ;;
+      --timeout) timeout=$2; shift 2 ;;
+      --interval) interval=$2; shift 2 ;;
+      --reconnect) reconnect=$2; shift 2 ;;
+      --state-dir) WATCH_DIR=$2; shift 2 ;;
+      -*) die "unknown option $1" ;;
+      *) [ -z "$ticket" ] || die "one ticket at a time"; ticket=$1; shift ;;
+    esac
+  done
+  mkdir -p "$WATCH_DIR" 2>/dev/null || die "cannot create the watch state directory $WATCH_DIR"
+  if [ "$all" = 1 ]; then
+    [ -z "$ticket" ] || die "--all takes no ticket"
+    local -a slugs=() pids=()
+    mapfile -t slugs < <(team_slugs)
+    [ "${#slugs[@]}" -gt 0 ] || die "no team pods in $NS"
+    local s p rc=0
+    for s in "${slugs[@]}"; do
+      [ -n "$s" ] || continue
+      watch_ticket "$s" "$s" "$do_collect" "$archive" "$timeout" "$interval" "$reconnect" &
+      pids+=($!)
+    done
+    trap 'for p in "${pids[@]}"; do kill "$p" 2>/dev/null; done' INT TERM   # each child kills its own reader
+    for p in "${pids[@]}"; do wait "$p" || rc=$?; done
+    trap - INT TERM
+    return $rc
+  fi
+  [ -n "$ticket" ] || usage
+  watch_ticket "$(slug_of "$ticket")" "$ticket" "$do_collect" "$archive" "$timeout" "$interval" "$reconnect"
 }
 
 # --- archive ---------------------------------------------------------------------------------
@@ -1328,6 +1656,10 @@ cmd_delete() {
   # whenDeleted: Delete removes the volume; this covers a StatefulSet deleted by other means.
   k delete pvc -l "$ANN/ticket=$slug" --ignore-not-found >/dev/null
   k delete pvc "home-$name-0" --ignore-not-found >/dev/null
+  # The resume store is keyed by ticket key, and the ticket instance dies here. Leaving the id behind
+  # is what makes a re-dispatched ticket key start out watching a stream that will stay silent for
+  # ever, so the file goes with the pod it described.
+  rm -f "$(watch_file "$slug")" 2>/dev/null || true
   log "deleted $name"
 }
 
@@ -1337,6 +1669,7 @@ case "$cmd" in
   start) cmd_start "$@" ;;
   status|ls) cmd_status "$@" ;;
   wait) cmd_wait "$@" ;;
+  watch) cmd_watch "$@" ;;
   archive) cmd_archive "$@" ;;
   collect) cmd_collect "$@" ;;
   report) cmd_report "$@" ;;

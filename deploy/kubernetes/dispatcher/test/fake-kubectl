@@ -10,7 +10,8 @@
 # Knobs a test sets: FAKE_FIXTURES, FAKE_CALLS, FAKE_POD_READY, FAKE_FAIL_USAGE_TOP,
 # FAKE_STALL_EVENTS, FAKE_NO_RESULT, FAKE_ANSWER, FAKE_NO_HUB, FAKE_NOT_REGISTERED,
 # FAKE_EMPTY_BUNDLE, FAKE_FAIL_BUNDLE, FAKE_SHOW_STATE, FAKE_SHOW_BLOCKED,
-# FAKE_WATERMARK_EVENTS, FAKE_WATERMARK_TRANSITIONS, FAKE_STS_CREATED.
+# FAKE_WATERMARK_EVENTS, FAKE_WATERMARK_TRANSITIONS, FAKE_STS_CREATED, FAKE_EVENTS,
+# FAKE_EVENTS2, FAKE_EVENTS3, FAKE_EVENTS_SEEN, FAKE_EVENTS_FAIL.
 set -u
 
 : "${FAKE_FIXTURES:?fake-kubectl needs FAKE_FIXTURES}"
@@ -82,6 +83,10 @@ pod_sh() {
   [ "${2:-}" = "-c" ] || nope "sh without -c"
   local script=$3
   case "$script" in
+    *Rig-Dispatch-*eader*)
+      # `watch` reaps the curl it started inside the pod, because killing kubectl does not reach it and
+      # a curl on a quiet stream never notices its stdout has gone. The test asserts this was asked for.
+      printf 'reap\n' >> "${FAKE_REAP:-/dev/null}" ;;
     *mission-control/audit*)
       local qitem=${5:-} before=${7:-}
       case "$qitem:$before" in
@@ -169,6 +174,30 @@ serve() {
         *) nope "rig $*" ;;
       esac ;;
     sh) pod_sh "$@" ;;
+    curl)
+      # `watch` reaches the team daemon with curl over pod-local loopback, so the event stream is
+      # recorded here the same way every other response is. FAKE_EVENTS names the stream for the
+      # first connection and FAKE_EVENTS2 the one for the second, which is how a test drops a stream
+      # mid-flight and shows what the reconnect asks for. Each connection appends the Last-Event-ID
+      # it was given to $FAKE_EVENTS_SEEN, so resume is asserted rather than assumed.
+      local seen="" a n
+      for a in "$@"; do case "$a" in Last-Event-ID:*) seen=${a#Last-Event-ID:} ;; esac; done
+      seen=${seen//[[:space:]]/}
+      printf '%s\n' "${seen:-none}" >>"${FAKE_EVENTS_SEEN:-/dev/null}"
+      # FAKE_EVENTS_FAIL stands for a pod that will not hold a stream at all (no curl, a daemon that
+      # refuses the route), which is the case `watch` must answer with polling rather than silence.
+      if [ "${FAKE_EVENTS_FAIL:-0}" = 1 ]; then kfail 22; fi
+      n=$(grep -c ' curl ' "$FAKE_CALLS")
+      case "$n" in
+        1) fix "${FAKE_EVENTS:-events-terminal.sse}" ;;
+        2) fix "${FAKE_EVENTS2:-events-empty.sse}" ;;
+        *) fix "${FAKE_EVENTS3:-events-empty.sse}" ;;
+      esac
+      # A real team's stream does not end when its last event has been delivered: it stays open until
+      # the pod goes away, and that is the only shape a watch has to be correct against. So the held
+      # stream is the default here and FAKE_EVENTS_END is the opt-out, for the one case that really
+      # does end: an API server dropping a long-lived exec mid-flight.
+      if [ "${FAKE_EVENTS_END:-0}" != 1 ]; then sleep "${FAKE_EVENTS_HOLD_SECS:-30}"; fi ;;
     delete)
       # `kubectl delete` on the way out: succeed quietly, the test checks what was asked for.
       : ;;
@@ -229,9 +258,14 @@ case "${rest[0]:-}" in
   get)
     case "${rest[1]:-}" in
       statefulset|statefulsets)
-        if [ "${#rest[@]}" -gt 2 ] && [ "${rest[2]}" != "t-demo" ]; then nope "statefulset ${rest[2]}"; fi
-        # FAKE_STS_CREATED stands in for a re-dispatched ticket: same slug, newer pod.
-        if [ -n "${FAKE_STS_CREATED:-}" ]; then
+        # `status --all` and `watch --all` list the teams by label instead of naming one, which is a
+        # different recorded answer from the single-StatefulSet read.
+        if [ "${rest[2]:-}" = "-l" ]; then
+          fix statefulsets-team.json
+        elif [ "${#rest[@]}" -gt 2 ] && [ "${rest[2]}" != "t-demo" ]; then
+          nope "statefulset ${rest[2]}"
+        elif [ -n "${FAKE_STS_CREATED:-}" ]; then
+          # FAKE_STS_CREATED stands in for a re-dispatched ticket: same slug, newer pod.
           fix statefulset.json | jq -c --arg c "$FAKE_STS_CREATED" '.metadata.creationTimestamp = $c'
         else
           fix statefulset.json
