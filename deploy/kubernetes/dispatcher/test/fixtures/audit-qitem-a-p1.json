@@ -1,0 +1,36 @@
+{
+  "rows": [
+    {
+      "actionId": "act-3",
+      "actionVerb": "resolve",
+      "qitemId": "qitem-a",
+      "actorSession": "human@operator-laptop",
+      "actedAt": "2026-10-23T20:20:00Z",
+      "beforeState": { "state": "blocked" },
+      "afterState": { "state": "in-progress" },
+      "reason": "Use the existing retry helper.",
+      "annotation": null,
+      "notifyAttempted": true,
+      "notifyResult": "delivered",
+      "auditNotes": { "openrig_relay": { "from_host": "hub-0" } },
+      "identityProvenance": "relay:v1"
+    },
+    {
+      "actionId": "act-2",
+      "actionVerb": "block",
+      "qitemId": "qitem-a",
+      "actorSession": "orch-lead@demo-rig",
+      "actedAt": "2026-10-23T20:10:00Z",
+      "beforeState": { "state": "in-progress" },
+      "afterState": { "state": "blocked" },
+      "reason": "needs a decision",
+      "annotation": null,
+      "notifyAttempted": true,
+      "notifyResult": "delivered",
+      "auditNotes": null,
+      "identityProvenance": "transport:v1"
+    }
+  ],
+  "hasMore": true,
+  "nextBeforeId": "act-2"
+}

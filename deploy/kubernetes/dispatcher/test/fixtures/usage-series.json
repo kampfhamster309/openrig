@@ -1,0 +1,79 @@
+{
+  "rows": [
+    {
+      "id": 1,
+      "lane": "context",
+      "seatSession": "orch-lead@demo-rig",
+      "nodeId": "n-1",
+      "source": "pi",
+      "sampledAt": "2026-10-23T20:05:00Z",
+      "capturedAt": "2026-10-23T20:05:00Z",
+      "totalInputTokens": 1000,
+      "totalOutputTokens": 100,
+      "usedPercentage": 12,
+      "window": null,
+      "windowUsedPercent": null,
+      "resetsAt": null
+    },
+    {
+      "id": 2,
+      "lane": "context",
+      "seatSession": "orch-lead@demo-rig",
+      "nodeId": "n-1",
+      "source": "pi",
+      "sampledAt": "2026-10-23T20:06:00Z",
+      "capturedAt": "2026-10-23T20:06:00Z",
+      "totalInputTokens": 1500,
+      "totalOutputTokens": 200,
+      "usedPercentage": 18,
+      "window": null,
+      "windowUsedPercent": null,
+      "resetsAt": null
+    },
+    {
+      "id": 3,
+      "lane": "context",
+      "seatSession": "orch-lead@demo-rig",
+      "nodeId": "n-1",
+      "source": "pi",
+      "sampledAt": "2026-10-23T20:07:00Z",
+      "capturedAt": "2026-10-23T20:07:00Z",
+      "totalInputTokens": 300,
+      "totalOutputTokens": 50,
+      "usedPercentage": 4,
+      "window": null,
+      "windowUsedPercent": null,
+      "resetsAt": null
+    },
+    {
+      "id": 4,
+      "lane": "context",
+      "seatSession": "orch-lead@demo-rig",
+      "nodeId": "n-1",
+      "source": "pi",
+      "sampledAt": "2026-10-23T20:08:00Z",
+      "capturedAt": "2026-10-23T20:08:00Z",
+      "totalInputTokens": 800,
+      "totalOutputTokens": 100,
+      "usedPercentage": 9,
+      "window": null,
+      "windowUsedPercent": null,
+      "resetsAt": null
+    },
+    {
+      "id": 5,
+      "lane": "provider_window",
+      "seatSession": "orch-lead@demo-rig",
+      "nodeId": "n-1",
+      "source": "claude",
+      "sampledAt": "2026-10-23T20:08:00Z",
+      "capturedAt": "2026-10-23T20:08:00Z",
+      "totalInputTokens": null,
+      "totalOutputTokens": null,
+      "usedPercentage": null,
+      "window": "five_hour",
+      "windowUsedPercent": 31,
+      "resetsAt": "2026-10-24T00:00:00Z"
+    }
+  ]
+}

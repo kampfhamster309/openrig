@@ -1,0 +1,13 @@
+# One long-lived OpenRig host (pod rig-0). Apply the shared objects first:
+#   kubectl apply -k deploy/kubernetes && kubectl apply -k deploy/kubernetes/single-host
+# Needs the openrig-daemon Secret (create-secrets.sh).
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: openrig
+resources:
+  - service.yaml
+  - statefulset.yaml
+images:
+  - name: openrig-host
+    newName: ghcr.io/kampfhamster309/openrig-host
+    newTag: 0.6.10-6e8027ea4

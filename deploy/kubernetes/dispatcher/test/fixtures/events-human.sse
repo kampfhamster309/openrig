@@ -1,0 +1,3 @@
+id: 7
+data: {"type":"queue.updated","qitemId":"qitem-b","fromState":"in-progress","toState":"blocked","closureReason":null,"closureTarget":null,"actorSession":"dev.build@demo","summary":"a decision is owed"}
+

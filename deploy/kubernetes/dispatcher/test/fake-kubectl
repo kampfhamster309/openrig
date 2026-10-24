@@ -1,0 +1,290 @@
+#!/usr/bin/env bash
+# fake-kubectl: stands in for a cluster so `rig-dispatch archive` can be tested without one.
+#
+# It serves the recorded responses in ./fixtures and appends every call it receives to $FAKE_CALLS,
+# so a test can assert what the archive actually asked for -- which page of a paged read it requested,
+# what limit it used -- and not only what it wrote to disk. Where the real daemon would refuse a
+# request, the fake refuses it too: a telemetry read that asks for neither a cursor nor
+# `--start retained` would read no history at all, so it is recorded as a failure here.
+#
+# Knobs a test sets: FAKE_FIXTURES, FAKE_CALLS, FAKE_POD_READY, FAKE_FAIL_USAGE_TOP,
+# FAKE_STALL_EVENTS, FAKE_NO_RESULT, FAKE_ANSWER, FAKE_NO_HUB, FAKE_NOT_REGISTERED,
+# FAKE_EMPTY_BUNDLE, FAKE_FAIL_BUNDLE, FAKE_SHOW_STATE, FAKE_SHOW_BLOCKED,
+# FAKE_WATERMARK_EVENTS, FAKE_WATERMARK_TRANSITIONS, FAKE_STS_CREATED, FAKE_EVENTS,
+# FAKE_EVENTS2, FAKE_EVENTS3, FAKE_EVENTS_SEEN, FAKE_EVENTS_FAIL.
+set -u
+
+: "${FAKE_FIXTURES:?fake-kubectl needs FAKE_FIXTURES}"
+: "${FAKE_CALLS:?fake-kubectl needs FAKE_CALLS}"
+printf '%s\n' "$*" >> "$FAKE_CALLS"
+
+fix() { cat "$FAKE_FIXTURES/$1"; }
+nope() { echo "fake kubectl: no recorded response for [$*]" >&2; exit 1; }
+# Real `kubectl exec` writes this to ITS OWN stderr when the remote command exits non-zero, so a
+# caller that merges the two streams sees it beside the command's JSON. The dispatcher has to parse
+# around it; without this line the fake is more polite than kubectl and hides that.
+kfail() { printf 'command terminated with exit code %s\n' "$1" >&2; exit "$1"; }
+
+# One telemetry stream. The archive opens a history with `--start retained` and then follows the
+# cursor. A read with neither asks for the CURRENT window and gets no rows back, which is exactly how
+# the delete guard learns how far the stream has reached without dragging the whole history along.
+telemetry() {
+  local stream=$1 cursor="" started=""
+  shift
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --cursor) cursor=${2:-} ;;
+      --start) started=${2:-} ;;
+    esac
+    shift
+  done
+  if [ -z "$cursor" ] && [ "$started" != retained ]; then
+    case "$stream" in
+      events) fix events-latest.json | jq -c --arg wm "${FAKE_WATERMARK_EVENTS:-$( [ "${FAKE_R3_WRITES:-0}" = 1 ] && echo 9 || echo 3 )}" '.page.retainedHighWatermark = $wm' ;;
+      transitions) fix transitions-latest.json | jq -c --arg wm "${FAKE_WATERMARK_TRANSITIONS:-5}" '.page.retainedHighWatermark = $wm' ;;
+      *) nope "telemetry $stream latest window" ;;
+    esac
+    return
+  fi
+  case "$stream:$cursor" in
+    events:) fix events-page1.json ;;
+    events:CURSOR-E1)
+      if [ "${FAKE_STALL_EVENTS:-0}" = 1 ]; then fix events-page1.json
+      elif [ "${FAKE_R3_WRITES:-0}" = 1 ]; then
+        # The team wrote while the read was running: the window's `through` stays where it opened, but
+        # the high watermark the daemon reports has moved past what this read can include.
+        fix events-page2.json | jq -c '.page.retainedHighWatermark = "9"'
+      else fix events-page2.json; fi ;;
+    transitions:) fix transitions-page1.json ;;
+    transitions:CURSOR-T1) fix transitions-page2.json ;;
+    *) nope "telemetry $stream cursor $cursor" ;;
+  esac
+}
+
+# One seat's usage series. The public read answers oldest-first up to a cap and says nothing when it
+# truncates, so the archive pages it with --since; RIG_DISPATCH_USAGE_PAGE is set small in the test so
+# two pages are enough to show that it really followed them.
+usage_series() {
+  local since=""
+  while [ $# -gt 0 ]; do
+    case "$1" in --since) since=${2:-} ;; esac
+    shift
+  done
+  case "$since" in
+    "") fix usage-series.json ;;
+    2026-10-23T20:08:00Z) fix usage-series-page2.json ;;
+    *) printf '{"rows": []}\n' ;;
+  esac
+}
+
+# A `kubectl exec ... -- sh -c <script> [name] [args...]`. Two shapes reach it: the raw result.json
+# read, and the mission-control audit read, which passes the qitem, the page size and the before_id.
+pod_sh() {
+  [ "${2:-}" = "-c" ] || nope "sh without -c"
+  local script=$3
+  case "$script" in
+    *Rig-Dispatch-*eader*)
+      # `watch` reaps the curl it started inside the pod, because killing kubectl does not reach it and
+      # a curl on a quiet stream never notices its stdout has gone. The test asserts this was asked for.
+      printf 'reap\n' >> "${FAKE_REAP:-/dev/null}" ;;
+    *mission-control/audit*)
+      local qitem=${5:-} before=${7:-}
+      case "$qitem:$before" in
+        qitem-a:)
+          # FAKE_AUDIT_A swaps in a different first page, e.g. one whose resolve carries some other
+          # decision, which is how a test says "the row moved but not because of this answer".
+          if [ -n "${FAKE_AUDIT_A:-}" ]; then fix "$FAKE_AUDIT_A"; else fix audit-qitem-a-p1.json; fi ;;
+        qitem-a:act-2) fix audit-qitem-a-p2.json ;;
+        qitem-b:|qitem-unrelated:|qitem-review-untagged:|qitem-recovery-1f2e3d4c:)
+          fix audit-empty.json ;;
+        *) nope "audit rows for $qitem before $before" ;;
+      esac ;;
+    *result.json*)
+      # `cat ... 2>/dev/null; true` prints nothing when the file is absent, and still exits 0.
+      [ "${FAKE_NO_RESULT:-0}" = 1 ] || fix result.json ;;
+    *"npm root"*) printf '/usr/lib/node_modules\n' ;;
+    *) nope "pod shell: $script" ;;
+  esac
+}
+
+serve() {
+  case "${1:-}" in
+    rig)
+      case "${2:-} ${3:-}" in
+        "ps --nodes") fix nodes.json ;;
+        "queue list") fix queue.json ;;
+        "queue show")
+          # What the team's own daemon says about the row, which is how `answer` learns whether a
+          # write the hub reported as failed had in fact landed. Default: still parked on a human.
+          # FAKE_SHOW_UNREADABLE stands for a pod that cannot be reached or answers nonsense, which is
+          # a different thing from a row that moved, and `answer` must not treat it as one.
+          if [ "${FAKE_SHOW_UNREADABLE:-0}" = 1 ]; then
+            echo "rig queue show: the daemon did not answer" >&2
+            exit 1
+          fi
+          local blocked=${FAKE_SHOW_BLOCKED-human@host}
+          printf '{"qitemId":"qitem-a","state":"%s","blockedOn":%s}\n' \
+            "${FAKE_SHOW_STATE:-blocked}" \
+            "$(if [ -n "$blocked" ]; then printf '"%s"' "$blocked"; else printf 'null'; fi)" ;;
+        "queue resolve")
+          # The hub's forwarded answer, or the team pod's own. FAKE_ANSWER picks which outcome the
+          # test is exercising: ok, a routing failure only the hub can hit (it is the one passing
+          # --host), a refusal by the team that the dispatcher must NOT fall back on, a failure that
+          # reached the team anyway, or a failure of the hub's own.
+          hub=0
+          for a in "$@"; do [ "$a" = "--host" ] && hub=1; done
+          outcome=${FAKE_ANSWER:-ok}
+          # A hub-side outcome belongs to the hub leg only; the team pod never passes --host, so the
+          # fallback after such a failure must still succeed.
+          if [ "$hub" = 0 ]; then
+            case "$outcome" in unroutable|unreachable-landed|hub401) outcome=ok ;; esac
+          fi
+          case "$outcome" in
+            ok) printf '{"qitemId":"qitem-a","state":"in-progress","resolvedBy":"human@host"}\n' ;;
+            unroutable)
+              printf '{"error":"remote_action_failed","hostId":"t-demo","failureClass":"unknown-host","detail":"host not in hosts.yaml"}\n'
+              kfail 2 ;;
+            unreachable-landed)
+              printf '{"error":"remote_action_failed","hostId":"t-demo","failureClass":"unreachable","detail":"request timed out after the team had the write"}\n'
+              kfail 2 ;;
+            hub401)
+              printf '{"error":"unauthorized"}\n'
+              kfail 1 ;;
+            refused)
+              printf '{"error":"remote_action_failed","hostId":"t-demo","failureClass":"remote-error","remoteStatus":404,"remoteBody":{"error":"qitem_not_found","hint":"Queue item was not found on the team daemon."}}\n'
+              kfail 1 ;;
+            refused-closed)
+              # What the real hub returns when the row is no longer parked on a human: the team refused,
+              # and kubectl's own line lands on stderr beside it.
+              printf '{"error":"remote_action_failed","hostId":"t-demo","failureClass":"remote-error","remoteStatus":409,"detail":"qitem_not_leg1_parked"}\n'
+              kfail 2 ;;
+            *) nope "FAKE_ANSWER=${FAKE_ANSWER}" ;;
+          esac ;;
+        "usage series") shift 3; usage_series "$@" ;;
+        "usage top")
+          if [ "${FAKE_FAIL_USAGE_TOP:-0}" = 1 ]; then
+            echo "rig usage top: the daemon answered 503 usage_unavailable" >&2
+            exit 1
+          fi
+          fix usage-top.json ;;
+        "telemetry events") shift 3; telemetry events "$@" ;;
+        "telemetry transitions") shift 3; telemetry transitions "$@" ;;
+        "config reset"*) : ;;
+        "down"*) : ;;
+        *) nope "rig $*" ;;
+      esac ;;
+    sh) pod_sh "$@" ;;
+    curl)
+      # `watch` reaches the team daemon with curl over pod-local loopback, so the event stream is
+      # recorded here the same way every other response is. FAKE_EVENTS names the stream for the
+      # first connection and FAKE_EVENTS2 the one for the second, which is how a test drops a stream
+      # mid-flight and shows what the reconnect asks for. Each connection appends the Last-Event-ID
+      # it was given to $FAKE_EVENTS_SEEN, so resume is asserted rather than assumed.
+      local seen="" a n
+      for a in "$@"; do case "$a" in Last-Event-ID:*) seen=${a#Last-Event-ID:} ;; esac; done
+      seen=${seen//[[:space:]]/}
+      printf '%s\n' "${seen:-none}" >>"${FAKE_EVENTS_SEEN:-/dev/null}"
+      # FAKE_EVENTS_FAIL stands for a pod that will not hold a stream at all (no curl, a daemon that
+      # refuses the route), which is the case `watch` must answer with polling rather than silence.
+      if [ "${FAKE_EVENTS_FAIL:-0}" = 1 ]; then kfail 22; fi
+      n=$(grep -c ' curl ' "$FAKE_CALLS")
+      case "$n" in
+        1) fix "${FAKE_EVENTS:-events-terminal.sse}" ;;
+        2) fix "${FAKE_EVENTS2:-events-empty.sse}" ;;
+        *) fix "${FAKE_EVENTS3:-events-empty.sse}" ;;
+      esac
+      # A real team's stream does not end when its last event has been delivered: it stays open until
+      # the pod goes away, and that is the only shape a watch has to be correct against. So the held
+      # stream is the default here and FAKE_EVENTS_END is the opt-out, for the one case that really
+      # does end: an API server dropping a long-lived exec mid-flight.
+      if [ "${FAKE_EVENTS_END:-0}" != 1 ]; then sleep "${FAKE_EVENTS_HOLD_SECS:-30}"; fi ;;
+    delete)
+      # `kubectl delete` on the way out: succeed quietly, the test checks what was asked for.
+      : ;;
+    rm) : ;;
+    env)
+      # Three shapes arrive here: `env HUB_MODE=has ... node -` from the hub registry helper,
+      # `env -u NAME ... rig queue resolve ...` from the hub answer path (no seat, on purpose), and
+      # `env OPENRIG_SESSION_NAME=<who> rig queue resolve ...` from the in-pod fallback. Strip the
+      # assignments and unsets and dispatch on the command behind them.
+      shift
+      local hubmode=""
+      while [ $# -gt 1 ]; do
+        case "$1" in
+          -u) shift 2 ;;
+          HUB_MODE=*) hubmode=${1#HUB_MODE=}; shift ;;
+          *=*) shift ;;
+          *) break ;;
+        esac
+      done
+      if [ "$hubmode" = has ]; then
+        # `hub_registry has` exits 0 when the team is registered and 1 when it is not, which is what
+        # decides whether `answer` may try the hub at all.
+        if [ "${FAKE_NOT_REGISTERED:-0}" = 1 ]; then exit 1; fi
+        exit 0
+      fi
+      serve "$@" ;;
+    git)
+      # `collect` bundles the result branch out of the pod. The bytes are opaque here; what the test
+      # cares about is that collect keeps the archive whatever the bundle step does, and that a ticket
+      # with nothing to bundle is a state of the ticket rather than a failed archive.
+      if [ "${FAKE_FAIL_BUNDLE:-0}" = 1 ]; then
+        echo "fatal: not a valid object name ticket/demo" >&2
+        exit 128
+      fi
+      if [ "${FAKE_EMPTY_BUNDLE:-0}" = 1 ]; then
+        echo "fatal: can't create empty bundle" >&2
+        exit 128
+      fi
+      printf 'fake git bundle for %s\n' "${*}" ;;
+    *) nope "$*" ;;
+  esac
+}
+
+ns=""
+declare -a rest=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -n) ns=${2:-}; shift 2 ;;
+    *) rest+=("$1"); shift ;;
+  esac
+done
+[ -n "$ns" ] || nope "a call with no -n namespace; the dispatcher always passes one"
+
+case "${rest[0]:-}" in
+  delete)
+    # `kubectl delete` on the way out: succeed quietly; the test asserts on the calls it saw.
+    : ;;
+  get)
+    case "${rest[1]:-}" in
+      statefulset|statefulsets)
+        # `status --all` and `watch --all` list the teams by label instead of naming one, which is a
+        # different recorded answer from the single-StatefulSet read.
+        if [ "${rest[2]:-}" = "-l" ]; then
+          fix statefulsets-team.json
+        elif [ "${#rest[@]}" -gt 2 ] && [ "${rest[2]}" != "t-demo" ]; then
+          nope "statefulset ${rest[2]}"
+        elif [ -n "${FAKE_STS_CREATED:-}" ]; then
+          # FAKE_STS_CREATED stands in for a re-dispatched ticket: same slug, newer pod.
+          fix statefulset.json | jq -c --arg c "$FAKE_STS_CREATED" '.metadata.creationTimestamp = $c'
+        else
+          fix statefulset.json
+        fi ;;
+      pod)
+        # hub_ready() asks about the hub pod by name, so a test can take the hub away on its own.
+        if [ "${rest[2]:-}" = "hub-0" ] && [ "${FAKE_NO_HUB:-0}" = 1 ]; then fix pod-not-ready.json
+        elif [ "${FAKE_POD_READY:-1}" = 1 ]; then fix pod-ready.json
+        else fix pod-not-ready.json; fi ;;
+      *) nope "get $*" ;;
+    esac ;;
+  exec)
+    declare -a cmd=()
+    seen=0
+    for a in "${rest[@]}"; do
+      [ "$seen" = 1 ] && cmd+=("$a")
+      [ "$a" = "--" ] && seen=1
+    done
+    [ "${#cmd[@]}" -gt 0 ] || nope "exec with no command"
+    serve "${cmd[@]}" ;;
+  *) nope "$*" ;;
+esac

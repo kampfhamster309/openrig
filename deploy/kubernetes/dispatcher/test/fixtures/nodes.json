@@ -1,0 +1,14 @@
+[
+  {
+    "logicalId": "orch.lead",
+    "canonicalSessionName": "orch-lead@demo-rig",
+    "sessionStatus": "running",
+    "agentActivity": { "state": "idle" }
+  },
+  {
+    "logicalId": "dev.build",
+    "canonicalSessionName": "dev-build@demo-rig",
+    "sessionStatus": "running",
+    "agentActivity": { "state": "working" }
+  }
+]

@@ -1,0 +1,17 @@
+# Headless, like the team Service. Nothing in the cluster connects to the hub (it binds loopback),
+# so this exists only to give the StatefulSet a governing Service and the pod a stable name,
+# hub-0.hub.openrig.svc. Reach the daemon with `kubectl port-forward pod/hub-0`, never a
+# LoadBalancer or Ingress.
+apiVersion: v1
+kind: Service
+metadata:
+  name: hub
+  labels:
+    app: openrig-hub
+spec:
+  clusterIP: None
+  selector:
+    app: openrig-hub
+  ports:
+    - name: daemon
+      port: 7433

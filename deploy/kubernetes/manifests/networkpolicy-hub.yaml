@@ -1,0 +1,61 @@
+# The hub's half of the network rules. Two policies:
+#
+#   openrig-hub                - what the hub pod may reach.
+#   openrig-team-from-hub      - who may reach a team pod's daemon.
+#
+# NetworkPolicy is additive per direction: a pod is allowed anything any policy selecting it
+# allows. openrig-host (networkpolicy.yaml) still owns the teams' egress; this file only adds the
+# ingress rule the hub needs, so the teams' egress rules are unchanged.
+---
+# The hub holds every team's bearer, so it is the tightest pod in the namespace: no ingress at all
+# (it binds loopback and the operator comes in with `kubectl port-forward`, which is not subject to
+# NetworkPolicy), and egress only to cluster DNS and to the team daemons it polls.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: openrig-hub
+spec:
+  podSelector:
+    matchLabels:
+      app: openrig-hub
+  policyTypes: [Ingress, Egress]
+  ingress: []
+  egress:
+    # Cluster DNS: the hub resolves t-<slug>-0.teams.openrig.svc for every team.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - { protocol: UDP, port: 53 }
+        - { protocol: TCP, port: 53 }
+    # The team daemons, and nothing else. The hub runs no agents, so it has no reason to reach the
+    # model provider, a git remote, or the internet.
+    - to:
+        - podSelector:
+            matchLabels:
+              openrig.dev/role: team
+      ports:
+        - { protocol: TCP, port: 7433 }
+---
+# Team pods stay unreachable to everything else in the cluster; the hub is the one exception, so the
+# operator can see every team through it. Still one bearer per team, and only the hub can use it.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: openrig-team-from-hub
+spec:
+  podSelector:
+    matchLabels:
+      app: openrig-team
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: openrig-hub
+      ports:
+        - { protocol: TCP, port: 7433 }

@@ -1,0 +1,252 @@
+#!/usr/bin/env python3
+"""Verdict on a Pi seat from its OpenRig heartbeat (pi-extensions/openrig-heartbeat.ts).
+
+Usage:
+  pi-seat-status [SEAT]            # default seat: dev-build@claude-pi-k8s
+  pi-seat-status SEAT --json
+  pi-seat-status SEAT --calibrate  # percentiles from real runs + suggested thresholds
+
+Exit codes: 0 ok/working, 1 warn (look closer), 2 stuck/stalled/dead, 3 no heartbeat.
+
+Thresholds (seconds) can be overridden with env vars, e.g. PI_STUCK_PREFILL=420.
+Defaults come from 616 model calls on strix_halogen/halogen-qwen3.8-flash-next
+(2026-10-09): call median 6s, p99 64s, max 372s (8k output tokens at ~22 tok/s
+with 111k context); tool median 0s, p99 36s; output 47 tok/s median.
+"""
+import glob
+import json
+import os
+import subprocess
+import sys
+import time
+from datetime import datetime
+
+DEFAULT_SEAT = "dev-build@claude-pi-k8s"
+HOME = os.environ.get("OPENRIG_HOME") or os.path.join(os.path.expanduser("~"), ".openrig")
+HB_DIR = os.path.join(HOME, "state", "pi-heartbeat")
+
+# name: (warn, stuck)
+DEFAULTS = {
+    "PREFILL": (120, 300),     # model call started, no token yet (prompt processing)
+    "TOKEN_GAP": (60, 180),    # tokens were streaming, then went silent
+    "CALL": (600, 1200),       # one model call running this long while still streaming: possible reasoning loop
+    "TOOL": (300, 900),        # one tool call (builds/tests can be long)
+    "COMPACT": (300, 600),     # context compaction
+    "IDLE_WITH_WORK": (60, 180),  # idle while owning an in-progress queue item (post-compaction stall)
+}
+
+
+def threshold(name):
+    w, s = DEFAULTS[name]
+    return float(os.environ.get(f"PI_WARN_{name}", w)), float(os.environ.get(f"PI_STUCK_{name}", s))
+
+
+def ts(s):
+    return datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp() if s else None
+
+
+def ago(t, now):
+    return None if t is None else now - t
+
+
+def fmt(sec):
+    if sec is None:
+        return "?"
+    sec = int(sec)
+    return f"{sec // 60}m{sec % 60:02d}s" if sec >= 60 else f"{sec}s"
+
+
+def pid_alive(pid):
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except (OSError, TypeError, ValueError):
+        return False
+
+
+def in_progress_items(seat):
+    try:
+        out = subprocess.run(
+            ["rig", "queue", "list", "--destination", seat, "--state", "in-progress,pending", "-o", "json"],
+            capture_output=True, text=True, timeout=20,
+        ).stdout
+        items = json.loads(out)
+        return [i for i in items if i.get("destinationSession") == seat]
+    except Exception:
+        return None
+
+
+def grade(level, current):
+    order = {"ok": 0, "warn": 1, "stuck": 2}
+    return level if order[level] > order[current] else current
+
+
+def verdict(seat):
+    path = os.path.join(HB_DIR, f"{seat}.json")
+    try:
+        hb = json.load(open(path))
+    except FileNotFoundError:
+        return 3, {"seat": seat, "verdict": "no-heartbeat",
+                   "reason": f"{path} missing: the heartbeat extension is not loaded in this seat (seat started before it was installed?)"}
+    now = time.time()
+    state = hb.get("state")
+    since = ago(ts(hb.get("state_since")), now)
+    last_ev = ago(ts(hb.get("last_event_at")), now)
+    level, reasons = "ok", []
+    alive = pid_alive(hb.get("pid"))
+
+    if state == "exited" or not alive:
+        level, reasons = "stuck", [f"Pi process {'exited' if state == 'exited' else 'not running'} (last event {fmt(last_ev)} ago)"]
+        state = "dead"
+    elif state == "model":
+        call = hb.get("current_call") or {}
+        call_age = ago(ts(call.get("started_at")), now)
+        first = call.get("first_token_at")
+        if not first:
+            w, s = threshold("PREFILL")
+            age = call_age if call_age is not None else since
+            if age is not None and age >= s:
+                level = grade("stuck", level); reasons.append(f"no token for {fmt(age)} since the model call started (prefill limit {fmt(s)})")
+            elif age is not None and age >= w:
+                level = grade("warn", level); reasons.append(f"still processing the prompt after {fmt(age)}")
+        else:
+            gap = ago(ts(call.get("last_token_at")), now)
+            w, s = threshold("TOKEN_GAP")
+            if gap >= s:
+                level = grade("stuck", level); reasons.append(f"tokens stopped {fmt(gap)} ago mid-response")
+            elif gap >= w:
+                level = grade("warn", level); reasons.append(f"no new token for {fmt(gap)}")
+            w, s = threshold("CALL")
+            if call_age and call_age >= s:
+                level = grade("stuck", level); reasons.append(f"single model call running {fmt(call_age)}: likely a reasoning loop")
+            elif call_age and call_age >= w:
+                level = grade("warn", level); reasons.append(f"long model call ({fmt(call_age)}, phase {hb.get('phase')}): possible reasoning loop")
+    elif state == "tool":
+        tool = hb.get("current_tool") or {}
+        age = ago(ts(tool.get("started_at")), now)
+        w, s = threshold("TOOL")
+        if age and age >= s:
+            level = grade("stuck", level); reasons.append(f"tool {tool.get('name')} running {fmt(age)}: {tool.get('args')}")
+        elif age and age >= w:
+            level = grade("warn", level); reasons.append(f"tool {tool.get('name')} running {fmt(age)}: {tool.get('args')}")
+    elif state == "compacting":
+        w, s = threshold("COMPACT")
+        if since and since >= s:
+            level = grade("stuck", level); reasons.append(f"compacting for {fmt(since)}")
+        elif since and since >= w:
+            level = grade("warn", level); reasons.append(f"compacting for {fmt(since)}")
+
+    owned = None
+    if state in ("idle", "starting"):
+        owned = in_progress_items(seat)
+        if owned:
+            w, s = threshold("IDLE_WITH_WORK")
+            ids = ", ".join(i["qitemId"] for i in owned)
+            if since and since >= s:
+                level = grade("stuck", level); reasons.append(f"idle {fmt(since)} while owning open work ({ids}): stalled, nudge it")
+            elif since and since >= w:
+                level = grade("warn", level); reasons.append(f"idle {fmt(since)} while owning open work ({ids})")
+
+    label = {"ok": "working" if state in ("model", "tool", "compacting") else state, "warn": "warn", "stuck": "stuck"}[level]
+    if level == "stuck" and state == "idle":
+        label = "stalled"
+    detail = {
+        "seat": seat,
+        "verdict": label,
+        "state": state,
+        "phase": hb.get("phase"),
+        "in_state_for": fmt(since),
+        "last_event": f"{fmt(last_ev)} ago",
+        "turn": hb.get("turn"),
+        "current_tool": hb.get("current_tool"),
+        "context": hb.get("context"),
+        "totals": hb.get("totals"),
+        "last_model_call": hb.get("last_model_call"),
+        "recent": hb.get("recent"),
+        "reasons": reasons,
+    }
+    if owned is not None:
+        detail["open_queue_items"] = [i["qitemId"] for i in owned]
+    return {"ok": 0, "warn": 1, "stuck": 2}[level], detail
+
+
+def pct(a, p):
+    a = sorted(a)
+    return a[min(len(a) - 1, int(p * len(a)))] if a else None
+
+
+def calibrate(seat):
+    calls = []
+    try:
+        calls = [json.loads(l) for l in open(os.path.join(HB_DIR, f"{seat}.calls.jsonl"))]
+    except FileNotFoundError:
+        pass
+    # Older history from Pi's own session logs (call duration only).
+    hist = []
+    for f in glob.glob(os.path.join(HOME, "state", "pi", "*", "sessions", "*.jsonl")):
+        prev = prole = None
+        for line in open(f, errors="ignore"):
+            try:
+                d = json.loads(line)
+            except ValueError:
+                continue
+            t = ts(d.get("timestamp"))
+            if d.get("type") == "message":
+                role = d["message"].get("role")
+                if role == "assistant" and prole in ("user", "toolResult") and prev:
+                    hist.append(t - prev)
+                prole = role
+            prev = t
+    rows = [("call duration s (heartbeat)", [c["duration_s"] for c in calls if c.get("duration_s") is not None]),
+            ("time to first token s", [c["ttft_s"] for c in calls if c.get("ttft_s") is not None]),
+            ("longest token gap s", [c["max_gap_s"] for c in calls if c.get("max_gap_s") is not None]),
+            ("call duration s (all Pi logs)", hist)]
+    print(f"Calibration for {seat}")
+    for name, a in rows:
+        if a:
+            print(f"  {name:30} n={len(a):5} p50={pct(a, .5):7.1f} p90={pct(a, .9):7.1f} p99={pct(a, .99):7.1f} max={max(a):7.1f}")
+        else:
+            print(f"  {name:30} no data yet")
+    ttft = [c["ttft_s"] for c in calls if c.get("ttft_s") is not None]
+    gaps = [c["max_gap_s"] for c in calls if c.get("max_gap_s") is not None]
+    if len(ttft) >= 50:
+        print(f"  suggest PI_WARN_PREFILL={max(60, int(2 * max(ttft)))} PI_STUCK_PREFILL={max(180, int(4 * max(ttft)))}")
+    if len(gaps) >= 50:
+        print(f"  suggest PI_WARN_TOKEN_GAP={max(30, int(3 * max(gaps)))} PI_STUCK_TOKEN_GAP={max(90, int(8 * max(gaps)))}")
+    if len(ttft) < 50 or len(gaps) < 50:
+        print("  (need >= 50 heartbeat-logged calls before suggesting prefill/token-gap thresholds)")
+
+
+def main():
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    seat = args[0] if args else DEFAULT_SEAT
+    if "--calibrate" in sys.argv:
+        calibrate(seat)
+        return 0
+    code, d = verdict(seat)
+    if "--json" in sys.argv:
+        print(json.dumps(d, indent=1))
+        return code
+    print(f"{d['seat']}: {d['verdict'].upper()}" + (f" ({'; '.join(d['reasons'])})" if d.get("reasons") else ""))
+    if code == 3:
+        print(f"  {d['reason']}")
+        return code
+    tool = d.get("current_tool") or {}
+    print(f"  state={d['state']} phase={d.get('phase')} for {d['in_state_for']}, last event {d['last_event']}, turn {d['turn']}")
+    if tool:
+        print(f"  tool: {tool.get('name')} {tool.get('args')}")
+    ctx = d.get("context") or {}
+    t = d.get("totals") or {}
+    if ctx.get("percent") is not None:
+        print(f"  context: {ctx.get('tokens')}/{ctx.get('window')} tokens ({ctx['percent']:.0f}%)")
+    print(f"  totals: {t.get('model_calls')} calls, {t.get('tool_calls')} tools ({t.get('tool_errors')} errors), "
+          f"{t.get('compactions')} compactions, in {t.get('input')} / out {t.get('output')} / cache-read {t.get('cache_read')} tokens")
+    if "open_queue_items" in d:
+        print(f"  open queue items: {', '.join(d['open_queue_items']) or 'none'}")
+    for line in (d.get("recent") or [])[-6:]:
+        print(f"  | {line}")
+    return code
+
+
+if __name__ == "__main__":
+    sys.exit(main())
