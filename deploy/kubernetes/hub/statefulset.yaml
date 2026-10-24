@@ -1,0 +1,98 @@
+# The hub: one OpenRig daemon that runs no rigs. Its hosts.yaml lists every team pod, so the
+# operator's TUI talks only to this daemon and sees every team. Design:
+# deploy/kubernetes/docs/architecture.md.
+#
+# One replica: the hub is the single point of truth, and its volume holds hosts.yaml, config.json
+# and one bearer file per team.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: hub
+  labels:
+    app: openrig-hub
+    openrig.dev/role: hub
+spec:
+  serviceName: hub
+  replicas: 1
+  selector:
+    matchLabels:
+      app: openrig-hub
+  persistentVolumeClaimRetentionPolicy:
+    whenDeleted: Delete
+    whenScaled: Retain
+  template:
+    metadata:
+      labels:
+        app: openrig-hub
+        openrig.dev/role: hub
+    spec:
+      # The hub runs no agents and needs no Kubernetes API access.
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      imagePullSecrets:
+        - name: ghcr-pull
+      terminationGracePeriodSeconds: 60
+      containers:
+        - name: daemon
+          image: openrig-host
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+          ports:
+            - name: daemon
+              containerPort: 7433
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            # Seeds the daemon's self-host id on first boot; the id then lives in the volume.
+            - name: OPENRIG_HOST_NAME
+              value: "$(POD_NAME)"
+            # Loopback only. Nothing in the cluster connects to the hub; the operator comes in with
+            # `kubectl port-forward`, which connects inside the pod. A loopback bind needs no
+            # bearer, so reaching the hub is exactly having pods/portforward on this namespace.
+            - name: OPENRIG_BIND_HOST
+              value: "127.0.0.1"
+            - name: OPENRIG_PORT
+              value: "7433"
+            # The hub runs no rigs, so it needs no kernel rig and no agent credentials.
+            - name: OPENRIG_NO_KERNEL
+              value: "1"
+            # Deliberately absent: OPENRIG_AUTH_BEARER_TOKEN (loopback bind needs none),
+            # OPENRIG_WORKSPACE_REPO, and the openrig-agents Secret. The hub holds every team's
+            # bearer and nothing else.
+          # An exec probe, not httpGet: the kubelet probes the pod IP, and a loopback bind has no
+          # listener there, so httpGet would never go Ready. exec runs in the pod's own network
+          # namespace, where 127.0.0.1 is the daemon.
+          readinessProbe:
+            exec:
+              command: ["curl", "-fsS", "http://127.0.0.1:7433/healthz"]
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 6
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              memory: 1Gi
+          volumeMounts:
+            - name: home
+              mountPath: /home/openrig
+  volumeClaimTemplates:
+    - metadata:
+        name: home
+      spec:
+        accessModes: [ReadWriteOnce]
+        storageClassName: local-path
+        resources:
+          requests:
+            storage: 5Gi

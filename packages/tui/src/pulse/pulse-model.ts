@@ -5,7 +5,8 @@ import { isHumanSeatSessionRef } from "@openrig/daemon/attention";
 // a STATIC demo fixture reproducing the approved mock's EXACT rows; increments
 // 2-3 build it from SHIPPED daemon reads (no new surface).
 import type { Token } from "../theme.js";
-import type { Action, FleetSnapshot, QueueRead, SeatActivitySummary } from "../types.js";
+import type { Action, FleetSnapshot, NeedsItem, QueueRead, SeatActivitySummary } from "../types.js";
+import { LOCAL_HOST_ID_SENTINEL, RIG_DOWN_ID_PREFIX } from "../types.js";
 import { findAgentBySession } from "../state.js";
 
 /** One exception row: an accent glyph + bold subject + plain claim + dim metadata. */
@@ -15,6 +16,13 @@ export interface PulseException {
   subject: string; // bold subject (mock <b>)
   claim: string; // plain claim text
   meta: string; // dim trailing metadata (age / hint)
+  /** Cross-host provenance, rendered as the `[host]` label BEFORE the subject.
+   * Set only on a row that came from a REMOTE host; a local row never carries one,
+   * so an operator with no remote hosts sees no new labels at all. */
+  host?: string;
+  /** Dim continuation line under the row, for an address the operator has to type
+   * somewhere else — a remote item's action cannot run here. */
+  hint?: string;
 }
 
 export interface PulseExceptionSection {
@@ -191,6 +199,71 @@ function needsRows(attention: QueueRead[], nowMs: number): PulseException[] {
   });
 }
 
+/** The `[host]` provenance label every cross-host row carries. ONE place, so the
+ * exception rows and the lane rows spell it identically. */
+export function hostLabel(hostId: string): string {
+  return `[${hostId}]`;
+}
+
+/** The address an operator uses IN PLACE of an action the TUI cannot take on a remote
+ * row. Two rules decide it, and both come from the CLI rather than from taste:
+ * - it must RUN AS PRINTED. `rig queue resolve` declares `--decision` as a
+ *   requiredOption, so a printed line without it fails in commander before it runs.
+ * - it must apply to THIS leg. `resolve` unparks a leg-1 park (state=blocked on a
+ *   human seat) and nothing else; the fleet read also serves `human-routed` pending
+ *   rows and derived exceptions, which have nothing to resolve. Those get the honest
+ *   non-mutating read instead.
+ *
+ * On the park-on-human leg the TUI can answer the row itself
+ * (`answer <qitem-id> <decision>`, routed to this row's host), so the row points at the action
+ * this surface can actually take instead of at a command to type somewhere else. The other legs
+ * keep the address, exactly as before — the hint only ever names something the operator cannot do
+ * from here. NO QUOTES around the decision: the grammar takes the rest of the line
+ * literally, so a printed pair of quotes would land in the team's transition note. */
+function remoteHint(kind: string, hostId: string, qitemId: string): string {
+  return kind === "park-on-human"
+    ? ` → answer here: answer ${qitemId} <decision> (routes to ${hostId})`
+    : ` → on ${hostId}: rig queue show ${qitemId}`;
+}
+
+/** The host that OWNS a NEEDS YOU row, as the fleet reads served it. `answer` routes on this
+ *  instead of guessing: a row this hub has only ever seen from another host belongs to that host,
+ *  and anything else is the hub's own. Returns undefined for a local row (the `local` sentinel) and
+ *  for an id no served row carries — the daemon then answers honestly with qitem_not_found rather
+ *  than the TUI inventing a destination. */
+export function remoteHostForQitem(snap: FleetSnapshot, qitemId: string): string | undefined {
+  const remote = (hostId: string | null | undefined): string | undefined =>
+    (hostId && hostId !== LOCAL_HOST_ID_SENTINEL ? hostId : undefined);
+  for (const item of snap.needs) if (item.qitemId === qitemId) { const hit = remote(item.hostId); if (hit) return hit; }
+  for (const row of snap.fleetQueue) if (row.qitemId === qitemId) { const hit = remote(row.hostId); if (hit) return hit; }
+  return undefined;
+}
+
+/** ▲ NEEDS YOU rows for the FLEET leg — the `/api/review/fleet` items whose host is
+ * a REMOTE one. The local leg above is the hub's own queue, which is empty on a
+ * daemon that runs no rigs, so this is the only way a hub's PULSE can show what the
+ * teams are waiting on. Rows carry the `[host]` label and the resolve address, and
+ * keep the same subject/detail split the local rows use. */
+function fleetNeedsRows(needs: NeedsItem[], nowMs: number, alreadyShown: Set<string>): PulseException[] {
+  return needs
+    .filter((item) => item.hostId != null && item.hostId !== LOCAL_HOST_ID_SENTINEL)
+    .filter((item) => !(item.qitemId && alreadyShown.has(item.qitemId)))
+    .map((item) => {
+      const full = item.detail || item.target;
+      const sep = full.indexOf(NEEDS_SUBJECT_SEP);
+      const age = ageLabel(item.ageIso, nowMs);
+      return {
+        glyph: "●",
+        token: "error" as Token,
+        host: item.hostId,
+        subject: sep > 0 ? full.slice(0, sep) : full,
+        claim: sep > 0 ? full.slice(sep) : "",
+        meta: age ? ` · ${age}` : "",
+        ...(item.qitemId ? { hint: remoteHint(item.kind, item.hostId!, item.qitemId) } : {}),
+      };
+    });
+}
+
 /** ⧗ BLOCKED ON AGENTS rows — filter the state=blocked read to NON-human
  * blockers (human-blocked already appear under NEEDS YOU), then NAME the blocking
  * AGENT. blockedOn is a qitem POINTER for agent-blocks (a session only for
@@ -214,6 +287,7 @@ function blockedRows(blocked: QueueRead[], nowMs: number): PulseException[] {
         subject: q.destinationSession,
         claim: ` blocked on ${blocker}`,
         meta: meta ? ` · ${meta}` : "",
+        ...(q.hostId ? { host: q.hostId } : {}),
       };
     });
 }
@@ -232,7 +306,16 @@ function qitemShort(qitemId: string): string {
  * DURATION is a VIEW derived HERE from the owner's raw lastActivityAt (arch
  * 3a947fb1) + the reader clock (nowMs) — the renderer-side test-clock seam,
  * DISTINCT from the .cjs OPENRIG_TEST_CLOCK_NOW env clock. Render: owner ·
- * qitem-short · idle-duration · no-handoff · the drill hint. */
+ * qitem-short · idle-duration · no-handoff · the drill hint.
+ *
+ * The seat map is keyed by host+session, NOT by session alone. A remote row and a
+ * local seat can share a session name, and painting a remote host's stranded baton
+ * under a local seat - unlabelled - is worse than not joining at all. A row with no
+ * hostId is local and looks up under the empty host; a remote row matches only a
+ * seat the hub read off THAT host, and then carries its own [host] label. This is
+ * the join that could not run before the hub-side fleet read existed. A remote row
+ * whose seat the summary did not answer for stays excluded: unknown, never assumed
+ * idle. */
 function parkedRows(
   inProgress: QueueRead[],
   seatBySession: Map<string, SeatActivitySummary>,
@@ -242,7 +325,7 @@ function parkedRows(
   for (const q of inProgress) {
     if (q.state !== "in-progress") continue;       // defensive: the read is already state=in-progress
     if (q.handedOffTo != null) continue;           // handed off → not a stranded baton
-    const seat = seatBySession.get(q.destinationSession);
+    const seat = seatBySession.get(seatKey(q.hostId, q.destinationSession));
     if (!seat || seat.terminalActive !== false) continue; // IDLE owner ONLY (null ≠ idle — honest-unknown)
     const idle = ageLabel(seat.lastActivityAt, nowMs);
     // r1 belt (incr-3): a false-active seat carries a record, so it carries a
@@ -256,9 +339,68 @@ function parkedRows(
       subject: q.destinationSession,
       claim: ` · qitem ${qitemShort(q.qitemId)} in-progress ${idleText}, no handoff`,
       meta: " → enter: transcript check",
+      ...(q.hostId ? { host: q.hostId } : {}),
     });
   }
   return out;
+}
+
+/** The PARKED join's map key: host + session. A local row has no hostId, so it keys
+ * under the empty host; a remote row keys under the host the hub read it from. */
+function seatKey(hostId: string | null | undefined, session: string): string {
+  return `${hostId ?? ""}|${session}`;
+}
+
+/** ⚑ STALLED rows - the hub's own verdict, carried verbatim: open work, and no
+ * qualifying progress for longer than the threshold. The DURATION is the point, and
+ * the threshold travels with the row so a reader can tell a 31-minute verdict from
+ * a 6-hour one. A host and each of its rigs carry their own verdict; a rig row
+ * names the rig, so the operator knows which team owes the answer rather than only
+ * which machine. Nothing here is computed in the TUI. */
+function stalledRows(stalled: FleetSnapshot["stalled"]): PulseException[] {
+  // A host with exactly one rig would otherwise render two lines differing only in the
+  // rig name — same duration, same count, same threshold. One line says it once, and it
+  // names the rig, because the team is the useful referent. With several rigs the host
+  // row and the rig rows answer different questions (the machine vs each team), so all
+  // stay.
+  const rigCounts = new Map<string, number>();
+  for (const row of stalled) {
+    if (row.level === "rig") rigCounts.set(row.hostId, (rigCounts.get(row.hostId) ?? 0) + 1);
+  }
+  return stalled
+    .filter((row) => !(row.level === "host" && (rigCounts.get(row.hostId) ?? 0) === 1))
+    .map((row) => {
+      const age = row.minutesSinceProgress == null
+        ? "age unknown"
+        : `${row.minutesSinceProgress}m since last progress`;
+      return {
+        glyph: "⚑",
+        token: "warn" as Token,
+        subject: row.rigName ?? row.hostId,
+        claim: ` — ${age}, ${row.openWorkCount} open`,
+        meta: ` · threshold ${row.thresholdMinutes}m`,
+        host: row.hostId,
+      };
+    });
+}
+
+/** ✕ HOSTS DOWN rows — the aggregate host legs that are not `ok`, and ONLY those.
+ * `snap.hostsDown` also carries LOCAL rig-down rows (a stopped or recoverable rig on
+ * the operator's own machine). Those are rigs, not hosts, and rendering them here
+ * would open a red section on a PULSE with no remote host at all — exactly what the
+ * no-remote-hosts rule forbids, and it happens on a real machine whose kernel rig is
+ * merely recoverable. Whether rig-down belongs on PULSE at all is a separate product
+ * question, not settled here. Rows carry the served hostId / status / error VERBATIM. */
+function hostsDownRows(hostsDown: FleetSnapshot["hostsDown"]): PulseException[] {
+  return hostsDown
+    .filter((h) => !h.hostId.startsWith(RIG_DOWN_ID_PREFIX))
+    .map((h) => ({
+      glyph: "✕",
+      token: "error" as Token,
+      subject: h.hostId,
+      claim: ` — ${h.status}`,
+      meta: h.error ? ` · ${h.error}` : "",
+    }));
 }
 
 /** Per-lane DISPLAY cap. A lane never dumps an unbounded set; overflow past the
@@ -339,7 +481,9 @@ function finishedRows(recent: QueueRead[], cap: number, snap: FleetSnapshot): Pu
 function upNextLane(pending: QueueRead[], cap: number, snap: FleetSnapshot): PulseLane {
   const unclaimed = pending.filter((q) => q.claimedAt == null); // unclaimed only (claimedAt null)
   const toRow = (q: QueueRead): PulseLaneRow => {
-    const label = q.summary ?? bodyHead(q.body);
+    // A cross-host backlog row says so: on a hub the operator must know which
+    // machine the work is queued on, because claiming it happens THERE.
+    const label = `${q.hostId ? `${hostLabel(q.hostId)} ` : ""}${q.summary ?? bodyHead(q.body)}`;
     // drill to the seat the work is DESTINED for (destinationSession → agent).
     return { glyph: "○", token: "dim", label, action: seatRowAction(snap, q.destinationSession, `${q.destinationSession} · ${label}`) };
   };
@@ -361,28 +505,75 @@ function upNextLane(pending: QueueRead[], cap: number, snap: FleetSnapshot): Pul
 export function buildPulseModel(snap: FleetSnapshot, nowMs: number = Date.now()): PulseModel {
   const exceptions: PulseExceptionSection[] = [];
 
-  const needs = needsRows(snap.attention, nowMs);
+  // ▲ NEEDS YOU is the union of the two human-facing reads the shipped surface
+  // already serves: the LOCAL attention read (a hub that runs no rigs has none) and
+  // the FLEET read's REMOTE items. Deduped by qitem id, because the fleet read
+  // includes the local host and a local row must never show up twice.
+  const localNeeds = needsRows(snap.attention, nowMs);
+  const localNeedIds = new Set(snap.attention.map((row) => row.qitemId));
+  const needs = [...localNeeds, ...fleetNeedsRows(snap.needs, nowMs, localNeedIds)];
   // empty-strip-is-silence: a ran join with zero items is OMITTED (silence == zero)
   if (needs.length > 0) exceptions.push({ glyph: "▲", token: "error", label: "NEEDS YOU", rows: needs });
 
-  // ◌ PARKED WITH BATON — now a LIVE ran-join (arch 3a947fb1 landed the owner
-  // idle-age fact): in-progress qitems whose owner is idle and un-handed-off,
-  // idle-duration derived at the renderer. Zero parked = silence (OMITTED), like
-  // the other live joins — the incr-2 "read pending" placeholder is retired.
-  const seatBySession = new Map(snap.seatActivity.map((s) => [s.session, s]));
-  const attentionIds = new Set(snap.attention.map(row => row.qitemId));
-  const parked = parkedRows(snap.inProgress.filter(row => !attentionIds.has(row.qitemId)), seatBySession, nowMs);
+  // ◌ PARKED WITH BATON — a LIVE ran-join (arch 3a947fb1 landed the owner idle-age
+  // fact): in-progress qitems whose owner is idle and un-handed-off, idle-duration
+  // derived at the renderer. Zero parked = silence (OMITTED), like the other live
+  // joins — the incr-2 "read pending" placeholder is retired.
+  //
+  // CROSS-HOST: the fleet summary read answers per-seat activity on the remote host
+  // itself, which a local ps read cannot supply, so a remote in-progress row CAN join
+  // PARKED — keyed by host AND session, never by session alone. A remote row and a local
+  // seat can share a name, and painting a remote host's stranded baton under a local seat
+  // with no `[host]` label is worse than not joining at all. A remote row whose seat the
+  // fleet read did not answer for stays out: no signal is honest-unknown, never an
+  // assumed idle owner. A remote row already shown under NEEDS YOU is deduped out
+  // below, as a local one is. NOW stays local: it reads only this host's seat
+  // activity, so a remote row never joins it.
+  const localQueueIds = new Set(
+    [...snap.attention, ...snap.blocked, ...snap.inProgress, ...snap.pending, ...snap.recentlyFinished]
+      .map((row) => row.qitemId),
+  );
+  // A host that subscribes itself would otherwise show its own rows twice, once
+  // unlabelled and once labelled — the same id rule NEEDS YOU already applies.
+  const remote = snap.fleetQueue.filter((row) => !localQueueIds.has(row.qitemId));
+  const remoteWithState = (state: string) => remote.filter((row) => row.state === state);
+  const seatBySession = new Map<string, SeatActivitySummary>([
+    ...snap.seatActivity.map((s) => [seatKey(null, s.session), s] as [string, SeatActivitySummary]),
+    ...snap.remoteSeatActivity.map((s) => [seatKey(s.hostId, s.session), s] as [string, SeatActivitySummary]),
+  ]);
+  const remoteNeedIds = new Set(
+    snap.needs.filter((item) => item.hostId != null && item.hostId !== LOCAL_HOST_ID_SENTINEL).map((item) => item.qitemId ?? ""),
+  );
+  const attentionIds = new Set([...snap.attention.map(row => row.qitemId), ...remoteNeedIds]);
+  const parked = parkedRows(
+    [...snap.inProgress.filter(row => !attentionIds.has(row.qitemId)), ...remoteWithState("in-progress")],
+    seatBySession,
+    nowMs,
+  );
   if (parked.length > 0) exceptions.push({ glyph: "◌", token: "warn", label: "PARKED WITH BATON", rows: parked });
 
-  const blocked = blockedRows(snap.blocked.filter(row => !attentionIds.has(row.qitemId)), nowMs);
+  const blocked = blockedRows(
+    [...snap.blocked, ...remoteWithState("blocked")].filter(row => !attentionIds.has(row.qitemId)),
+    nowMs,
+  );
   if (blocked.length > 0) exceptions.push({ glyph: "⧗", token: PULSE_INFO_TOKEN, label: "BLOCKED ON AGENTS", rows: blocked });
+
+  // Composed BESIDE the items (hydrate), and previously rendered nowhere at all.
+  const down = hostsDownRows(snap.hostsDown);
+  if (down.length > 0) exceptions.push({ glyph: "✕", token: "error", label: "HOSTS DOWN", rows: down });
+
+  // ⚑ STALLED — the hub's verdict that a team holds open work and nothing has moved.
+  // Absent when nothing stalled AND when the read is unavailable; the two are told
+  // apart by snap.fleetProbed, which is why that flag exists.
+  const stalled = stalledRows(snap.stalled);
+  if (stalled.length > 0) exceptions.push({ glyph: "⚑", token: "warn", label: "STALLED", rows: stalled });
 
   const now = nowRows(snap.seatActivity, snap.inProgress, snap);
   const finished = finishedRows(snap.recentlyFinished, LANE_ROW_CAP, snap);
   const lanes: [PulseLane, PulseLane, PulseLane] = [
     { label: "NOW", count: now.length, rows: now },
     { label: "JUST FINISHED", count: finished.length, rows: finished },
-    upNextLane(snap.pending, LANE_ROW_CAP, snap),
+    upNextLane([...snap.pending, ...remoteWithState("pending")], LANE_ROW_CAP, snap),
   ];
 
   // Footer counts ARE the built referent sets (label==referent — never a second

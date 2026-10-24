@@ -1,4 +1,5 @@
 import { composeHumanUpdates, type DeliveredHumanUpdates } from "./attention/attention-model.js";
+import { fleetSummaryReaderTimeoutMs } from "@openrig/daemon/fleet";
 import { readTerminals } from "./terminals/terminal-model.js";
 import { fileTargetForPath } from "./reading.js";
 // Snapshot hydrator: maps the §4.A daemon reads (via DaemonClient, the one
@@ -20,7 +21,8 @@ import type { ConnectionsRead, ControlPlaneRead, SlackManifestRead } from "./con
 import type { UsageRead } from "./usage/usage-model.js";
 import { DaemonClient } from "./daemon-client.js";
 import { parse as parseYaml } from "yaml";
-import type { AgentRow, FleetSnapshot, HealthCoverage, HealthRecord, HostNode, NeedsItem, PodNode, QueueRead, RecentTransitionSnap, SeatActivitySummary, SeatEffortRead, SliceDetailSnap, SpecEntry, ViewState } from "./types.js";
+import type { AgentRow, FleetSnapshot, FleetSummaryRead, FleetUsageRead, HealthCoverage, HealthRecord, HostNode, NeedsItem, PodNode, QueueRead, RecentTransitionSnap, RigNode, SeatActivitySummary, SeatEffortRead, SliceDetailSnap, SpecEntry, ViewState } from "./types.js";
+import { LOCAL_HOST_ID_SENTINEL, RIG_DOWN_ID_PREFIX, remoteSeatAddress, FLEET_USAGE_TOP_ROWS } from "./types.js";
 import { isHumanSeatSession } from "./pulse/pulse-model.js";
 
 // Narrow read-shapes: just the served fields this module consumes (names match
@@ -160,6 +162,7 @@ interface NeedsYouItemRead {
   summary: string;
   leg: string;
   where: string;
+  ageIso?: string | null;
   destinationSession: string | null;
   derived: { kind: string; evidence: string; threshold: string } | null;
   qitemId: string | null;
@@ -173,6 +176,9 @@ interface ReviewFleetRead {
 }
 interface AttentionAggregateRead {
   hosts?: Array<{ hostId: string; status: string; error?: string }>;
+  /** The fan-out's queue rows, each stamped with its `hostId`. The TUI consumed
+   * `hosts` long before these; `toFleetQueueRead` is the items leg. */
+  items?: unknown[];
 }
 interface StreamItemRead {
   tsEmitted: string;
@@ -211,6 +217,42 @@ function toQueueRead(item: QueueItemRead): QueueRead {
     body: item.body ?? "",
     claimedAt: item.claimedAt,
     tsUpdated: item.tsUpdated,
+  };
+}
+
+/** The fan-out contract's local sentinel lives in types.ts as ONE constant; this is
+ * the only place the TUI needs it, and it is what makes "no local row appears twice"
+ * structural rather than a filter each call-site has to remember. */
+
+/** One attention-aggregate item → a PULSE `QueueRead`, REMOTE rows only.
+ *
+ * The item is another daemon's own attention-list row carried verbatim through the
+ * fan-out with `hostId` stamped on, so it crosses a wire and a version boundary: the fields the joins actually read are CHECKED, and a row that fails is
+ * DROPPED rather than rendered as a blank line. Rows stamped `local` are dropped
+ * here, which is what makes "no local row appears twice" structural rather than a
+ * filter each call-site has to remember. */
+function toFleetQueueRead(raw: unknown): QueueRead | null {
+  if (typeof raw !== "object" || raw === null) return null;
+  const item = raw as Partial<QueueItemRead> & { hostId?: unknown };
+  if (typeof item.qitemId !== "string" || item.qitemId === "") return null;
+  if (typeof item.state !== "string" || typeof item.destinationSession !== "string") return null;
+  const hostId = typeof item.hostId === "string" ? item.hostId : "";
+  if (hostId === "" || hostId === LOCAL_HOST_ID_SENTINEL) return null;
+  const text = (value: unknown): string | null => (typeof value === "string" ? value : null);
+  return {
+    qitemId: item.qitemId,
+    sourceSession: text(item.sourceSession),
+    state: item.state,
+    destinationSession: item.destinationSession,
+    blockedOn: text(item.blockedOn),
+    handedOffTo: text(item.handedOffTo),
+    tier: text(item.tier),
+    tags: Array.isArray(item.tags) ? (item.tags.filter((t): t is string => typeof t === "string")) : null,
+    summary: text(item.summary),
+    body: typeof item.body === "string" ? item.body : "",
+    claimedAt: text(item.claimedAt),
+    tsUpdated: typeof item.tsUpdated === "string" ? item.tsUpdated : "",
+    hostId,
   };
 }
 
@@ -322,6 +364,7 @@ function toNeedsItem(item: NeedsYouItemRead): NeedsItem {
     qitemId: item.qitemId,
     evidenceRef: item.evidenceRef,
     unblocks: item.unblocks,
+    ageIso: item.ageIso ?? null,
     ...(item.hostId ? { hostId: item.hostId } : {}),
   };
 }
@@ -367,7 +410,139 @@ function agentSpecTruth(raw?: string): { runtime?: string; skills: string[] } {
  * avoids re-reading every spec every refresh; the key rolls when the library
  * entry's updatedAt changes. Owned by the caller (instance-scoped, no module state). */
 export type SpecReviewCache = Map<string, SpecLibraryReviewRead>;
-export type HydrateViewContext = Pick<ViewState, "project" | "section" | "viewTab" | "drill" | "file" | "externalUrl" | "terminalView" | "attentionOpen" | "pendingDrill">;
+export type HydrateViewContext = Pick<ViewState, "project" | "section" | "viewTab" | "drill" | "file" | "externalUrl" | "terminalView" | "attentionOpen" | "pendingDrill" | "expanded">;
+
+/** What the fleet read remembers between polls, OWNED BY THE CALLER like
+ *  `reviewCache` — this file's convention is no module state, and module state here
+ *  would also leak across test cases and across clients in one process.
+ *
+ *  Two jobs, both about a TUI that polls:
+ *  - the last good payload, so one failed read does not blank STALLED and every remote
+ *    row for a frame and restore them on the next. Serving the previous answer is
+ *    honest only because the failure is NAMED in readErrors.
+ *  - the shape of the last answer, so the reader's next wait is derived from the
+ *    operator's REAL budget rather than the compiled defaults. `targetedHostIds`
+ *    counts unreachable hosts too; `items` does not, so the wait would shrink exactly
+ *    when hosts are timing out. */
+export interface FleetReadRetention {
+  last: FleetSummaryRead | null;
+  /** The usage read's own last good payload. Kept BESIDE `last` rather than inside it:
+   *  the two routes fail independently, and blanking one with the other's failure would
+   *  invent a fleet change that is only a read failure. */
+  lastUsage: FleetUsageRead | null;
+}
+
+/** The reader's wait for the next poll, from the last answer's own numbers. Cold start
+ *  has nothing to go on and uses the shared defaults, which is what the route would have
+ *  used had the operator configured nothing.
+ *
+ *  Typed on the three fields BOTH hub fan-outs echo rather than on one payload type, so
+ *  the summary and the usage read size their wait by the same rule and cannot drift into
+ *  waiting two different amounts for one fleet. */
+export function fleetReaderTimeoutFor(last: { targetedHostIds?: string[]; hostTimeoutMs?: number; concurrency?: number } | null): number {
+  if (!last) return fleetSummaryReaderTimeoutMs(1);
+  const hosts = last.targetedHostIds?.length || 1;
+  return fleetSummaryReaderTimeoutMs(hosts, last.hostTimeoutMs, last.concurrency);
+}
+
+/** Does this fleet have a REMOTE host at all? The usage read is asked only when it
+ *  does: an operator with one machine has nothing to add up, and nothing changes for a
+ *  single-machine operator — not even a fan-out's cost behind the change.
+ *
+ *  Sized from `targetedHostIds` rather than `items`, for the reason the summary's own
+ *  comment gives: `items` only carries hosts that ANSWERED, so a fleet whose one remote
+ *  host is timing out would look local exactly when the operator most needs the read.
+ *  A payload with no `targetedHostIds` is an older daemon's, and an older daemon has no
+ *  usage route to ask either, so "no remote hosts" is the honest answer, not a guess. */
+export function fleetHasRemoteHost(summary: FleetSummaryRead | null): boolean {
+  if (!summary) return false;
+  return (summary.targetedHostIds ?? []).some((id) => id !== LOCAL_HOST_ID_SENTINEL);
+}
+
+async function readFleetUsage(
+  client: DaemonClient,
+  summary: FleetSummaryRead | null,
+  retention: FleetReadRetention | undefined,
+): Promise<{ payload: FleetUsageRead | null; failed: string | null }> {
+  if (!fleetHasRemoteHost(summary)) {
+    // Drop the retained payload, do not merely stop reading. A fleet whose remotes were
+    // removed from the registry would otherwise hold its last answer indefinitely, and if
+    // a host were added back later and its first read failed, retention would serve that
+    // arbitrarily old payload as "the last successful read" — a stale fleet presented as
+    // a live one, which is the one thing this block must never do.
+    if (retention) retention.lastUsage = null;
+    return { payload: null, failed: null };
+  }
+  const last = retention?.lastUsage ?? null;
+  try {
+    // window_hours=1: the question this block answers is "which team is burning fastest
+    // RIGHT NOW". A wider window averages a finished burst into everything after it.
+    const payload = (await client.fleetUsage({
+      windowHours: 1,
+      top: FLEET_USAGE_TOP_ROWS,
+      optional: true,
+      timeoutMs: fleetReaderTimeoutFor(last),
+    })) as FleetUsageRead;
+    if (retention) retention.lastUsage = payload;
+    return { payload, failed: null };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    return fleetReadOutcome(message, last, "fleet-usage");
+  }
+}
+
+async function readFleetSummary(
+  client: DaemonClient,
+  retention: FleetReadRetention | undefined,
+): Promise<{ payload: FleetSummaryRead | null; failed: string | null }> {
+  const last = retention?.last ?? null;
+  try {
+    const payload = (await client.fleetSummary({
+      optional: true,
+      timeoutMs: fleetReaderTimeoutFor(last),
+    })) as FleetSummaryRead;
+    if (retention) retention.last = payload;
+    return { payload, failed: null };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    return fleetReadOutcome(message, last);
+  }
+}
+
+/** What a failed fleet read means. Three outcomes, and the difference between them is
+ *  the difference between an honest page and a confusing one:
+ *
+ *  - a 404 is an ABSENT FEATURE. Nothing is served and nothing is named: an operator on
+ *    an older daemon has no expectation to fail, and a status-line error every poll
+ *    would report a problem that does not exist.
+ *  - a real failure WITH a previous good read keeps that payload and says it is stale.
+ *    A poll that times out must not blank STALLED and the remote rows for one frame.
+ *  - a real failure with NOTHING previous reports the failure and serves nothing,
+ *    because there is no last known state to show.
+ */
+export function fleetReadOutcome(
+  message: string,
+  lastGood: FleetSummaryRead | null,
+  label?: string,
+): { payload: FleetSummaryRead | null; failed: string | null };
+export function fleetReadOutcome(
+  message: string,
+  lastGood: FleetUsageRead | null,
+  label: string,
+): { payload: FleetUsageRead | null; failed: string | null };
+export function fleetReadOutcome<T extends FleetSummaryRead | FleetUsageRead>(
+  message: string,
+  lastGood: T | null,
+  label = "fleet-summary",
+): { payload: T | null; failed: string | null } {
+  if (/→ 404/.test(message)) return { payload: null, failed: null };
+  return {
+    payload: lastGood,
+    failed: lastGood
+      ? `${label}: ${message}; showing the last successful read`
+      : `${label}: ${message}`,
+  };
+}
 
 export async function hydrateSnapshot(
   client: DaemonClient,
@@ -376,6 +551,10 @@ export async function hydrateSnapshot(
   sliceDetailName?: string | null,
   currentRigName?: string | null,
   viewContext?: HydrateViewContext,
+  // Appended rather than slotted in beside `reviewCache`: 94 call sites pass these
+  // positionally, and a mid-list insertion would silently re-point every one of them.
+  // Still caller-owned, which is the part that matters — no module state.
+  fleetRetention?: FleetReadRetention,
 ): Promise<FleetSnapshot> {
   const readErrors: string[] = [];
   async function safe<T>(label: string, fn: () => Promise<unknown>): Promise<T | null> {
@@ -383,6 +562,19 @@ export async function hydrateSnapshot(
       return (await fn()) as T;
     } catch (err) {
       readErrors.push(`${label}: ${err instanceof Error ? err.message : String(err)}`);
+      return null;
+    }
+  }
+
+/** Like safe(), for an ADDITIVE read whose absence is an expected state rather
+   * than a hydration failure — an older daemon that has no such route, a read the
+   * page uses only to enrich what already rendered. A miss leaves the page exactly
+   * as it was, so naming it in the status line would report a problem that is not
+   * one. A load-bearing read must use safe(), never this. */
+  async function optional<T>(fn: () => Promise<unknown>): Promise<T | null> {
+    try {
+      return (await fn()) as T;
+    } catch {
       return null;
     }
   }
@@ -495,6 +687,15 @@ export async function hydrateSnapshot(
   const wantsRecent = wantsTopologyScope && (!topologyLeaf || topologyLeaf.kind === "host" || topologyLeaf.kind === "rig");
   const focusedTopology = !!viewContext && wantsTopologyScope && viewContext.viewTab !== "pulse";
   const broadReads = !readingOnly && !focusedTopology && !wantsConnections;
+  // The fleet usage block is drawn on the hub's OWN instance page, which is a drilled
+  // topology leaf — and a drilled leaf is exactly what `focusedTopology` switches off.
+  // Gated on `broadReads` alone, the read fired only while PULSE was showing, a page that
+  // renders none of it, so the block could never appear. Gate the fan-outs on the page
+  // that draws them as well as on the broad view. A remote host's own page is included:
+  // the fan-out is the hub's, cached, and the render still refuses the block there.
+  const hostInstancePage = wantsTopologyScope && topologyLeaf?.kind === "host"
+    && viewContext?.viewTab !== "pulse";
+  const wantsFleetReads = broadReads || hostInstancePage;
   // Seat rows (Q / WORK / NOW) join these four lists: only a seat's page and the drilled table tab show them.
   const seatQueueReads = broadReads || (focusedTopology && (topologyLeaf?.kind === "agent" || (!!topologyLeaf && viewContext?.viewTab === "table")));
   const healthRequested = broadReads || viewContext?.viewTab === "health";
@@ -506,9 +707,27 @@ export async function hydrateSnapshot(
   const drillRig = [...(viewContext?.drill ?? [])].reverse().find((segment) => segment.kind === "rig")?.name
     ?? currentRigName
     ?? null;
-  const seatEffortRef = topologyLeaf?.kind === "agent" && drillRig ? `${topologyLeaf.name}@${drillRig}` : null;
+  // A seat on another host has no effort report here: this daemon would answer for a seat it does
+  // not run. The drilled host is remote when the last fleet read targeted it.
+  const drillHostName = viewContext?.drill.find((segment) => segment.kind === "host")?.name;
+  const drillsRemoteHost = !!drillHostName && drillHostName !== LOCAL_HOST_ID_SENTINEL
+    && (fleetRetention?.last?.targetedHostIds ?? []).includes(drillHostName);
+  const seatEffortRef = topologyLeaf?.kind === "agent" && drillRig && !drillsRemoteHost ? `${topologyLeaf.name}@${drillRig}` : null;
 
-  const [instanceHealth, healthProjection, agg, summaries, library, review, streamItems, attention, blocked, inProgress, pending, recentlyFinished, scopesRead, executionRead, sliceDetailRead, connectionsRead, seatEffortRead] = await Promise.all([
+  // The two hub-side fan-outs, CHAINED rather than parallel. The summary is what names
+  // the fleet's hosts, and the usage read must not be asked of a fleet that has no remote
+  // host to add up. Chaining costs one fan-out's latency on the slow path and buys that
+  // gate with no extra registry read; both legs hit the daemon's own short cache, so a
+  // steady-state poll pays it twice only when the fleet is actually being fanned out.
+  const fleetReads: Promise<{ summary: { payload: FleetSummaryRead | null; failed: string | null } | null; usage: { payload: FleetUsageRead | null; failed: string | null } | null }> =
+    !wantsFleetReads
+      ? Promise.resolve({ summary: null, usage: null })
+      : readFleetSummary(client, fleetRetention).then(async (summary) => ({
+          summary,
+          usage: await readFleetUsage(client, summary.payload, fleetRetention),
+        }));
+
+  const [instanceHealth, healthProjection, agg, summaries, library, review, streamItems, attention, blocked, inProgress, pending, fleetReadsResult, recentlyFinished, scopesRead, executionRead, sliceDetailRead, connectionsRead, seatEffortRead] = await Promise.all([
     safe<InstanceHealthRead>("health", () => client.health()),
     !healthRequested ? Promise.resolve(null) : safe<HealthProjectionRead>("health-findings", () => client.healthFindings()),
     !broadReads ? Promise.resolve(null) : safe<AttentionAggregateRead>("attention-aggregate", () => client.attentionAggregate()),
@@ -522,6 +741,12 @@ export async function hydrateSnapshot(
     !seatQueueReads ? Promise.resolve(null) : safe<QueueItemRead[]>("queue-in-progress", () => client.queueInProgress()),
     // PULSE UP NEXT + JUST FINISHED lane reads (increment 3) — same shipped /list route
     !seatQueueReads ? Promise.resolve(null) : safe<QueueItemRead[]>("queue-pending", () => client.queuePending()),
+    // The hub-side fleet summary: ONE fan-out answering reachability, per-seat
+    // activity on OTHER hosts, and the stall verdict. OPTIONAL — an older daemon
+    // 404s and every field below stays empty, which is what the page rendered
+    // before this read existed. The fleet USAGE read rides behind it, gated on the
+    // hosts this one names.
+    fleetReads,
     !broadReads ? Promise.resolve(null) : safe<QueueItemRead[]>("queue-recently-finished", () => client.queueRecentlyFinished()),
     !broadReads ? Promise.resolve(null) : safe<{ missions: unknown[]; sourceObservation?: { state: string } }>("scopes", () => client.scopesDetailed() as Promise<{ missions: unknown[] }>),
     !broadReads ? Promise.resolve(null) : safe<{ rows: unknown[] }>("execution", () => client.execution(executionMission ?? undefined) as Promise<{ rows: unknown[] }>),
@@ -538,6 +763,20 @@ export async function hydrateSnapshot(
     : null;
 
   const agentSpecNames = new Set((library ?? []).filter((entry) => entry.kind === "agent").map((entry) => entry.name));
+  // The fleet summary's own registry leg can fail while the local host still answers;
+  // that is a named partial hydration, not a silent narrowing of the fleet.
+  // A failed fleet read is NAMED, not swallowed: STALLED and the remote rows may be
+  // showing the last good read rather than the current state, and a reader is entitled
+  // to know that the sections they can see are not freshly confirmed.
+  const fleetSummary = fleetReadsResult?.summary?.payload ?? null;
+  if (fleetReadsResult?.summary?.failed) readErrors.push(fleetReadsResult.summary.failed);
+  if (fleetSummary?.registryError) readErrors.push(`fleet-summary registry: ${fleetSummary.registryError}`);
+  // The usage read failed the same way and gets the same treatment: the last good
+  // payload stands, and the failure is NAMED rather than left as a block that quietly
+  // stopped growing.
+  const fleetUsage = fleetReadsResult?.usage?.payload ?? null;
+  if (fleetReadsResult?.usage?.failed) readErrors.push(fleetReadsResult.usage.failed);
+  if (fleetUsage?.registryError) readErrors.push(`fleet-usage registry: ${fleetUsage.registryError}`);
   if (scopesRead?.sourceObservation?.state === "unavailable") readErrors.push("scopes: proof source updates unavailable; current HTTP basis only");
   if (review?.registryError) readErrors.push(`review-fleet registry: ${review.registryError}`);
   const recentTransitionsRig = currentRigName ?? (!viewContext ? summaries?.[0]?.name : null) ?? null;
@@ -621,7 +860,7 @@ export async function hydrateSnapshot(
       const st = await safe<RigStatusRead>(`rig-status(${rig.name})`, () => client.rigStatus(rig.id));
       const seatDetail = st && st.seatsTotal != null ? `${st.seatsRunning ?? 0}/${st.seatsTotal} seats running` : undefined;
       rigsDown.push({
-        hostId: `rig:${rig.name}`,
+        hostId: `${RIG_DOWN_ID_PREFIX}${rig.name}`,
         status: st?.status ? `${rig.lifecycleState} (${st.status})` : rig.lifecycleState,
         ...(seatDetail ? { error: seatDetail } : {}),
       });
@@ -641,16 +880,79 @@ export async function hydrateSnapshot(
       if (spec.name) rigSpecRefs.set(spec.name, refs);
     }
   }
-  const aggHosts = agg?.hosts ?? [];
+  // The aggregate's `hosts` leg is the ONLY thing that names the remote
+  // hosts, and it rode `broadReads` alone, so a remote host existed only in PULSE and
+  // vanished the moment it was drilled (drilling switches to the table tab, which reads
+  // narrowly). A daemon that runs NO rigs of its own is a hub, and the fleet view IS
+  // its product, so the topology scope reads the aggregate for it. Quietly: a failing
+  // aggregate leaves the local host alone rather than naming an error on every focused
+  // view. A machine that runs its own rigs pays nothing extra — that is where the
+  // 24-rig landing cost guard (navigation-continuity) lives, and it stays exact.
+  let fleetAgg = agg;
+  if (fleetAgg === null && wantsTopologyScope && (summaries?.length ?? 0) === 0) {
+    fleetAgg = await client.attentionAggregate().catch(() => null) as AttentionAggregateRead | null;
+  }
+  const aggHosts = fleetAgg?.hosts ?? [];
   const localHost: HostNode = {
     id: "local",
     name: instanceHealth?.selfHostId?.trim() || "local",
     reachable: true,
     rigs,
   };
-  const remoteHosts: HostNode[] = aggHosts
-    .filter((h) => h.hostId !== "local")
-    .map((h) => ({ id: h.hostId, name: h.hostId, reachable: h.status === "ok", rigs: [] }));
+  // A REACHABLE remote host expands to its rigs through the shipped
+  // read-through (the rigs-summary read with a host envelope), and a remote rig drills
+  // into its seats the same way (the nodes read with the same envelope). The origin
+  // answers VERBATIM, so the same local projection code (groupPods) maps both levels.
+  //
+  // Both reads are LAZY by construction: a remote host's rigs are read only
+  // while the operator has that host expanded or drilled, and a remote rig's seats
+  // only while that rig is expanded or focused. The cost per refresh therefore follows
+  // what the operator looks at, not the number of entries in hosts.yaml. An
+  // UNREACHABLE host is never dialled — the aggregate already said so — so a dead team
+  // costs one skipped read rather than a named read error every refresh.
+  const expandedKeys = new Set(viewContext?.expanded ?? []);
+  const drillHost = wantsTopologyScope ? viewContext?.drill.find((seg) => seg.kind === "host")?.name : undefined;
+  const drillRemoteRig = wantsTopologyScope ? viewContext?.drill.find((seg) => seg.kind === "rig")?.name : undefined;
+  // One task per host, and one per rig inside a host, so a single slow team cannot
+  // stall the whole hydrate behind a serial chain of 5s client timeouts (review N3).
+  // Promise.all keeps the emitted order identical to the aggregate's.
+  const remoteHosts: HostNode[] = await Promise.all(aggHosts
+    .filter((h) => h.hostId !== LOCAL_HOST_ID_SENTINEL)
+    .map(async (aggHost): Promise<HostNode> => {
+      const host: HostNode = { id: aggHost.hostId, name: aggHost.hostId, reachable: aggHost.status === "ok", rigs: [], remote: true };
+      if (!host.reachable || !wantsTopologyScope) return host;
+      if (!expandedKeys.has(`host:${host.name}`) && drillHost !== host.name) return host;
+      const remoteRigs = await safe<RigSummaryRead[]>(`rigs-summary(${host.id})`, () => client.rigsSummary(host.id));
+      if (remoteRigs === null) {
+        host.rigsUnavailable = true;
+        return host;
+      }
+      host.rigs = await Promise.all(remoteRigs.map(async (rig): Promise<RigNode> => {
+        const focused = expandedKeys.has(`rig:${host.name}/${rig.name}`) || (drillHost === host.name && drillRemoteRig === rig.name);
+        const nodes = focused
+          ? await safe<NodeInventoryRead[]>(`nodes(${host.id}/${rig.name})`, () => client.rigNodes(rig.id, host.id))
+          : null;
+        return {
+          id: rig.id,
+          name: rig.name,
+          remote: true,
+          hostId: host.id,
+          // A remote seat is READ-ONLY from here: stamp the address that reaches
+          // it so the renderer can print it where it would otherwise offer an action.
+          pods: nodes
+            ? groupPods(nodes).map((pod) => ({
+                ...pod,
+                agents: pod.agents.map((agent) => ({ ...agent, remoteAddress: remoteSeatAddress(host.id, agent.session) })),
+              }))
+            : [],
+          ...(!focused ? { inventoryNotLoaded: true } : nodes === null ? { inventoryUnavailable: true } : {}),
+          ...(rig.lifecycleState ? { lifecycleState: rig.lifecycleState } : {}),
+          hasLiveAgents: rig.hasLiveAgents ?? null,
+          authoredSpecName: undefined as string | undefined,
+        };
+      }));
+      return host;
+    }));
 
   // Specs: RIG + AGENT land well by consuming the existing structured review
   // for BOTH kinds. WORKFLOW remains basics. Reviews are memoized by updatedAt.
@@ -773,6 +1075,56 @@ export async function hydrateSnapshot(
   ];
   const execution = (executionRead?.rows?.[0] ?? null) as FleetSnapshot["execution"];
 
+  // The remote half of the PARKED join's right side. The local host's own seats are
+  // skipped — the local nodes read already carries them, and counting a seat twice
+  // would double the join. `activity` is the daemon's own classifier
+  // (working | idle | needs-input | unknown): only a definite "idle" becomes
+  // terminalActive:false, because an unknown signal is honest-unknown and is
+  // EXCLUDED from PARKED rather than assumed idle. This is what the cross-host join
+  // was missing when it refused to run at all.
+  const remoteSeatActivity: SeatActivitySummary[] = (fleetSummary?.items ?? [])
+    .filter((host) => host.hostId !== LOCAL_HOST_ID_SENTINEL && host.reachable)
+    .flatMap((host) => host.rigs.flatMap((rig) => rig.seats))
+    .filter((seat) => seat.canonicalSessionName != null)
+    .map((seat) => ({
+      session: seat.canonicalSessionName as string,
+      logicalId: seat.logicalId ?? (seat.canonicalSessionName as string),
+      terminalActive: seat.activity === "idle" ? false : seat.activity === "unknown" || seat.activity === null ? null : true,
+      lastActivityAt: seat.lastActivityAt,
+      hostId: seat.hostId,
+    }));
+
+  // The stall verdict, taken VERBATIM from the hub — the TUI does not recompute a
+  // threshold it was handed. A host and each of its rigs carry their own verdict.
+  //
+  // LOCAL rigs are excluded unless the operator actually has remote hosts. The brief
+  // is explicit that an operator with no remote hosts sees no change, and the daemon
+  // always computes a local verdict — so without this gate a single-machine operator
+  // whose own in-progress item went quiet would get a brand-new ⚑ STALLED section
+  // labelled with their own machine. Once remote hosts ARE present, the hub's own rigs
+  // are part of the fleet it is reporting on and may be marked too.
+  //
+  // The test is against the hosts the fan-out TRIED, not the ones that answered. `items`
+  // only holds hosts that answered, so with every remote host down the operator's own
+  // stalled rigs would vanish from a page that is supposed to be getting worse, not
+  // quieter — a fleet on fire and a fleet with no remote hosts would render the same.
+  const probedHostIds = fleetSummary?.targetedHostIds?.length
+    ? fleetSummary.targetedHostIds
+    : (fleetSummary?.hosts ?? []).map((h) => h.hostId);
+  const hasRemoteHosts = probedHostIds.some((id) => id !== LOCAL_HOST_ID_SENTINEL);
+  const stalledRows: FleetSnapshot["stalled"] = (fleetSummary?.items ?? []).flatMap((host) => {
+    if (!hasRemoteHosts) return [];
+    const threshold = fleetSummary?.stallThresholdMinutes ?? 0;
+    return [
+      ...(host.progress.stalled === true
+        ? [{ level: "host" as const, hostId: host.hostId, rigName: null, openWorkCount: host.progress.openWorkCount, minutesSinceProgress: host.progress.minutesSinceProgress, lastProgressAt: host.progress.lastQueueTransitionAt, thresholdMinutes: threshold }]
+        : []),
+      ...host.rigs
+        .filter((rig) => rig.progress.stalled === true)
+        .map((rig) => ({ level: "rig" as const, hostId: rig.hostId, rigName: rig.rigName, openWorkCount: rig.progress.openWorkCount, minutesSinceProgress: rig.progress.minutesSinceProgress, lastProgressAt: rig.progress.lastQueueTransitionAt, thresholdMinutes: threshold })),
+    ];
+  });
+
   return {
     connections: connectionsRead,
     // Keep the address even when the read failed: the detail page then says the
@@ -811,6 +1163,34 @@ export async function hydrateSnapshot(
         }
       : {}),
     attention: (attention ?? []).map(toQueueRead),
+    // Cross-host queue rows from BOTH cross-host reads, deduped by qitem id. The
+    // attention aggregate only carries rows whose attention class made them interesting
+    // to a human, so a remote row blocked on an AGENT or simply in progress is not in
+    // it — the fleet summary's openQueue is what makes those visible, which is the
+    // whole reason BLOCKED ON AGENTS and PARKED could not cover remote rows before.
+    fleetQueue: (() => {
+      const rows = (fleetAgg?.items ?? []).map(toFleetQueueRead).filter((row): row is QueueRead => row !== null);
+      const seen = new Set(rows.map((row) => row.qitemId));
+      for (const item of fleetSummary?.openQueue ?? []) {
+        if (seen.has(item.qitemId) || item.hostId === LOCAL_HOST_ID_SENTINEL) continue;
+        seen.add(item.qitemId);
+        rows.push({
+          qitemId: item.qitemId,
+          state: item.state,
+          destinationSession: item.destinationSession ?? "",
+          blockedOn: item.blockedOn,
+          handedOffTo: item.handedOffTo,
+          claimedAt: item.claimedAt,
+          tier: item.priority,
+          tags: item.tags,
+          summary: item.summary,
+          body: "",
+          tsUpdated: item.tsUpdated ?? "",
+          hostId: item.hostId,
+        });
+      }
+      return rows;
+    })(),
     queueCoverage: !seatQueueReads ? undefined
       : [attention, blocked, inProgress, pending].some(rows => rows === null) ? "unavailable"
       // Existing /list defaults cap the first three reads at 100; pending requests 50.
@@ -819,6 +1199,11 @@ export async function hydrateSnapshot(
     blocked: blockedResolved,
     inProgress: (inProgress ?? []).map(toQueueRead),
     seatActivity,
+    remoteSeatActivity,
+    stalled: stalledRows,
+    stallThresholdMinutes: fleetSummary?.stallThresholdMinutes,
+    fleetProbed: fleetSummary != null,
+    fleetUsage,
     pending: (pending ?? []).map(toQueueRead),
     recentlyFinished: (recentlyFinished ?? []).map(toQueueRead),
     hydratedAt: new Date().toISOString(),

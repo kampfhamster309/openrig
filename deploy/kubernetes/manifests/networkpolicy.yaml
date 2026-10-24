@@ -1,0 +1,43 @@
+# Nothing in the cluster may connect to the daemon; operators come in through
+# `kubectl port-forward`, which connects inside the pod and is not subject to this policy.
+# The hub adds one ingress exception for the team pods in networkpolicy-hub.yaml; this file owns
+# the egress rules for both the single host and the team pods (the hub has its own).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: openrig-host
+spec:
+  podSelector:
+    matchExpressions:
+      - { key: app, operator: In, values: [openrig-host, openrig-team] }
+  policyTypes: [Ingress, Egress]
+  ingress: []
+  egress:
+    # Cluster DNS.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - { protocol: UDP, port: 53 }
+        - { protocol: TCP, port: 53 }
+    # The local model server for Pi seats (kit/pi/models.json). Change it with that file.
+    - to:
+        - ipBlock:
+            cidr: 192.168.178.113/32
+      ports:
+        - { protocol: TCP, port: 8731 }
+    # The internet (model APIs, git, npm), but not the cluster, the k3d node network (where
+    # the API server is), the LAN, the tailnet or link-local metadata addresses.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              - 100.64.0.0/10
+              - 169.254.0.0/16

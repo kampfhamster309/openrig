@@ -18,7 +18,8 @@ import { createStyle, detectColorMode } from "./theme.js";
 import { stylizeLines } from "./stylize.js";
 import { createControlSocket, defaultSocketPath } from "./socket-server.js";
 import { demoSnapshot } from "./demo-data.js";
-import { DaemonClient, launchNodeNotice } from "./daemon-client.js";
+import { DaemonClient, launchNodeNotice, resolveQitemNotice } from "./daemon-client.js";
+import { remoteHostForQitem } from "./pulse/pulse-model.js";
 import { hydrateSnapshot } from "./hydrate.js";
 import { createLiveRefresh } from "./live.js";
 import { resolvePendingAddress } from "./pending-address.js";
@@ -38,7 +39,7 @@ import { StartupController } from "./startup.js";
 import { dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
 import type { Action, FleetSnapshot, Screen } from "./types.js";
-import type { SpecReviewCache } from "./hydrate.js";
+import type { FleetReadRetention, SpecReviewCache } from "./hydrate.js";
 import { MOTION_FRAME_MS } from "./visual-layout.js";
 import { launchProcess, runSpecLaunch } from "./specs/launch.js";
 import { runCopySession, processCopyTerminal } from "./print-for-copy.js";
@@ -116,6 +117,10 @@ async function run(): Promise<void> {
   // pure and takes the clock + owner state as inputs. motionTimer keeps
   // redrawing ONLY while the frame reports live motion (spinner or flash).
   const reviewCache: SpecReviewCache = new Map();
+  // Caller-owned, like reviewCache: the fleet read's last good payload and the shape of
+  // the fleet it came from, so the next poll sizes its wait from the operator's real
+  // budget rather than the compiled defaults.
+  const fleetRetention: FleetReadRetention = { last: null, lastUsage: null };
   const selectedSliceDirectory = (): string | null => {
     const current = view.get();
     if (current.scopesSelected) return current.scopesSelected.slice;
@@ -127,7 +132,7 @@ async function run(): Promise<void> {
   const selectedRigName = (): string | null =>
     view.get().drill.find((part) => part.kind === "rig")?.name ?? null;
   const live = client
-    ? createLiveRefresh({ scopeKey: () => pageReadKey(view.get()), hydrate: (page, signal) => hydrateSnapshot(client.forPage(page, signal), reviewCache, view.get().scopesMission, selectedSliceDirectory(), selectedRigName(), view.get()), onFrame: () => draw(), now: () => Date.now() })
+    ? createLiveRefresh({ scopeKey: () => pageReadKey(view.get()), hydrate: (page, signal) => hydrateSnapshot(client.forPage(page, signal), reviewCache, view.get().scopesMission, selectedSliceDirectory(), selectedRigName(), view.get(), fleetRetention), onFrame: () => draw(), now: () => Date.now() })
     : null;
   let motionTimer: NodeJS.Timeout | null = null;
   // S19 AM-R18 — the open view updates ITSELF: oracle pushes drive the refresh owner.
@@ -447,6 +452,12 @@ async function run(): Promise<void> {
           ? `Approved ${action.qitemId} as ${action.actorSession}: the request is closed on its own row.`
           : result.answer?.message ?? (result.answer?.outcome === "recorded" ? `Recorded on ${action.qitemId}. Still to answer: ${result.answer.unanswered.join("; ")}`
           : `Answered ${action.qitemId} as ${action.actorSession}: the answer went back to the asker, and the request is closed.`) });
+      } else if (action.act === "resolve-qitem") {
+        // Route by the host the fleet read served for THIS row; an id no remote row carries is the
+        // hub's own and the daemon answers honestly if that is wrong. Never a guessed host.
+        const hostId = remoteHostForQitem(snapshot, action.qitemId);
+        const result = await client.resolveQitem(action.qitemId, action.decision, hostId);
+        view.dispatch({ type: "notice", message: resolveQitemNotice(action.qitemId, hostId, result) });
       }
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);

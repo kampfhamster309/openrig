@@ -1,0 +1,21 @@
+{
+  "rows": [
+    {
+      "actionId": "act-1",
+      "actionVerb": "create",
+      "qitemId": "qitem-a",
+      "actorSession": "dispatcher@openrig",
+      "actedAt": "2026-10-23T20:00:20Z",
+      "beforeState": null,
+      "afterState": { "state": "pending" },
+      "reason": "ticket handed to the team",
+      "annotation": null,
+      "notifyAttempted": false,
+      "notifyResult": null,
+      "auditNotes": null,
+      "identityProvenance": "claimed:v1"
+    }
+  ],
+  "hasMore": false,
+  "nextBeforeId": null
+}

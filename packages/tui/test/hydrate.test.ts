@@ -153,6 +153,10 @@ const FIXTURES: Record<string, unknown> = {
   "/api/queue/list?attention=1": [],
 
   "/api/scopes?detail=1": { missions: [] },
+  // The hub-side fleet read. The fixture represents a CURRENT daemon, so the route is
+  // served; a daemon that does not have it is covered in hydrate-fleet-summary.test.ts,
+  // where the interesting claim is what the page does when the read is absent or fails.
+  "/api/fleet/summary": { items: [], hosts: [{ hostId: "local", status: "ok" }], openQueue: [], generatedAt: "2026-10-23T12:00:00.000Z", stallThresholdMinutes: 30, enabledProgressSources: ["queue-transition"] },
   "/api/views/execution": { rowCount: 1, rows: [{ view: "execution", mission: "release-0.5.8", q1_lanes: [], q2_sequencing: [], q4_ladder: [], q5_park: [], sources: {} }] },
   "/api/queue/list?state=blocked": [],
   // PULSE ◌ PARKED WITH BATON source (increment 2b) — in-progress qitems
@@ -330,6 +334,33 @@ describe("snapshot hydration over the §4.A reads (Phase 2)", () => {
     expect(snap.hosts.find((h) => h.id === "local")?.rigs.find((r) => r.name === "downrig")?.lifecycleState).toBe("recoverable");
   });
 
+  it("carries the attention aggregate's ITEMS as fleet rows, REMOTE ONLY", async () => {
+    // The TUI has fetched this payload for ages and used only its `hosts`. The items
+    // are another daemon's rows across a wire and a version boundary, so a row that
+    // cannot name itself is DROPPED rather than rendered blank, and the `local`-stamped
+    // leg is dropped because the local queue reads already carry it.
+    const row = (qitemId: string, hostId: string) => ({
+      qitemId, state: "blocked", destinationSession: "dev-a@t-host", blockedOn: null, handedOffTo: null,
+      tier: null, tags: ["ticket:demo"], summary: `work ${qitemId}`, body: "the full body",
+      claimedAt: null, tsUpdated: "2026-08-02T09:00:00.000Z", hostId,
+    });
+    const snap = await hydrateSnapshot(fixtureClient({}, {
+      "/api/queue/attention-aggregate": {
+        items: [
+          row("q-local", "local"),
+          row("q-remote", "t-hubtest-a"),
+          { qitemId: "", hostId: "t-hubtest-a" },
+          { hostId: "t-hubtest-a" },
+          "not an object",
+          { qitemId: "q-no-host" },
+        ],
+        hosts: [{ hostId: "local", status: "ok" }, { hostId: "t-hubtest-a", status: "ok" }],
+      },
+    }));
+    expect(snap.fleetQueue.map((q) => [q.qitemId, q.hostId])).toEqual([["q-remote", "t-hubtest-a"]]);
+    expect(snap.fleetQueue[0]).toMatchObject({ state: "blocked", summary: "work q-remote", body: "the full body", tags: ["ticket:demo"] });
+  });
+
   it("hydrates agent-spec structured detail from the LIVE /:id/review route (QA blocker 2)", async () => {
     const cache = new Map();
     const snap = await hydrateSnapshot(fixtureClient(), cache);
@@ -377,9 +408,11 @@ describe("snapshot hydration over the §4.A reads (Phase 2)", () => {
   it("maps the human-queue leg and marks it PROBED (proven-empty vs not-yet-known)", async () => {
     const snap = await hydrateSnapshot(fixtureClient());
     expect(snap.humanQueueProbed).toBe(true);
+    // ageIso rides VERBATIM from the composed read — it is the only date a remote
+    // row carries, and PULSE's age column depends on it.
     expect(snap.needs.filter((item) => item.source === "agent")).toEqual([
-      { source: "agent", kind: "human-routed", target: "human@kernel", detail: "approve slice 11 proof", hostId: "local", qitemId: "qitem-2026080201", evidenceRef: "proof/qa.md", unblocks: null },
-      { source: "agent", kind: "human-routed", target: "human@kernel", detail: "remote founder gate", hostId: "mm2-host", qitemId: "qitem-remote", evidenceRef: null, unblocks: null },
+      { source: "agent", kind: "human-routed", target: "human@kernel", detail: "approve slice 11 proof", hostId: "local", qitemId: "qitem-2026080201", evidenceRef: "proof/qa.md", unblocks: null, ageIso: "2026-08-02T08:40:00.000Z" },
+      { source: "agent", kind: "human-routed", target: "human@kernel", detail: "remote founder gate", hostId: "mm2-host", qitemId: "qitem-remote", evidenceRef: null, unblocks: null, ageIso: "2026-08-02T08:41:00.000Z" },
     ]);
   });
 

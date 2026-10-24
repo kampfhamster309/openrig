@@ -4,7 +4,8 @@
 > code. It is incomplete by design and it may be stale. Where it disagrees with the code, the code
 > is right; please fix the page. Every path, symbol, count and command below was checked against
 > commit `c750304f` (0.6.6 development). Each count shows the command that produced it, so you
-> can re-run it.
+> can re-run it. The section "The fleet and the Kubernetes deployment" was checked against commit
+> `990570367` on the `kubernetes-integration` branch.
 
 ## What OpenRig is
 
@@ -25,6 +26,7 @@ the right skills and context.
 | `packages/tui` | `@openrig/tui` (private) | The terminal UI | Copied into `@openrig/cli`; opened by `rig tui`, by bare `rig` in a terminal, or by the `openrig-tui` bin |
 | `packages/ui` | `@openrig/ui` (private) | The React web UI, in **maintenance mode**: it still ships and runs, but gets no new feature work. The CLI and TUI are the supported surfaces | Built files copied into `@openrig/cli` and served by the daemon |
 | `packages/test-system` | none (not an npm workspace) | The stub-agent scenario library, the CI scenario harness, live-model eval cases | Not shipped |
+| `deploy/kubernetes` | none (not an npm workspace) | The container image, manifests, the hub and the `rig-dispatch` script for running one team per ticket on Kubernetes | Not shipped; the image packs the CLI from the checkout |
 
 **What bundles what.** `packages/cli/package.json` publishes `LICENSE`, `dist`, `daemon`, `ui`,
 `tui` and `scripts`. `scripts/build-package.sh` (the CLI's `prepublishOnly`) builds the daemon, UI,
@@ -39,7 +41,9 @@ the `exports` field of `packages/daemon/package.json` (21 at this commit), for e
 uses 19 of them and the TUI uses 2. In development they resolve through the npm workspace. At
 package time `scripts/rewrite-daemon-imports.mjs` rewrites them to the shipped `daemon/dist` copy
 and fails the build on a specifier with no `exports` entry. To share new daemon code, add a
-`*-surface.ts` file and an `exports` entry.
+`*-surface.ts` file and an `exports` entry. The `kubernetes-integration` branch adds a 22nd,
+`@openrig/daemon/fleet` (`packages/daemon/src/fleet-surface.ts`), used by the CLI and the TUI (see
+"The fleet and the Kubernetes deployment").
 
 ## The request path
 
@@ -110,6 +114,96 @@ and fails the build on a specifier with no `exports` entry. To share new daemon 
 copy (`resolveDaemonPath` in `packages/cli/src/daemon-lifecycle.ts`), and the TUI launcher prefers
 `packages/tui/dist` (`packages/cli/src/front-door.ts`). Rebuild the package you changed. A daemon
 that is already running keeps running the code it started with.
+
+## The fleet and the Kubernetes deployment
+
+One daemon can already reach others: hosts listed in `$OPENRIG_HOME/hosts.yaml` are read through
+`?host=` (`packages/daemon/src/domain/hosts/read-through.ts`) and written to by forwarding queue and
+mission-control writes. The `kubernetes-integration` branch builds on that so one daemon, the
+**hub**, can answer for many: a fleet of short-lived teams, one per ticket, each its own host. The
+OpenRig changes are general multi-host work; only `deploy/kubernetes/` knows about Kubernetes.
+
+```
+  operator machine                         cluster
+  rig-dispatch ── kubectl exec ──────────▶ team pod t-<ticket>-0   (daemon :7433, seats, workspace)
+  rig / TUI ───── port-forward ──▶ hub-0 ── http + bearer per team ──▶ every team pod
+  Prometheus ─────────────────────▶   └─ /metrics
+```
+
+**The hub's reads** (`packages/daemon/src/domain/fleet/`, mounted in `server.ts`):
+
+- `GET /api/fleet/summary` (`fleet-summary.ts`, `composeFleetSummary`): per host, reachability,
+  rigs, seats, open queue items in every open state, and a progress verdict. It is composed only
+  from routes an older team daemon already serves (`/api/ps`, `/api/rigs/:id/nodes`,
+  `/api/queue/list`, `/api/queue/overdue`, `/api/queue/undelivered`, `/api/queue/recent` and the
+  item's transitions), so a team running an older image is fully represented.
+- **Progress** is a queue transition by a seat or a person, including a note-only update. System
+  actors (`isProgressActor`: `…@system`, `system`, `system:*`, `daemon@kernel`) do not count, and
+  terminal output deliberately does not either. A rig with open work and no progress for
+  `fleet.stall_threshold_minutes` is stalled.
+- `GET /api/fleet/usage` (`fleet-usage.ts`): each host's `/api/telemetry/usage/top`, summed only
+  where numbers add (`fleet-usage-math.ts`).
+- `GET /metrics` (`packages/daemon/src/routes/metrics.ts`, rendered by `fleet-metrics.ts`): both
+  reads as one Prometheus scrape target, metric names `openrig_fleet_*`. It sits behind the same
+  browser-boundary instance as `/api/*` and, on a non-loopback bind, the daemon's bearer.
+- **The fan-out** (`fleet-fanout.ts`) is shared by all three: a deadline per host, a concurrency
+  limit, and a single-flight cache (3 s fresh, served stale for up to 60 s while one refresh runs).
+  `createFleetReads()` in `routes/fleet.ts` builds one holder, so a scrape reuses the fan-out the
+  TUI already paid for. A host that does not answer is reported as unknown, never as zero.
+- **Settings** (`fleet-settings.ts`): `fleet.stall_threshold_minutes` (30),
+  `fleet.host_timeout_ms` (5000), `fleet.fanout_concurrency` (4). Each key exists twice, in the
+  daemon's `settings-store.ts` and the CLI's `config-store.ts`, and the two lists move together.
+
+**Writes from the hub.** `rig queue update --host` and `rig queue resolve --host` (and the TUI's
+`answer` on a remote item) forward to the team. `routes/relay-origin.ts` strips the caller's actor
+and any `auditNotes.openrig_relay` from the body and re-stamps them from the hub's own identity, so
+the team records the answer as the person who gave it, with the hub's host id in
+`auditNotes.openrig_relay`. A body claim cannot choose which host a write came from.
+
+**The read-through allowlist** (`READ_THROUGH_ALLOWLIST` in `read-through.ts`) gains exactly one path,
+`/api/telemetry/usage/series`, for `rig usage series --host`. Every other telemetry route stays
+refused, pinned by named negative tests. Widening it is a security decision, not a convenience.
+
+**The clients.**
+
+- `rig ps --all-hosts` and `rig usage top --all-hosts` ask the local daemon for the fleet read
+  first (`tryHubFleetRead` in `packages/cli/src/lib/fleet-hub-read.ts`). They fall back to dialling
+  every host themselves only when the daemon does not serve the route; `rig usage top --json` says
+  which ran in `source`.
+- The TUI (`packages/tui/src/hydrate.ts`) reads both routes when the daemon serves them. PULSE gains
+  the fleet's NEEDS YOU items with a `[host]` label, BLOCKED ON AGENTS, PARKED and STALLED, and the
+  instance page gains FLEET USAGE. The topology expands reachable remote hosts into rigs and seats.
+- `@openrig/daemon/fleet` (`fleet-surface.ts`) carries what clients must not reimplement: how long
+  a reader waits for the summary (`fleetSummaryReaderTimeoutMs`, derived from the fan-out's worst
+  case) and the usage arithmetic the CLI's fallback uses, so hub and CLI report the same totals.
+
+**The deployment** (`deploy/kubernetes/`):
+
+| Path | What it is |
+|---|---|
+| `image/`, `build-image.sh` | Node 22, tmux, git, the agent CLIs and OpenRig packed from this checkout. The entrypoint clones the workspace on first boot, writes the terminal token and runs the daemon in the foreground. Tags are `<version>-<commit>`. |
+| `kustomization.yaml`, `kit/` | Shared objects and the `openrig-kit` ConfigMap: the rig spec every team runs, mounted at `/etc/openrig-kit`. |
+| `manifests/` | Namespace, the headless `teams` Service, and NetworkPolicies: only the hub reaches a team's port 7433, nothing reaches the hub, and egress is DNS and public addresses. |
+| `hub/` | StatefulSet `hub-0`: the same image with no rigs (`OPENRIG_NO_KERNEL=1`), bound to loopback, reached by port-forward. Its `hosts.yaml` lists every team over the `http` transport with one bearer file each. |
+| `dispatcher/rig-dispatch` | Bash on the operator machine; it reaches pods only through `kubectl exec` and keeps ticket state in labels and annotations. `start` creates StatefulSet `t-<slug>`, brings the rig up, hands over the brief and registers the team on the hub; `status`, `wait` and `watch` (the team's event stream, resumed by `Last-Event-ID`) follow it; `answer` goes through the hub; `archive`, `collect` and `report` keep the history and the result as a git bundle; `delete` refuses without a complete, current archive and unregisters the team; `hub-sync` repairs the hub's registry when it has drifted from the teams that exist. Every hub registry edit runs under one `flock` in the hub pod. |
+| `dispatcher/test/` | `archive-test.sh`, `watch-test.sh` and `hub-sync-test.sh`, run against `fake-kubectl` with recorded responses; no cluster needed. |
+| `docs/` | Architecture, setup, operating, monitoring, reference and troubleshooting for the deployment. |
+
+**Where to add things here.**
+
+- **A field in the fleet summary:** read it from a route older daemons already serve, add it to
+  `fleet-summary-types.ts`, and treat a host that lacks it as unknown. A new route on the team side
+  means every team running an older image reports nothing for it.
+- **A metric:** add it to `renderFleetMetrics` in `fleet-metrics.ts` with its `HELP` text, from
+  the summary or usage payload only; the metrics route must not start a fan-out of its own. Tests:
+  `packages/daemon/test/fleet-metrics.test.ts` and `fleet-metrics-route.test.ts`.
+- **A dispatcher command:** add `cmd_<name>` in `rig-dispatch`, its usage line in the header, a case
+  in the test scripts, and a row in `deploy/kubernetes/docs/reference.md`. Keep exit codes stable:
+  operators script against them.
+
+[deploy/kubernetes/docs/architecture.md](deploy/kubernetes/docs/architecture.md) covers the
+deployment's design, security model and what is not built yet;
+[deploy/kubernetes/README.md](deploy/kubernetes/README.md) is the entry point for running it.
 
 ## Key counts
 
@@ -329,5 +423,7 @@ packages.
 - [docs/as-built/arteries.md](docs/as-built/arteries.md): the areas where a small change has a
   large effect, what depends on them, and what broke there before.
 - [packages/test-system/ci/README.md](packages/test-system/ci/README.md): the CI scenario job.
+- [deploy/kubernetes/README.md](deploy/kubernetes/README.md): running OpenRig on Kubernetes, one
+  team per ticket with a hub; setup, operation and monitoring are under `deploy/kubernetes/docs/`.
 - [docs/releases/](docs/releases/) and [CHANGELOG.md](CHANGELOG.md): release history, written by
   the maintainers at release time.

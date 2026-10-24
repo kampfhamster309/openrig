@@ -14,6 +14,7 @@ import { QueueRepositoryError, newQitemId, deriveCrossHostSuccessorId, stampSelf
 import type { QueueItem, QueueCreateInput } from "../domain/queue-repository.js";
 import { parseSessionName, isHumanSeatSessionRef } from "../domain/session-name.js";
 import { requireSenderIdentity, resolveRecordedProvenance, ORIGIN_UNKNOWN_HEADER, transportSenderSession } from "./require-sender-identity.js";
+import { relayForwardHeaders } from "./relay-origin.js";
 import { hostname as osHostname } from "node:os";
 import type { InboxHandler } from "../domain/inbox-handler.js";
 import { InboxHandlerError } from "../domain/inbox-handler.js";
@@ -275,6 +276,10 @@ export function queueRoutes(): Hono {
     hostId: string,
     path: string,
     forwardBody: Record<string, unknown>,
+    // A write whose actor the ORIGIN must not take from the body (update,
+    // unlike create/handoff, derives it from the transport header) needs the relay identity
+    // re-stamped here. Additive: create and handoff pass nothing and forward byte-identically.
+    extraHeaders?: Record<string, string>,
   ): Promise<
     | { ok: true; payload: unknown; status: number }
     | { ok: false; response: Response }
@@ -315,7 +320,10 @@ export function queueRoutes(): Hono {
       body: forwardBody,
       timeoutMs: QUEUE_FORWARD_TIMEOUT_MS,
       fetchImpl,
-      headers: c.req.header(ORIGIN_UNKNOWN_HEADER) === "true" ? { [ORIGIN_UNKNOWN_HEADER]: "true" } : undefined,
+      headers: {
+        ...(c.req.header(ORIGIN_UNKNOWN_HEADER) === "true" ? { [ORIGIN_UNKNOWN_HEADER]: "true" } : {}),
+        ...(extraHeaders ?? {}),
+      },
     });
     if (res.ok) {
       // The origin daemon's structured response, verbatim — its row is the
@@ -698,6 +706,9 @@ export function queueRoutes(): Hono {
       wakeAfterSeconds?: number;
       summary?: string | null;
       evidenceRef?: string | null;
+      // Out-of-band host envelope, same shape as create/handoff: absent / "" / "local" /
+      // this daemon's own id = today's local write byte-for-byte; a registered remote id forwards.
+      hostId?: string;
     }>().catch(() => ({} as never));
     // P21 I3 — the actor is the transport-derived sender (X-OpenRig-Session), NEVER a body claim.
     // P18 deliver-and-label: absent header + a body actor → claimed:v1; absent + no body → 400
@@ -707,6 +718,24 @@ export function queueRoutes(): Hono {
     if (!identity.ok) return identity.response;
     const actorSession = identity.session;
     { const held = switchCustody(c, actorSession); if (held) return held; }
+
+    // The cross-host leg. Same forward-then-strip mechanism as create/handoff,
+    // with the identity re-stamp mission-control already does: the body's actor claim is STRIPPED and
+    // the origin derives the actor from the header THIS daemon stamps from its own authenticated
+    // context. A caller therefore cannot put a forged actor on another host's row — the wire decides,
+    // one hop away, and `resolveRecordedProvenance` degrades the claim to relay:v1/claimed:v1.
+    if (typeof body.hostId === "string" && !resolvesToLocalHost(body.hostId, getSelfHostId())) {
+      const { hostId: _droppedHost, actorSession: _droppedClaim, ...forwardBody } = body;
+      const fwd = await forwardQueueWrite(
+        c,
+        body.hostId,
+        `/api/queue/${encodeURIComponent(qitemId)}/update`,
+        forwardBody,
+        relayForwardHeaders(identity, getSelfHostId()),
+      );
+      if (!fwd.ok) return fwd.response;
+      return c.json(fwd.payload as Record<string, unknown>, fwd.status as 200);
+    }
 
     try {
       const fence = classificationRefusal(c, actorSession, body.classificationBinding);

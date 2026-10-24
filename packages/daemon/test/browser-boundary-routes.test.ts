@@ -124,6 +124,35 @@ describe("browser boundary on the real route table", () => {
     expect(((await r.json()) as { code: string }).code).toBe("browser_origin_refused");
   });
 
+  it("GET /metrics gets the same target-name refusal as the fleet read it composes", async () => {
+    // The scrape publishes the same fleet data `/api/fleet/summary` does, so a page that
+    // rebinds its own hostname to loopback must not read it here while that read refuses
+    // it. This is the real route table, so it proves the mount rather than a copy of it.
+    const b = build();
+    const rebinding = { Host: "evil.example:7433", Origin: "http://evil.example:7433" };
+    const summary = await req(b.app, "/api/fleet/summary", rebinding);
+    const scrape = await req(b.app, "/metrics", rebinding);
+    expect(summary.status).toBe(403);
+    expect(scrape.status).toBe(403);
+    expect(((await scrape.json()) as { code: string }).code)
+      .toBe(((await summary.json()) as { code: string }).code);
+    // A loopback scrape is untouched by the boundary. The test app has no fleet services,
+    // so reaching the handler at all (any non-refusal) is the claim being made here.
+    const loop = await req(b.app, "/metrics", { Host: "127.0.0.1:7433" });
+    expect(loop.status).not.toBe(403);
+  });
+
+  it("GET /metrics: a valid bearer waives the name check, a wrong one does not", async () => {
+    // This is what keeps an authenticating Prometheus working when it addresses the hub by
+    // a cluster DNS name: the same rule `/api/fleet/*` already has.
+    const b = build({ terminalBearerToken: "scrape-token" });
+    const ok = await req(b.app, "/metrics", { Host: "custom.example:7433", Authorization: "Bearer scrape-token" });
+    expect(ok.status).not.toBe(403);
+    expect(ok.status).not.toBe(401);
+    const wrong = await req(b.app, "/metrics", { Host: "custom.example:7433", Authorization: "Bearer nope" });
+    expect(wrong.status).toBe(403);
+  });
+
   it("a waived target name keeps downstream route authorization: wrong-route token still refused by the route", async () => {
     const b = build({ missionControlBearerToken: "mc-token", terminalBearerToken: "term-token" });
     const body = { session: "dev-impl@rig", text: "fixture" };

@@ -1,0 +1,61 @@
+version: "0.2"
+name: claude-pi-k8s
+summary: >
+  The claude-pi-duo team on a Kubernetes pod: a Claude Code lead organizes the
+  work, a Pi builder on the local strix_halogen model implements, and a Claude
+  Code reviewer checks the result. The pod entrypoint seeds the Pi seat's
+  models.json and heartbeat extension (OPENRIG_PI_SEATS=dev-build@claude-pi-k8s);
+  the lead checks the builder with /etc/openrig-kit/bin/pi-seat-status.
+# Nobody sits at these terminals to answer permission prompts, and the pod is the sandbox:
+# it holds no Git push credentials and only the secrets in its Secret.
+permission_policy: builtin:yolo
+non_interruptive: true
+
+pods:
+  - id: orch
+    label: Orchestration
+    members:
+      - id: lead
+        agent_ref: "path:/usr/local/lib/node_modules/@openrig/cli/daemon/specs/agents/orchestration/orchestrator"
+        runtime: claude-code
+        profile: default
+        cwd: /home/openrig/work/project
+        startup:
+          files:
+            - path: guidance/lead-monitoring.md
+              delivery_hint: send_text
+              required: true
+              applies_on: [fresh_start, restore]
+    edges: []
+
+  - id: dev
+    label: Development
+    members:
+      - id: build
+        agent_ref: "path:/usr/local/lib/node_modules/@openrig/cli/daemon/specs/agents/development/implementer"
+        runtime: pi
+        model: strix_halogen/halogen-qwen3.8-flash-next
+        profile: default
+        cwd: /home/openrig/work/project
+    edges: []
+
+  - id: review
+    label: Review
+    members:
+      - id: r1
+        agent_ref: "path:/usr/local/lib/node_modules/@openrig/cli/daemon/specs/agents/review/independent-reviewer"
+        runtime: claude-code
+        profile: default
+        cwd: /home/openrig/work/project
+    edges: []
+
+edges:
+  - kind: delegates_to
+    from: orch.lead
+    to: dev.build
+  - kind: delegates_to
+    from: orch.lead
+    to: review.r1
+  - kind: can_observe
+    from: review.r1
+    to: dev.build

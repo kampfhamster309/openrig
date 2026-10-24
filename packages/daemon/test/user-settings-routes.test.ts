@@ -129,13 +129,21 @@ describe("config routes (User Settings v0)", () => {
     // + 1 daemon.db_conflict (warn by default; optional pre-open conflict stop).
     // + 1 provider.selected (the providers chosen at rig setup --providers; default empty).
     // + 2 retention.stream_days / stream_max_items (slice 22 outcome 9 stream retention; default 30, 20000).
-    expect(Object.keys(body.settings).length).toBe(92);
-    expect(body.settings["retention.stream_days"]).toMatchObject({ value: 30, source: "default", defaultValue: 30 });
+        expect(body.settings["retention.stream_days"]).toMatchObject({ value: 30, source: "default", defaultValue: 30 });
     expect(body.settings["retention.stream_max_items"]).toMatchObject({ value: 20000, source: "default", defaultValue: 20000 });
     expect(body.settings["decisions.enabled"]).toMatchObject({ value: false, source: "default", defaultValue: false });
     expect(body.settings["provider.selected"]).toMatchObject({ value: "", source: "default", defaultValue: "" });
     expect(body.settings["terminal.history_limit"]).toMatchObject({ value: 10000, source: "default", defaultValue: 10000 });
     expect(body.settings).not.toHaveProperty("provider.subscription_moves");
+    // + 1 fleet.stall_threshold_minutes (the fleet read's stall threshold).
+    // + 1 fleet.host_timeout_ms (the fleet read's per-host deadline).
+    // + 1 fleet.fanout_concurrency (how many hosts the hub dials at once).
+    expect(Object.keys(body.settings).length).toBe(95);
+    // Named as well as counted: a bare tally would pass for a key that exists but has
+    // no default, which is the exact shape that makes a key unwritable.
+    expect(body.settings["fleet.stall_threshold_minutes"]).toMatchObject({ value: 30, source: "default" });
+    expect(body.settings["fleet.host_timeout_ms"]).toMatchObject({ value: 5000, source: "default" });
+    expect(body.settings["fleet.fanout_concurrency"]).toMatchObject({ value: 4, source: "default" });
     expect(body.settings["launch.non_interruptive"]).toMatchObject({ value: false, source: "default" });
     expect(body.settings["runtime.readiness_timeout_seconds"]).toMatchObject({ value: 30, source: "default" });
     expect(body.settings["ui.enabled"]).toMatchObject({ value: false, source: "default" });

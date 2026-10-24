@@ -1,0 +1,46 @@
+[
+  {
+    "qitemId": "qitem-a",
+    "state": "done",
+    "destinationSession": "orch-lead@demo-rig",
+    "tags": [
+      "ticket:demo"
+    ],
+    "summary": "the ticket"
+  },
+  {
+    "qitemId": "qitem-b",
+    "state": "done",
+    "destinationSession": "review-r1@demo-rig",
+    "tags": [
+      "ticket:demo",
+      "review"
+    ],
+    "summary": "the review of the ticket"
+  },
+  {
+    "qitemId": "qitem-unrelated",
+    "state": "pending",
+    "destinationSession": "orch-lead@demo-rig",
+    "tags": [
+      "ticket:elsewhere"
+    ],
+    "summary": "a different ticket, must not be archived"
+  },
+  {
+    "qitemId": "qitem-review-untagged",
+    "state": "done",
+    "destinationSession": "review-r1@demo-rig",
+    "tags": [
+      "review"
+    ],
+    "summary": "a review the team opened itself, carrying no ticket tag"
+  },
+  {
+    "qitemId": "qitem-recovery-1f2e3d4c",
+    "state": "done",
+    "destinationSession": "review-r1@demo-rig",
+    "tags": [],
+    "summary": "a stuck-sweep recovery row addressed to a review seat"
+  }
+]

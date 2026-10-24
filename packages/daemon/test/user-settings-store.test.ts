@@ -194,6 +194,13 @@ describe("SettingsStore (User Settings v0)", () => {
       "queue.wake_unconfirmed_window_minutes",
       "queue.wake_swap_grace_seconds",
       "queue.wake_human_rung",
+      // The fleet read's stall threshold; daemon + CLI twins in lockstep.
+      "fleet.stall_threshold_minutes",
+      // The fleet read's own transport budget, also daemon + CLI twins. Both are
+      // operator-tunable because the right deadline depends on how far the hosts are,
+      // and a fan-out that gives up too early reports a live team as unreachable.
+      "fleet.host_timeout_ms",
+      "fleet.fanout_concurrency",
     ]);
   });
 

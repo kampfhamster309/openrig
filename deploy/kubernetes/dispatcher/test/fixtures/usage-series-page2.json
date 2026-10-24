@@ -1,0 +1,34 @@
+{
+  "rows": [
+    {
+      "id": 100,
+      "lane": "context",
+      "seatSession": "orch-lead@demo-rig",
+      "nodeId": "n-1",
+      "source": "pi",
+      "sampledAt": "2026-10-23T21:00:00Z",
+      "capturedAt": "2026-10-23T21:00:00Z",
+      "totalInputTokens": 5000,
+      "totalOutputTokens": 100,
+      "usedPercentage": 12,
+      "window": null,
+      "windowUsedPercent": null,
+      "resetsAt": null
+    },
+    {
+      "id": 101,
+      "lane": "context",
+      "seatSession": "orch-lead@demo-rig",
+      "nodeId": "n-1",
+      "source": "pi",
+      "sampledAt": "2026-10-23T21:01:00Z",
+      "capturedAt": "2026-10-23T21:01:00Z",
+      "totalInputTokens": 5001,
+      "totalOutputTokens": 200,
+      "usedPercentage": 18,
+      "window": null,
+      "windowUsedPercent": null,
+      "resetsAt": null
+    }
+  ]
+}

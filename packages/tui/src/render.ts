@@ -37,6 +37,7 @@ import { terminalLines } from "./terminals/terminal-model.js";
 import { detailPage, fieldLine, sectionRule, listItem, alignedRow, LABEL_W, wrapDetailLines } from "./detail.js";
 import { healthAgentLines, healthDetailLines, healthListLines, healthSummaryLine } from "./health/health-model.js";
 import type { Action, FleetSnapshot, LoadState, NeedsItem, RecentTransitionSnap, RowFlash, Screen, SeatEffortRead, ViewState } from "./types.js";
+import { FLEET_USAGE_TOP_ROWS } from "./types.js";
 
 interface ContentLine {
   text: string;
@@ -254,8 +255,14 @@ function operationalState(status: string, motion: MotionCtx): { mark: string; wo
   return { mark: "?", word: "unknown" };
 }
 
-function queueFacts(snap: FleetSnapshot, session: string | null | undefined): { count: number; work: string; now: string } {
+function queueFacts(snap: FleetSnapshot, session: string | null | undefined, remote = false): { count: number; work: string; now: string } {
   if (!session) return { count: 0, work: "—", now: "—" };
+  // A REMOTE seat's queue lives on its own daemon. These four lists are LOCAL reads, so
+  // joining them on a bare session name would paste a local seat's rows onto a remote
+  // one the moment both exist. No read here gives a remote seat's queue per seat, so the
+  // cell says so rather than guessing. The fleet summary does carry remote open rows;
+  // this cell does not use them yet.
+  if (remote) return { count: 0, work: "remote", now: "queue not served here" };
   const sources: Array<["needs you" | "blocked" | "working" | "queued", FleetSnapshot["attention"]]> = [
     ["needs you", snap.attention], ["blocked", snap.blocked], ["working", snap.inProgress], ["queued", snap.pending],
   ];
@@ -350,11 +357,22 @@ function agentDetailLines(
 ): ContentLine[] {
   const { agent, rig, pod } = found;
   const session = agent.session;
+  // A seat read through a REMOTE host is read-only from here: the
+  // daemon that can act on it is elsewhere, so the local write affordances are replaced
+  // by the address that reaches it, and the local queue joins are skipped rather than
+  // guessed.
+  const remote = !!found.host.remote;
   const specInLibrary = !!agent.spec && !!findSpec(snap, agent.spec, "agent");
-  const currentRows = session ? rowsForAgent(snap, session, [snap.attention, snap.blocked, snap.inProgress]) : [];
-  const pendingRows = session ? rowsForAgent(snap, session, [snap.pending]) : [];
-  const recentRows = session ? rowsForAgent(snap, session, [snap.recentlyFinished]) : [];
-  const needs = session ? snap.needs.filter((item) => item.target === session) : [];
+  const currentRows = session && !remote ? rowsForAgent(snap, session, [snap.attention, snap.blocked, snap.inProgress]) : [];
+  const pendingRows = session && !remote ? rowsForAgent(snap, session, [snap.pending]) : [];
+  const recentRows = session && !remote ? rowsForAgent(snap, session, [snap.recentlyFinished]) : [];
+  // Needs-You rows DO carry fleet provenance, so a remote seat joins them
+  // when the host matches; a local seat keeps today's unqualified join.
+  const needs = session
+    ? remote
+      ? snap.needs.filter((item) => item.target === session && item.hostId === found.host.id)
+      : snap.needs.filter((item) => item.target === session)
+    : [];
   const visibleAssigned = new Set([...currentRows, ...pendingRows].map(row => row.qitemId)).size;
   const assigned = agent.assignedWorkCount ?? visibleAssigned;
   const pending = agent.pendingWorkCount ?? pendingRows.length;
@@ -399,11 +417,16 @@ function agentDetailLines(
           fieldLine({ label: "meter", value: context == null ? "— (not yet known)" : `${context}% used  ${barCells(context / 100, meterWidth)}` }),
           fieldLine({ label: "tokens", value: `${number(agent.totalInputTokens)} input · ${number(agent.totalOutputTokens)} output · ${number(agent.contextWindowSize)} window` }),
           runtimeLine,
-          // #1347 — four values stay distinguishable on one wrapped row. "applied"
-          // appears only for outcome `accepted`; unknowns stay unknown.
-          ...wrapDetailValue("effort", effortDetailText(effortReport, agent), contentWidth),
-          ...(agent.attach ? [fieldLine({ label: "attach", value: agent.attach })] : []),
-          fieldLine({ label: "terminal", value: `Open terminals ▸ pod ${pod.name}`, link: { type: "act", act: "open-terminal", view: `pod:${rig.name}/${pod.name}` } }),
+          ...(remote
+            ? [fieldLine({ label: "reach", value: agent.remoteAddress ? `rig capture|send ${agent.remoteAddress}` : "no canonical session served — this remote seat has no address to print" })]
+            : [
+                // #1347 — four values stay distinguishable on one wrapped row. "applied"
+                // appears only for outcome `accepted`; unknowns stay unknown. Local seats only:
+                // the effort report is read from this daemon, which does not run a remote seat.
+                ...wrapDetailValue("effort", effortDetailText(effortReport, agent), contentWidth),
+                ...(agent.attach ? [fieldLine({ label: "attach", value: agent.attach })] : []),
+                fieldLine({ label: "terminal", value: `Open terminals ▸ pod ${pod.name}`, link: { type: "act", act: "open-terminal", view: `pod:${rig.name}/${pod.name}` } }),
+              ]),
         ],
       },
       {
@@ -423,7 +446,7 @@ function agentDetailLines(
           rigId: rig.id ?? rig.name,
           seatId: agent.nodeId ?? null,
           seatName: agent.name,
-          local: found.host === snap.hosts[0],
+          local: !found.host.remote,
         }, contentWidth),
       },
       { title: `CURRENT WORK · ${currentRows.length}${queueIncomplete(snap) ? " sampled" : ""}`, lines: workRows(currentRows, contentWidth, queueIncomplete(snap)) },
@@ -605,21 +628,6 @@ function specTabsLine(state: ViewState): ContentLine {
   };
 }
 
-function needsLine(prefix: string, item: NeedsItem, snap: FleetSnapshot): ContentLine {
-  // aligned columns (glance speed): kind · host · target · detail — same fact,
-  // same visual place, every row
-  const found = findAgentBySession(snap, item.target, item.hostId);
-  const cols = alignedRow([
-    [item.kind, 16],
-    [item.hostId ? `[${item.hostId}]` : "", 11],
-    [item.target, 34],
-  ]);
-  return {
-    text: `${prefix}${cols} ${item.detail}${found ? "  (open ▸)" : ""}`,
-    ...(found ? { action: { type: "drill", resource: "agent", name: found.agent.name, target: { host: found.host.name, rig: found.rig.name, pod: found.pod.name } } as const } : {}),
-  };
-}
-
 function sourceProvenance(spec: FleetSnapshot["specs"][number]): string {
   if (spec.sourceType === "builtin") return "built-in library";
   if (spec.sourceType === "user_file") return "user library";
@@ -694,6 +702,78 @@ interface MotionCtx {
   loading: boolean;
 }
 
+/** Compact token count for the fleet usage block: `12.4k`, `940`. Pinned to a fixed
+ *  format rather than toLocaleString so the padded columns hold in every operator
+ *  locale — a grouping mark changing width shifts every aligned cell beside it. */
+function usageTokens(value: number): string {
+  if (!Number.isFinite(value)) return "—";
+  if (Math.abs(value) >= 1000) return `${(value / 1000).toFixed(1)}k`;
+  return String(Math.round(value));
+}
+
+/** FLEET USAGE — the hub's answer to "which team is burning fastest right now".
+ *
+ *  WHY IT LIVES ON THE INSTANCE PAGE. This is the only place the TUI shows usage today:
+ *  the CTX column of the instance/rig seat tables and the seat detail's CONTEXT block.
+ *  There was no fleet-usage surface to extend — the TUI had no token-burn read at all —
+ *  so the read goes where usage already is, on the page that describes the whole
+ *  instance rather than one rig, because a fleet-wide ranking has no per-rig home. On a
+ *  hub this page is otherwise near-empty (a hub runs no rigs of its own), which is
+ *  exactly the operator who needs it. PULSE was the other candidate and was rejected:
+ *  it is an exceptions page, and "these seats are using a lot" is not an exception.
+ *
+ *  WHAT IT NEVER DOES. It does not render, sort or total `windows[]`: those are
+ *  subscription provider windows, a runtime on API keys does not observe them, and a
+ *  percentage of one seat's window is not comparable to another's. It leads on
+ *  `tokensDelta` and `tokensPerHour`, the two numbers that mean the same thing on every
+ *  seat. A host whose usage leg failed is named as unknown with the origin's reason —
+ *  never a zero row, and never a total that silently omits it. There is no fleet-wide
+ *  tokens/hour anywhere: a rate over each seat's own sample span cannot be summed.
+ *
+ *  HEIGHT IS BOUNDED (top rows + one truncation line) because this sits ABOVE the
+ *  instance table and a long fleet must not push the operator's seats off the screen. */
+function fleetUsageLines(snap: FleetSnapshot, local: boolean): ContentLine[] {
+  // Absent with no remote hosts (the read is never asked), with an older daemon that 404s
+  // the route, and until a first read answers. Every one of those renders NOTHING: a
+  // single-machine operator's instance page is exactly as it was before this existed.
+  const usage = snap.fleetUsage;
+  if (!usage || !local) return [];
+
+  const header = [`FLEET USAGE · last ${usage.windowHours}h`];
+  if (usage.totals) {
+    header.push(`${usageTokens(usage.totals.tokensDelta)} tokens`);
+    header.push(`${usage.totals.hostsAnswered} of ${usage.totals.hostsTargeted} hosts answered`);
+    if (usage.totals.seatsUnknown > 0) header.push(`${usage.totals.seatsUnknown} seats unknown`);
+  } else {
+    // null totals means NO host answered. "0 tokens" would be the loudest lie available.
+    header.push("no host answered — usage unknown");
+  }
+  const lines: ContentLine[] = [{ text: header.join(" · ") }];
+
+  const rows = usage.top.slice(0, FLEET_USAGE_TOP_ROWS);
+  for (const seat of rows) {
+    lines.push({
+      text: `  ${usageTokens(seat.tokensDelta).padStart(6)} tok · ${usageTokens(seat.tokensPerHour).padStart(6)}/h  [${seat.hostId}] ${seat.seatSession}`,
+    });
+  }
+  // Truncation is said out loud: a cut list rendered without this is a partial fleet
+  // read presented as the whole one.
+  const more = Math.max(0, usage.totalSeatsRanked - rows.length);
+  if (more > 0) lines.push({ text: `  +${more} more ranked seats` });
+
+  // A host the hub could not get a usage read from. Its own totals are ABSENT rather
+  // than zero, and it contributed nothing to the header total — which is why the header
+  // says "N of M hosts answered" instead of a bare number.
+  for (const item of usage.items) {
+    if (item.usage.state === "ok") continue;
+    lines.push({ text: `  [${item.hostId}] usage unknown${item.usage.reason ? ` — ${item.usage.reason}` : ""}` });
+  }
+
+  lines.push({ text: `  sampled context-window readings · which team is burning fastest, not token or cost accounting` });
+  lines.push({ text: "" });
+  return lines;
+}
+
 function instanceContentLines(
   state: ViewState,
   snap: FleetSnapshot,
@@ -729,7 +809,7 @@ function instanceContentLines(
                 alignedRow([[rig.name, 20], [rig.lifecycleState ?? "unknown", 20], [rig.inventoryUnavailable ? "inventory unavailable" : `${rig.pods.length} pods · ${rig.pods.reduce((n, pod) => n + pod.agents.length, 0)} seats`, 24]]),
                 { type: "drill", resource: "rig", name: rig.name, target: { host: host.name } },
               ))
-            : [{ text: "  (no local rigs served — proven empty)" }],
+            : [{ text: host.rigsUnavailable ? "  ✕ remote rigs read failed — named in the status line" : `  (no ${host.remote ? "" : "local "}rigs served — proven empty)` }],
         },
       ]),
     ];
@@ -764,6 +844,7 @@ function instanceContentLines(
 
   lines.push(healthSummaryLine(snap, scope, contentWidth));
   lines.push(...queueSampleLines(snap, contentWidth));
+  lines.push(...fleetUsageLines(snap, scope.local));
   lines.push({ text: state.filter ? `/ filter instance rows: ${state.filter} · / replace · esc clear` : "/ filter instance rows…" });
   const columns = instanceAgentColumns(contentWidth);
   lines.push({ text: tableRow(columns, { rig: "RIG", pod: "POD", seat: "SEAT", runtime: "RT", context: "CTX", status: "STATE", queue: "Q", work: "WORK", now: "NOW" }) });
@@ -780,7 +861,7 @@ function instanceContentLines(
     const rigAction: Action = { type: "drill", resource: "rig", name: rig.name, target: { host: host.name } };
     if (agents.length === 0) {
       lines.push({
-        text: tableRow(columns, { rig: rig.name, pod: "—", seat: rig.inventoryUnavailable ? "(read failed)" : "(no seats)", status: rig.lifecycleState ?? "unknown" }),
+        text: tableRow(columns, { rig: rig.name, pod: "—", seat: rig.inventoryUnavailable ? "(read failed)" : rig.inventoryNotLoaded ? "(seats not read)" : "(no seats)", status: rig.lifecycleState ?? "unknown" }),
         action: rigAction,
       });
       continue;
@@ -791,7 +872,7 @@ function instanceContentLines(
       if (firstInPod && previousPod != null) lines.push({ text: "┈".repeat(columnsWidth(columns)) });
       previousPod = pod;
       const stateCell = operationalState(agent.status, motion);
-      const queue = queueFacts(snap, agent.session);
+      const queue = queueFacts(snap, agent.session, rig.remote);
       seatCount += 1;
       if (["active", "working", "running"].includes(agent.status)) workingCount += 1;
       if (agent.needsAttention === true) attentionCount += 1;
@@ -903,9 +984,23 @@ function contentLines(state: ViewState, snap: FleetSnapshot, contentWidth: numbe
       .filter((a) => !state.filter || a.name.includes(state.filter) || a.pod.includes(state.filter));
     const suffix = `rig ${rig.name}${podFilter ? ` · pod ${podFilter}` : ""}${state.filter ? ` · filter "${state.filter}"` : ""}`;
     lines.push(...tabsLine(state, suffix));
-    // Keep the explicit desktop action above the rig's grid.
-    if (!podFilter) lines.push(fieldLine({ label: "terminal", value: `Open terminals ▸ rig ${rig.name}`, link: { type: "act", act: "open-terminal", view: `rig:${rig.name}` } }));
-    const healthScope = { kind: "rig" as const, rigId: rig.id ?? rig.name, rigName: rig.name, local: host === snap.hosts[0] };
+    // Keep the explicit desktop action above the rig's grid. A REMOTE rig has none: the
+    // terminal would open on the wrong machine, so the page prints the address that
+    // reaches the seats instead.
+    if (!podFilter) {
+      if (rig.remote) {
+        // Rig-WIDE, so it must not print one seat's address as if it addressed the
+        // whole rig (review N4). The shape is what the operator needs; the seat page
+        // prints that seat's concrete address.
+        lines.push(fieldLine({
+          label: "reach",
+          value: `read-only from here · rig capture|send <seat>@${rig.name}@${rig.hostId ?? host.name}`,
+        }));
+      } else {
+        lines.push(fieldLine({ label: "terminal", value: `Open terminals ▸ rig ${rig.name}`, link: { type: "act", act: "open-terminal", view: `rig:${rig.name}` } }));
+      }
+    }
+    const healthScope = { kind: "rig" as const, rigId: rig.id ?? rig.name, rigName: rig.name, local: !host.remote };
     if (state.viewTab === "health") return [...lines, { text: "" }, ...healthListLines(snap, healthScope, contentWidth)];
     if (state.viewTab === "recent") {
       const recent = recentLines(snap, { kind: "rig", rig: rig.name }, contentWidth, true, state.timeZone);
@@ -1009,10 +1104,12 @@ function contentLines(state: ViewState, snap: FleetSnapshot, contentWidth: numbe
       // write contract: `run ▸` = the rig-restore write (rendered only where
       // it applies — the seat is not running); `term ▸` = the terminal-open
       // view contract (pod-scoped, the web's granularity). No false affordance.
-      const canRun = a.canRun ?? !a.live;
-      const actionsCell = canRun ? "run ▸ · term ▸" : "term ▸";
+      const canRun = !rig.remote && (a.canRun ?? !a.live);
+      // A remote seat offers NOTHING clickable: the word is plain, with no ▸ glyph, so
+      // the column cannot read as a control: no false affordance.
+      const actionsCell = rig.remote ? "remote" : canRun ? "run ▸ · term ▸" : "term ▸";
       const zones: ContentLine["zones"] = [];
-      if (actionsColStart >= 0) {
+      if (!rig.remote && actionsColStart >= 0) {
         const termOffset = actionsColStart + actionsCell.indexOf("term ▸");
         zones.push({ start: termOffset, end: termOffset + "term ▸".length, action: { type: "act", act: "open-terminal", view: `pod:${rig.name}/${a.pod}` } });
       }
@@ -1023,7 +1120,7 @@ function contentLines(state: ViewState, snap: FleetSnapshot, contentWidth: numbe
           action: { type: "act", act: "run", rigId: rig.id ?? rig.name, agent: a.name },
         });
       const stateCell = operationalState(a.status, motion);
-      const queue = queueFacts(snap, a.session);
+      const queue = queueFacts(snap, a.session, rig.remote);
       lines.push({
         // the WHOLE row is the hit surface (not a testid'd control): clicking
         // any visible cell opens the agent; the ACTIONS zones override.

@@ -1,0 +1,67 @@
+{
+  "schemaVersion": 1,
+  "stream": "queue-transitions",
+  "observedAt": "2026-10-23T20:30:02Z",
+  "source": {
+    "hostId": "t-demo-0",
+    "bootEpoch": "boot-1",
+    "sequenceSpaceId": null
+  },
+  "rows": [
+    {
+      "transitionId": "3",
+      "qitemId": "qitem-a",
+      "createdAt": "2026-10-23T20:20:00Z",
+      "state": "in-progress",
+      "actorSession": "human@operator-laptop",
+      "identityProvenance": "relay:v1",
+      "closureReason": null,
+      "closureTarget": null
+    },
+    {
+      "transitionId": "4",
+      "qitemId": "qitem-b",
+      "createdAt": "2026-10-23T20:25:00Z",
+      "state": "handed-off",
+      "actorSession": "review-r1@demo-rig",
+      "identityProvenance": "transport:v1",
+      "closureReason": "handed_off_to",
+      "closureTarget": "dev-build@demo-rig"
+    },
+    {
+      "transitionId": "5",
+      "qitemId": "qitem-review-untagged",
+      "createdAt": "2026-10-23T20:28:00Z",
+      "state": "done",
+      "actorSession": "review-r1@demo-rig",
+      "identityProvenance": "transport:v1",
+      "closureReason": "handed_off_to",
+      "closureTarget": "orch-lead@demo-rig"
+    }
+  ],
+  "page": {
+    "requestedAfter": "2",
+    "requestedBefore": null,
+    "lastScanned": "5",
+    "through": "5",
+    "retainedHighWatermark": "5",
+    "hasMore": false,
+    "nextCursor": null,
+    "restartCursor": null,
+    "fetched": 3,
+    "scanned": 2,
+    "filtered": 0,
+    "withheld": 0,
+    "returned": 3,
+    "capReason": null
+  },
+  "coverage": {
+    "status": "retained_window",
+    "historyCompleteness": "unknown",
+    "retainedMinimum": "1",
+    "gaps": [],
+    "gapCount": 0,
+    "gapDetailsTruncated": false,
+    "eventPayloads": "not_read"
+  }
+}

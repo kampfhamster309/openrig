@@ -1,0 +1,29 @@
+{
+  "stream": "transitions",
+  "rows": [],
+  "page": {
+    "requestedAfter": null,
+    "requestedBefore": null,
+    "lastScanned": "5",
+    "through": "5",
+    "retainedHighWatermark": "5",
+    "hasMore": false,
+    "nextCursor": null,
+    "restartCursor": null,
+    "fetched": 0,
+    "scanned": 0,
+    "filtered": 0,
+    "withheld": 0,
+    "returned": 0,
+    "capReason": null
+  },
+  "coverage": {
+    "status": "retained_window",
+    "historyCompleteness": "unknown",
+    "retainedMinimum": "1",
+    "gaps": [],
+    "gapCount": 0,
+    "gapDetailsTruncated": false,
+    "eventPayloads": "not_read"
+  }
+}

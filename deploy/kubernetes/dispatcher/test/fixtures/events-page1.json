@@ -1,0 +1,35 @@
+{
+  "schemaVersion": 1,
+  "stream": "events",
+  "observedAt": "2026-10-23T20:30:00Z",
+  "source": { "hostId": "t-demo-0", "bootEpoch": "boot-1", "sequenceSpaceId": null },
+  "rows": [
+    { "seq": "1", "rigId": "demo-rig", "nodeId": "n-1", "type": "rig.up", "createdAt": "2026-10-23T20:00:10Z" },
+    { "seq": "2", "rigId": "demo-rig", "nodeId": "n-2", "type": "seat.started", "createdAt": "2026-10-23T20:01:00Z" }
+  ],
+  "page": {
+    "requestedAfter": "0",
+    "requestedBefore": null,
+    "lastScanned": "2",
+    "through": "3",
+    "retainedHighWatermark": "3",
+    "hasMore": true,
+    "nextCursor": "CURSOR-E1",
+    "restartCursor": null,
+    "fetched": 2,
+    "scanned": 2,
+    "filtered": 0,
+    "withheld": 0,
+    "returned": 2,
+    "capReason": "source_row_limit"
+  },
+  "coverage": {
+    "status": "partial",
+    "historyCompleteness": "unknown",
+    "retainedMinimum": "1",
+    "gaps": [{ "code": "historical_events_not_read", "through": "3" }],
+    "gapCount": 1,
+    "gapDetailsTruncated": false,
+    "eventPayloads": "not_read"
+  }
+}

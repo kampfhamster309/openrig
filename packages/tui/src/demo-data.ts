@@ -182,6 +182,13 @@ export function demoSnapshot(): FleetSnapshot {
       { session: "dev50-guard@openrig-build", logicalId: "dev50.guard", terminalActive: false, lastActivityAt: "2026-08-06T11:13:00.000Z" },
       { session: "dev50-qa@openrig-build", logicalId: "dev50.qa", terminalActive: null, lastActivityAt: null },
     ],
+    // The demo fleet has NO remote host, so the hub-side fleet read contributes
+    // nothing here — and the rendered page is byte-identical to the one this fixture
+    // produced before the read existed. That is the contract, not an omission.
+    remoteSeatActivity: [],
+    stalled: [],
+    fleetProbed: false,
+    fleetUsage: null,
     // PULSE ○ UP NEXT source — shaped like the shipped state=pending read
     // (unclaimed backlog, served ts_created DESC → carried verbatim). SIX items
     // exercise the display-cap overflow: the view renders the first four + a "…"
@@ -207,6 +214,9 @@ export function demoSnapshot(): FleetSnapshot {
     hydratedAt: "2026-08-06T11:59:58.000Z",
     // host-down is composed BESIDE the items (never projected into the item shape)
     hostsDown: [{ hostId: "remote-host", status: "unreachable", error: "read timed out" }],
+    // No remote host in the demo fixture, so the cross-host queue read is proven
+    // empty rather than faked — the PULSE sections stay local-only here.
+    fleetQueue: [],
     stream: [
       { tsEmitted: "2026-08-02T10:00:00.000Z", sourceSession: "dev50-guard@v-openrig-build", body: "gate cleared: slice-11 spike verdict PASS" },
       { tsEmitted: "2026-08-02T10:05:00.000Z", sourceSession: "orch-lead@v-openrig-build", body: "provider re-auth completed on mm2" },

@@ -211,6 +211,11 @@ describe("ConfigStore — extended namespaces (User Settings v0)", () => {
       "queue.wake_unconfirmed_window_minutes",
       "queue.wake_swap_grace_seconds",
       "queue.wake_human_rung",
+      // The fleet read's stall threshold; CLI + daemon twins in lockstep.
+      "fleet.stall_threshold_minutes",
+      // The fleet read's own transport budget; same lockstep requirement.
+      "fleet.host_timeout_ms",
+      "fleet.fanout_concurrency",
     ];
     expect([...VALID_KEYS]).toEqual(expected);
   });

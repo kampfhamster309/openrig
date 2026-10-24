@@ -24,8 +24,15 @@
 //        and its absence is an explicit unknown — never "ok" by silence.
 //
 // The single-daemon scope IS the host scope: rows carry host="local" (the
-// reserved local host id). Multi-host aggregation is explicitly out of scope
-// (the PRD's MH-lane later).
+// reserved local host id). MULTI-HOST USAGE AGGREGATION IS NO LONGER OUT OF
+// SCOPE for the product — a hub now composes a fleet-wide usage read across every
+// registered host (`domain/fleet/fleet-usage.ts`). What is unchanged, and what this
+// module still owns: this rollup is the PROVIDER-LIMIT state of ONE daemon, keyed
+// (host, provider), and it does not do the cross-host work itself. The hub-side
+// read composes each host's own answer over routes that host already serves; it
+// never merges these rows across machines, because a usage-limit park is a
+// host-level event on that host's account and a merged limit state would be a
+// fiction (binding condition (i) still holds).
 
 import type { ProviderKind, ProviderSignal, SignalWindow } from "./provider-types.js";
 
@@ -57,7 +64,9 @@ export interface HostUsageConflictAnomaly {
 }
 
 export interface HostUsageRow {
-  /** The reserved LOCAL host id — this daemon's own scope (MH aggregation is out of scope). */
+  /** The reserved LOCAL host id — this daemon's own scope. Cross-host usage lives
+   *  in the hub's fleet read, which composes per-host answers rather than merging
+   *  these rows; see the header. */
   host: "local";
   provider: ProviderKind;
   state: HostUsageState;

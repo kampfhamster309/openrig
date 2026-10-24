@@ -58,6 +58,17 @@ export const READ_THROUGH_ALLOWLIST = [
   // must stay REFUSED — pinned by named negatives.
   "/api/rigs/:rigId/nodes/:logicalId",
   "/api/ps",
+  // Fleet usage: a registered host's READ-ONLY per-seat usage history, so an operator
+  // whose CLI reaches only the hub can read one seat's series on a host that is not
+  // directly routable (for example a cluster-internal team pod). A client-side direct
+  // dial would work nowhere the command is actually used, so the hub stays the single
+  // door and this is the one deliberate widening that decision required. Same read class
+  // as the seat-detail leaf above: a GET, one seat's own samples, bearer-protected,
+  // nothing written.
+  // DELIBERATELY NARROW — `/api/telemetry/usage/top` and the other telemetry streams
+  // stay refused (pinned by named negatives); the fleet already gets `top` through
+  // the hub's own fan-out, which is not this edge.
+  "/api/telemetry/usage/series",
   "/api/slices",
   "/api/slices/:name",
   "/api/slices/:name/doc/*",

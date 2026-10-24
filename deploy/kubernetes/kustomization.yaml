@@ -1,0 +1,28 @@
+# Shared objects for team pods: kubectl apply -k deploy/kubernetes
+# Create the Secrets first (see README.md); they are not in this directory.
+# Team pods come from dispatcher/rig-dispatch; a single long-lived host from single-host/.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: openrig
+resources:
+  - manifests/namespace.yaml
+  - manifests/networkpolicy.yaml
+  - manifests/networkpolicy-hub.yaml
+  - manifests/teams-service.yaml
+# The image new team pods get (rig-dispatch reads this pin; RIG_DISPATCH_IMAGE overrides it).
+images:
+  - name: openrig-host
+    newName: ghcr.io/kampfhamster309/openrig-host
+    newTag: 0.6.10-6e8027ea4
+configMapGenerator:
+  # Flat keys; the pods' volume items lay them out as /etc/openrig-kit/<path>.
+  - name: openrig-kit
+    files:
+      - rig.yaml=kit/rig.yaml
+      - lead-monitoring.md=kit/guidance/lead-monitoring.md
+      - pi-seat-status=kit/bin/pi-seat-status
+      - openrig-heartbeat.ts=kit/pi-extensions/openrig-heartbeat.ts
+      - models.json=kit/pi/models.json
+generatorOptions:
+  # The kit is read at boot (Pi seeding) and at `rig up`; a kit edit should not restart teams.
+  disableNameSuffixHash: true

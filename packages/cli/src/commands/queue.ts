@@ -672,6 +672,31 @@ function resolveCurrentSession(explicit: string | undefined, optionName: string)
   return undefined;
 }
 
+/** The caller's managed seat, read WITHOUT the exit side effect (the cross-host leg decides for
+ *  itself whether a missing seat is fatal). */
+function currentSeatSession(): string | undefined {
+  return readOpenRigEnv("OPENRIG_SESSION_NAME", "RIGGED_SESSION_NAME")?.trim() || undefined;
+}
+
+/**
+ * The actor a cross-host write records when the caller is NOT a managed seat.
+ *
+ * `resolve` derives its resolver from the seat environment of the daemon it runs against, so a human
+ * standing at the hub with no seat env could not answer a remote team at all — and the deployment
+ * workaround (run it inside the team's pod as the team's lead) records a SEAT as the one who answered,
+ * which is false. This ref is human-CLASS (`isHumanSeatSessionRef` matches the `human@host` family),
+ * so the team's row says a human answered rather than inventing a seat on the team's own host. It is
+ * the SAME ref the shipped browser surfaces use for a seatless human (`SURFACE_ACTOR` in
+ * packages/ui/src/components/review/*), so one human is not spelled two ways by two surfaces.
+ *
+ * It is deliberately not dressed up as more than it is. With no transport identity the daemon records
+ * the claim under `claimed:v1` (P18 deliver-and-label) — NOT `relay:v1`, which would overclaim it —
+ * and the hub stamps its own host id into the audit row, so the record reads "a human, from host X"
+ * with each part labelled at the strength it can actually support. Naming the individual human needs
+ * the hub's own human registry, which is a daemon-side resolution, not a CLI guess.
+ */
+const REMOTE_HUMAN_ACTOR = "human@host";
+
 function extractRigName(sessionName: string): string | undefined {
   // OPR.0.4.6.MH1 FR-8: the shared parse contract (greedy first-@ rig).
   return sessionRigOf(sessionName);
@@ -1048,6 +1073,7 @@ export function queueCommand(depsOverride?: QueueDeps): Command {
     .option("--summary <text>", "Summary persisted onto the item (human-seat parks, or standalone summary update without --state)")
     .option("--evidence-ref <path>", "Pointer to the durable artifact, persisted onto the item on a human-seat park or a done close (--state done)")
     .option("--note <text>", "Transition note for the audit log")
+    .option("--host <id>", QUEUE_HOST_OPTION_HELP)
     .option("--full", "Print the whole response row(s) as today, even when output.compact is on (the receipt's waiting keeps only blocker and nextBackstop)")
     .option("--json", "JSON output for agents")
     .action(async (qitemId: string, opts: {
@@ -1063,6 +1089,7 @@ export function queueCommand(depsOverride?: QueueDeps): Command {
       summary?: string;
       evidenceRef?: string;
       note?: string;
+      host?: string;
       json?: boolean;
       full?: boolean;
     }) => {
@@ -1084,7 +1111,14 @@ export function queueCommand(depsOverride?: QueueDeps): Command {
       // P21 I3 reconcile: the actor is DERIVED from the seat env (X-OpenRig-Session, stamped by
       // DaemonClient) — --actor is deprecated + ignored, no body actorSession. Verify the env (the
       // header source) or the daemon returns 400 actor_required (no seat identity to record; P18 retired the 401 refusal). Matches `resolve`.
-      if (!resolveCurrentSession(undefined, "actor")) return;
+      // Only a cross-host write may run without a seat env, and then the actor is
+      // the human ref (see REMOTE_HUMAN_ACTOR). Without --host this is byte-for-byte today's path.
+      const remoteHost = remoteHostOf(opts.host);
+      if (!remoteHost && !resolveCurrentSession(undefined, "actor")) return;
+      // Gated on the remote leg BY CONSTRUCTION: without `--host` this is `undefined`, so the local
+      // body cannot gain an actorSession however the seat env reads (a whitespace-only env used to
+      // reach the shipped refusal; it still does, and it still sends nothing).
+      const actorClaim = remoteHost && !currentSeatSession() ? REMOTE_HUMAN_ACTOR : undefined;
       const deps = getDeps();
       await withClient(deps, async (client) => {
         const res = await client.post<unknown>(`/api/queue/${encodeURIComponent(qitemId)}/update`, {
@@ -1099,9 +1133,12 @@ export function queueCommand(depsOverride?: QueueDeps): Command {
           summary: opts.summary,
           evidenceRef: opts.evidenceRef,
           transitionNote: opts.note,
+          ...(actorClaim ? { actorSession: actorClaim } : {}),
+          // The host rides the out-of-band envelope, never the session string.
+          ...(remoteHost !== undefined ? { hostId: remoteHost } : {}),
         });
-        await printQueueItemResult(client, qitemId, opts.json ?? false, res.data, res.status, writeReceipt(opts.full, { verb: "update" }));
-      });
+        await printQueueItemResult(client, qitemId, opts.json ?? false, res.data, res.status, writeReceipt(opts.full, { verb: "update", remoteHost }));
+      }, false, remoteHost);
     });
 
   // OPR.0.4.4.19 FR-6 — the first-class park affordance (C5 leg 1). One verb,
@@ -1176,19 +1213,26 @@ workspace home that is deferred/not-imminent belongs in its mission/slice.`)
     .requiredOption("--decision <text>", "The human's decision text (non-empty; lands in transition_note + the audit row)")
     .option("--actor <session>", "(deprecated, ignored) resolver is derived from the seat env (X-OpenRig-Session)")
     .option("--bearer <token>", "Operator bearer token for the mission-control write gate (or set OPENRIG_AUTH_BEARER_TOKEN; loopback daemons without a configured bearer need none)")
+    .option("--host <id>", QUEUE_HOST_OPTION_HELP)
     .option("--no-notify", "Skip the best-effort owner nudge (the unpark still commits)")
     .option("--json", "JSON output for agents")
     .action(async (qitemId: string, opts: {
       decision: string;
       actor?: string;
       bearer?: string;
+      host?: string;
       notify?: boolean;
       json?: boolean;
     }) => {
       // P21: the resolver is DERIVED from the seat env (X-OpenRig-Session, stamped by DaemonClient) —
       // --actor is deprecated + ignored. The pre-check verifies the env (the header source); else the
       // daemon returns 400 actor_required (no seat identity to record; P18 retired the 401 refusal).
-      if (!resolveCurrentSession(undefined, "actor")) return;
+      // A cross-host write is the one case where the caller may be a human at a
+      // plain terminal with no seat env; then the actor is the human ref, never a seat on the target
+      // host. Without --host this is byte-for-byte today's local path.
+      const remoteHost = remoteHostOf(opts.host);
+      if (!remoteHost && !resolveCurrentSession(undefined, "actor")) return;
+      const actorClaim = remoteHost && !currentSeatSession() ? REMOTE_HUMAN_ACTOR : undefined;
       const deps = getDeps();
       const bearer = opts.bearer ?? process.env.OPENRIG_AUTH_BEARER_TOKEN;
       await withClient(deps, async (client) => {
@@ -1197,14 +1241,19 @@ workspace home that is deferred/not-imminent belongs in its mission/slice.`)
           {
             verb: "resolve",
             qitemId,
-            // P21: no body actorSession — the daemon derives the resolver from the transport header.
+            // P21: no body actorSession when a seat env proved the caller — the daemon derives the
+            // resolver from the transport header. A seatless cross-host caller declares the human ref
+            // instead, which the daemon records under the honest `claimed:v1` era-stamp.
+            ...(actorClaim ? { actorSession: actorClaim } : {}),
             decision: opts.decision,
             notify: opts.notify,
+            // The host rides the out-of-band envelope, never the session string.
+            ...(remoteHost !== undefined ? { hostId: remoteHost } : {}),
           },
           bearer ? { headers: { Authorization: `Bearer ${bearer}` } } : undefined,
         );
         await printQueueItemResult(client, qitemId, opts.json ?? false, res.data, res.status);
-      });
+      }, false, remoteHost);
     });
 
   cmd

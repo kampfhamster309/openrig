@@ -32,6 +32,8 @@ import {
 } from "../domain/mission-control/audit-browse.js";
 import type { MissionControlNotificationDispatcher } from "../domain/mission-control/notification-dispatcher.js";
 import { resolveActorWithDeferral, resolveRecordedProvenance } from "./require-sender-identity.js";
+import { relayOriginAuditNotes, stripRelayClaim, relayActorOf } from "./relay-origin.js";
+import { RELAY_HEADER } from "./require-sender-identity.js";
 
 /**
  * Mission Control HTTP routes (PL-005 Phase A). Backs the integrated
@@ -375,14 +377,30 @@ export function missionControlRoutes(opts?: MissionControlRoutesOpts): Hono {
       // RE-STAMP X-OpenRig-Session from THIS daemon's derived actor (`identity.session`, from the
       // chokepoint above) + mark relay provenance — the origin derives the RE-STAMPED actor, never the
       // forwarded body claim (the census's #5/#17 forward sites).
-      const { hostId: _dropped, actorSession: _claim, ...forwardBody } = body as Record<string, unknown>;
+      // auditNotes is re-stamped here too. The origin host is composed by THIS
+      // hub from its own self-host id and is bearer-trusted at the origin; a caller that supplied its
+      // own `auditNotes.openrig_relay` is overwritten, so a caller cannot choose which host its write
+      // claims to have come from. This is what lets the origin's row say "a human answered, from
+      // host X" instead of silently attributing the answer to a seat on the team's host.
+      const { hostId: _dropped, actorSession: _claim, auditNotes: _notes, ...forwardBody } = body as Record<string, unknown>;
+      // Only stamped when there IS an origin to record. A hub whose own host id is unavailable sends
+      // no stamp rather than a null one — and the caller's own auditNotes is taken out of the body
+      // first, so a forged relay claim cannot ride through untouched when there was nothing to
+      // stamp over it.
+      const relayNotes = relayOriginAuditNotes(body.auditNotes, getSelfHostId());
+      if (relayNotes !== null) forwardBody.auditNotes = relayNotes;
       const res = await remoteJsonRequest(resolved.host, "/api/mission-control/action", {
         method: "POST",
         body: forwardBody,
         timeoutMs: REMOTE_ACTION_TIMEOUT_MS,
         fetchImpl,
         headers: {
-          "X-OpenRig-Session": identity.session,
+          // R1: QUALIFIED like the /update forward, for the same reason. `identity.session` is already
+          // canonicalised down to bare `member@rig` (canonicalSenderSession strips THIS hub's own
+          // suffix), and a bare seat ref on the team reads as one of the TEAM's seats — so a hub seat
+          // answering a remote park would be recorded as a seat the team does not have. A human ref is
+          // left as-is; see relayActorOf.
+          "X-OpenRig-Session": relayActorOf(identity.session, getSelfHostId()),
           "X-OpenRig-Relay": getSelfHostId() ?? "unknown",
           // Carry the provenance THIS hop resolved so the origin NEVER launders a claimed-era actor into a
           // transport-derived one: identity.provenance is transport:v1 (CLI) or claimed:v1 (UI deferral). The origin's
@@ -433,7 +451,10 @@ export function missionControlRoutes(opts?: MissionControlRoutesOpts): Hono {
         ...(typeof body.questionId === "string" ? { questionId: body.questionId } : {}),
         ...(typeof body.optionId === "string" ? { optionId: body.optionId } : {}),
         notify: body.notify,
-        auditNotes: body.auditNotes,
+        // This path is not a verified relay hop, so a `openrig_relay` key here is
+        // a claim with no hub stamp behind it. Keep it only when it names the host the relay header
+        // names; every other audit note passes through exactly as before.
+        auditNotes: stripRelayClaim(body.auditNotes, c.req.header(RELAY_HEADER)) ?? undefined,
       });
       return c.json(result);
     } catch (err) {

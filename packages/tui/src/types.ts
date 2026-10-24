@@ -61,6 +61,10 @@ export interface AgentRow {
    * within the daemon's silence window — the substrate whose false→true
    * transition means real new pane output; null = no signal */
   paneActive?: boolean | null;
+  /** Set on a seat read through a REMOTE host: the `member@rig@host` address the
+   * operator uses with `rig capture|send` in place of the local actions the TUI
+   * cannot run there. Absent on a local seat. */
+  remoteAddress?: string | null;
 }
 
 export interface PodNode {
@@ -78,6 +82,13 @@ export interface RigNode {
   id?: string;
   name: string;
   pods: PodNode[];
+  /** The rig lives on a REMOTE fleet host. Its seats came through the
+   * read-through, so every WRITE surface the TUI would offer on them (attach, open
+   * terminal, run, focus, send) belongs to that host, not this daemon. Consumers
+   * suppress the affordance and print `remoteSeatAddress` instead. */
+  remote?: boolean;
+  /** The remote host's registry id this rig was read through; local rigs carry none. */
+  hostId?: string;
   /** the rig's served graph projection (§4.A topology row 1 — a DECLARED
    * existing read via daemon-client.rigGraph; slice-17 view consumes it, R7-clean) */
   graph?: import("./topology/graph-types.js").RigGraph;
@@ -91,6 +102,24 @@ export interface HostNode {
   name: string;
   reachable: boolean;
   rigs: RigNode[];
+  /** This host is a REMOTE fleet host rather than the daemon being viewed. Remote
+   * hosts are lazy: their rigs are read only while the operator has them expanded,
+   * so an absent read is a deliberate non-read, never a failure. */
+  remote?: boolean;
+  /** The remote-rigs read was attempted and FAILED (the read-through named a cause).
+   * Distinct from `rigs: []`, which is a proven-empty answer. */
+  rigsUnavailable?: boolean;
+}
+
+/** The address that REACHES a remote seat from here. The TUI cannot act on a remote
+ * seat — acting on it belongs to the daemon that owns it — so it prints this instead.
+ * `canonicalSessionName` is already `member@rig`, so appending `@<hostId>` yields the
+ * `member@rig@host` form `rig capture|send` parses as its cross-host sugar
+ * (packages/cli/src/commands/capture.ts, send.ts). Null for a local seat or one with
+ * no canonical session — the caller then says so honestly rather than guessing. */
+export function remoteSeatAddress(hostId: string | undefined, session: string | null | undefined): string | null {
+  if (!hostId || !session) return null;
+  return `${session}@${hostId}`;
 }
 
 export type SpecKind = "rig" | "agent" | "workflow";
@@ -177,15 +206,37 @@ export interface NeedsItem {
   qitemId?: string | null;
   evidenceRef?: string | null;
   unblocks?: string | null;
+  /** The composed age the host's own composer stamped (VERBATIM); absent when the
+   * host could not date the row. PULSE renders an honest "" age, never a guess. */
+  ageIso?: string | null;
 }
 
 /** Host/rig-down rows — composed BESIDE the Needs-You items at render, never
- * projected into the item shape (§4.A: composeNeedsYou supplies no host rows). */
+ * projected into the item shape (§4.A: composeNeedsYou supplies no host rows).
+ * A row whose `hostId` starts with RIG_DOWN_ID_PREFIX is a LOCAL RIG, not a host. */
 export interface HostDown {
   hostId: string;
   status: string;
   error?: string;
 }
+
+/** The fan-out contract's local sentinel (`daemon/domain/hosts/fanout-contract.ts`
+ * — LOCAL_HOST_ID). Every daemon stamps its OWN rows with this literal, never with
+ * its self-host id, so it is the one reliable "this row is mine" marker across hosts.
+ * Spelled ONCE and reused (hydrate's drop, the remote-label test, the topology filter).
+ */
+export const LOCAL_HOST_ID_SENTINEL = "local";
+
+/** How many of the fleet's top seats the TUI asks for and shows. The block sits ABOVE
+ *  the instance table, so the list is bounded at the request as well as in the render —
+ *  a fleet with fifty busy seats must not push the operator's own seats off the screen.
+ *  The payload's `totalSeatsRanked` is what makes the cut visible as "+N more". */
+export const FLEET_USAGE_TOP_ROWS = 10;
+
+/** hydrate stamps a rig-down row's id with this prefix, because a rig is not a host
+ * and the row has to say which it is. Consumers that mean HOSTS specifically filter on
+ * it rather than re-typing the string. */
+export const RIG_DOWN_ID_PREFIX = "rig:";
 
 /** TUI-local read shape for the PULSE exception joins — the subset of the
  * daemon QueueItem (queue-repository.ts) the two LIVE joins consume. Carried
@@ -213,6 +264,13 @@ export interface QueueRead {
    * per-row lookup) and stamps the owner session here; null when unresolved (gate
    * name / lookup miss) — the render falls back to the raw blockedOn, never fabricates. */
   blockerSession?: string | null;
+  /** Fleet provenance, present ONLY on a row that came from a REMOTE host through
+   * the attention-aggregate read (the aggregate stamps every local row with the
+   * `local` sentinel, and hydrate drops those — the local reads already carry them).
+   * The renderer prints it as the `[host]` label so an operator reading a hub can
+   * tell which machine owes the answer. Local rows carry no label at all, so an
+   * operator with no remote hosts sees no new labels. */
+  hostId?: string;
 }
 
 /** One seat's ps/activity summary — the PULSE ◌ PARKED WITH BATON join's right
@@ -232,6 +290,148 @@ export interface SeatActivitySummary {
   logicalId: string;
   terminalActive: boolean | null;
   lastActivityAt: string | null;
+  /** Set ONLY for a seat read off ANOTHER host by the hub-side fleet summary.
+   * A local seat leaves it absent, so a row built from a remote seat can be
+   * labelled `[host]` instead of being painted under a local seat of the same
+   * name — the exact failure the cross-host PARKED join refused before. */
+  hostId?: string;
+}
+
+/** One rig or host the hub's fleet summary called STALLED: it holds open work and
+ * nothing has changed on it for longer than the threshold. The duration and the
+ * threshold travel with the row — the TUI never hardcodes a number it did not read. */
+export interface FleetStallRow {
+  /** "host" or "rig" — the two levels the verdict is served at. */
+  level: "host" | "rig";
+  hostId: string;
+  rigName: string | null;
+  /** open queue items the verdict counted */
+  openWorkCount: number;
+  /** minutes since the newest qualifying progress, as the hub computed it */
+  minutesSinceProgress: number | null;
+  /** the newest qualifying progress stamp, served verbatim */
+  lastProgressAt: string | null;
+  /** the threshold this verdict used */
+  thresholdMinutes: number;
+}
+
+/** The slice of the hub-side fleet summary the TUI consumes. Declared structurally
+ * (not imported from the daemon) so an OLDER daemon that 404s the route is a plain
+ * miss rather than a coupling; only the fields the page reads are named. */
+export interface FleetSummaryRead {
+  items: Array<{
+    hostId: string;
+    reachable: boolean;
+    progress: { lastQueueTransitionAt: string | null; minutesSinceProgress: number | null; stalled: boolean | null; openWorkCount: number };
+    rigs: Array<{
+      rigName: string;
+      hostId: string;
+      progress: { lastQueueTransitionAt: string | null; minutesSinceProgress: number | null; stalled: boolean | null; openWorkCount: number };
+      seats: Array<{
+        hostId: string;
+        rigName: string;
+        logicalId: string | null;
+        canonicalSessionName: string | null;
+        activity: string | null;
+        lastActivityAt: string | null;
+      }>;
+    }>;
+  }>;
+  stallThresholdMinutes?: number;
+  registryError?: string | null;
+  /** The fan-out's own budget and reach, echoed by the route. The reader needs them to
+   *  size its NEXT wait from the operator's real settings instead of the compiled
+   *  defaults — a hub configured for a 15 s per-host budget is not waited on for 20 s.
+   *  `targetedHostIds` counts hosts the fan-out tried, including ones that failed;
+   *  `items` does not, so the wait must not be sized from it. */
+  hostTimeoutMs?: number;
+  concurrency?: number;
+  targetedHostIds?: string[];
+  /** Per-host reachability, including hosts that failed — the sibling of `items`, which
+   *  only carries hosts that answered. */
+  hosts?: Array<{ hostId: string; status: string }>;
+  /** Every open queue row on every reachable host, in every open state — the read
+   * that makes a remote blocked-on-agent or in-progress row visible at all. */
+  openQueue?: Array<{
+    hostId: string;
+    rigName: string | null;
+    qitemId: string;
+    state: "pending" | "in-progress" | "blocked";
+    destinationSession: string | null;
+    blockedOn: string | null;
+    handedOffTo: string | null;
+    claimedAt: string | null;
+    priority: string | null;
+    summary: string | null;
+    tags: string[];
+    tsUpdated: string | null;
+  }>;
+}
+
+/** The slice of the hub-side fleet USAGE read the TUI consumes. Structural for the
+ *  same reason as `FleetSummaryRead`: an older daemon that 404s the route is a plain
+ *  miss, not a coupling.
+ *
+ *  What the page may render is narrower than what the payload carries, and that is the
+ *  whole point of declaring it here. `windows[]` is DELIBERATELY absent: the provider
+ *  windows are subscription lanes, a runtime on API keys does not observe them, and a
+ *  percentage of one seat's window cannot be compared, sorted or added to another's.
+ *  Rendering one would report a lane that does not exist. The read leads on the two
+ *  numbers that mean the same thing on every seat: `tokensDelta` and `tokensPerHour`. */
+export interface FleetUsageRead {
+  /** The window every host was asked for, and the hub's own window start. */
+  windowHours: number;
+  sinceIso: string;
+  /** The fleet's top seats across every host that answered, each labelled with its
+   *  host by the origin. Ranked by the per-seat rate the ORIGIN computed. */
+  top: Array<{
+    hostId: string;
+    seatSession: string;
+    tokensPerHour: number;
+    tokensDelta: number;
+    resets: number;
+    spanHours: number;
+    samples: number;
+  }>;
+  /** The cap the route applied; null when the request asked for none. With
+   *  `totalSeatsRanked` this tells a reader whether the list was cut — a truncated
+   *  list rendered without that is a partial fleet read as the whole one. */
+  topCap: number | null;
+  totalSeatsRanked: number;
+  /** Seats an origin could not rank, with the ORIGIN's own reason. A seat here is
+   *  unknown, never zero. */
+  unknown: Array<{ hostId: string; seatSession: string; reason: string }>;
+  /** Summed over the hosts that ANSWERED. Null when none did: a fleet that used
+   *  nothing and a fleet nobody heard from are different answers, and only one of
+   *  them is 0. */
+  totals: {
+    tokensDelta: number;
+    resets: number;
+    seatsRanked: number;
+    seatsUnknown: number;
+    hostsAnswered: number;
+    hostsTargeted: number;
+  } | null;
+  /** Per host: the usage leg's own state, and the honest sums where there is a read.
+   *  `totals` ABSENT is the field that means "no measurement" — an empty `ranked` is
+   *  not, and reading it that way is how an unknown host renders as a zero. */
+  items: Array<{
+    hostId: string;
+    kind: "local" | "remote";
+    usage: {
+      state: "ok" | "unavailable";
+      reason?: string;
+      totals?: { tokensDelta: number; resets: number; seatsRanked: number; seatsUnknown: number };
+    };
+  }>;
+  /** The fan-out's own budget, echoed. The reader sizes its NEXT wait from these
+   *  rather than from the compiled defaults — same rule as the summary. */
+  hostTimeoutMs?: number;
+  concurrency?: number;
+  targetedHostIds?: string[];
+  /** Set only when hosts.yaml EXISTS but could not be read: the fleet is local-only
+   *  for a stated reason rather than a silently thin one. */
+  registryError?: string | null;
 }
 
 import type { MissionScopesSnap } from "./scopes/scopes-model.js";
@@ -442,6 +642,12 @@ export interface FleetSnapshot {
   specs: SpecEntry[];
   /** grounded composeNeedsYou union in daemon priority order, VERBATIM (PIN 3) */
   needs: NeedsItem[];
+  /** Cross-host queue rows from the attention-aggregate read, REMOTE ONLY (the
+   * aggregate stamps every local row with the `local` sentinel, and hydrate drops
+   * those — the local reads already carry them). Each row keeps its `hostId`. The TUI
+   * consumed this payload's `hosts` long before it consumed its `items`; this is the
+   * items leg. Empty when no remote host is subscribed — silence, not a failure. */
+  fleetQueue: QueueRead[];
   /** false until the human-queue read has answered — honest-unknown vs proven-empty */
   humanQueueProbed: boolean;
   /** PULSE ▲ NEEDS YOU source — the shipped attention read (already the exact
@@ -460,6 +666,24 @@ export interface FleetSnapshot {
   /** Per-seat ps/activity (the PARKED join's right side), one entry per running
    * agent seat with a canonical session, from the shipped nodes read. */
   seatActivity: SeatActivitySummary[];
+  /** The SAME join's right side for seats on ANOTHER host, from the hub-side fleet
+   * summary. Empty when there is no remote host or the local daemon is too old to
+   * serve the read — and then a remote in-progress row joins nothing, which is the
+   * honest-unknown behaviour this field replaced, not a bug. */
+  remoteSeatActivity: SeatActivitySummary[];
+  /** Rigs/hosts the hub called STALLED (open work, no progress past the threshold).
+   * Empty when nothing stalled OR when the read is unavailable — see fleetProbed. */
+  stalled: FleetStallRow[];
+  /** The stall threshold the served verdict used, verbatim; absent with no read. */
+  stallThresholdMinutes?: number;
+  /** false until the fleet summary has answered — honest-unknown vs proven-none. */
+  fleetProbed: boolean;
+  /** The hub-side fleet USAGE read, carried ONLY when the registry has remote hosts.
+   *  null with no remote hosts (nothing to add up), with an older daemon that 404s the
+   *  route (absent feature, named nothing), and while a first read has not answered.
+   *  A failed read after a good one keeps the last good payload and NAMES the failure
+   *  in readErrors, exactly as the summary's does. */
+  fleetUsage: FleetUsageRead | null;
   /** PULSE UP NEXT source (increment 3) — the shipped state=pending read
    * (unclaimed backlog). Carried in the daemon's served order (ts_created DESC);
    * the render keeps only unclaimed (claimedAt null) and caps for display. */
@@ -577,6 +801,9 @@ export type Action =
   | { type: "act"; act: "answer"; qitemId: string; verb: "approve" | "answer"; actorSession: string; questionId?: string; optionId?: string; decision?: string }
   /** Answer the open request in your own words (the `reply` command); main resolves it to the served answer act. */
   | { type: "attention-reply"; text: string }
+  /** Answer a parked qitem from PULSE. `hostId` names the host that OWNS the
+   * row (carried from the served NEEDS YOU row, never guessed); absent means this daemon. */
+  | { type: "act"; act: "resolve-qitem"; qitemId: string; decision: string; hostId?: string }
   | { type: "notice"; message: string };
 
 /** FR-12: the section set is ONE in-code registry — adding a section is a

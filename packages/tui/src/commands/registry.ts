@@ -92,7 +92,7 @@ export const COMMAND_REGISTRY: readonly CommandEntry[] = [
   { name: "terminals", aliases: [], args: "", description: "browse Saved and Derived terminal views; preview before explicit Open", context: "standard", sample: "terminals", build: () => ({ type: "jump", section: "terminals" }) },
   { name: "terminal-preview", aliases: [], args: "<view>", description: "passively preview a saved:id or rig:name terminal view", context: "standard", sample: "terminal-preview rig:example", build: view => view ? ({ type: "terminal-preview", view }) : ({ type: "error", message: "terminal-preview needs a view" }) },
   { name: "terminal", aliases: [], args: "<view>", description: "open a rig:name, pod:rig/pod, mission:id, slice:id or saved:id view in a new terminal (Herdr or plain tmux)", context: "standard", sample: "terminal rig:example",
-    complete: ({ snapshot }) => snapshot.hosts.flatMap((h) => h.rigs.map((r) => `rig:${r.name}`)),
+    complete: ({ snapshot }) => snapshot.hosts.flatMap((h) => h.rigs.filter((rig) => !rig.remote).map((rig) => `rig:${rig.name}`)),
     build: view => view ? ({ type: "act", act: "open-terminal", view }) : ({ type: "error", message: "terminal needs a view, for example rig:<name>" }) },
   { name: "reply", aliases: [], args: "<your words>", description: "answer the open Feed request in your own words, as the person it's addressed to; it goes back to the asker", context: "standard", sample: "reply Ship it on Friday",
     build: text => text.trim() ? ({ type: "attention-reply", text }) : ({ type: "error", message: "reply needs your answer, for example reply Ship it on Friday" }) },
@@ -119,6 +119,16 @@ export const COMMAND_REGISTRY: readonly CommandEntry[] = [
   { name: "source", aliases: [], args: "", description: "read the selected project, mission or slice source", context: "standard", sample: "source", build: () => ({ type: "project-source" }) },
   { name: "mission", aliases: [], args: "<name>", description: "open a mission's work and workflows", context: "standard", sample: "mission release-demo", complete: ({ snapshot }) => (snapshot.scopes ?? []).map((m) => m.mission), build: (name) => name ? { type: "scopes-mission-open", mission: name } : { type: "error", message: "mission needs a name" } },
   { name: "workflow", aliases: [], args: "<instance-id>", description: "open a workflow in the selected mission", context: "standard", sample: "workflow example", complete: (ctx) => workflowArgs(ctx, false), build: (name) => name ? { type: "execution-open", key: `workflow:${name}` } : { type: "error", message: "workflow needs an instance id" } },
+  { name: "answer", aliases: ["ans"], args: "<qitem-id> <decision>", description: "answer a NEEDS YOU park with the operator's decision; a row the fleet read showed on another host is routed there", context: "standard", sample: "answer qitem-1 ship it", build: (rest) => {
+      // The decision is the REST of the line, spaces literal (same shape as launch-folder): a
+      // decision is prose, and making an operator quote it would be a worse answer than typing it.
+      const sep = rest.search(/\s/);
+      const qitemId = sep < 0 ? "" : rest.slice(0, sep);
+      const decision = sep < 0 ? "" : rest.slice(sep + 1).trim();
+      if (!qitemId) return { type: "error", message: 'answer needs a queue id (e.g. "answer <qitem-id> <decision>")' };
+      if (!decision) return { type: "error", message: "answer needs the decision text after the queue id — the daemon records it verbatim and refuses an empty one" };
+      return { type: "act", act: "resolve-qitem", qitemId, decision };
+    } },
   { name: "packet", aliases: [], args: "<qitem-id>", description: "open current workflow work in the selected mission", context: "standard", sample: "packet example", complete: (ctx) => workflowArgs(ctx, true), build: (name) => name ? { type: "execution-open", key: `packet:${name}` } : { type: "error", message: "packet needs a queue id" } },
   {
     name: ":",
