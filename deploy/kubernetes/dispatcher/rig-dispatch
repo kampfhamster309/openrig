@@ -10,6 +10,7 @@
 #   rig-dispatch report  <ticket>|--all [--dir <root>] [--json]
 #   rig-dispatch answer  <ticket> <qitem> <decision text>
 #   rig-dispatch delete  <ticket> [--dir <root>] [--force]
+#   rig-dispatch hub-sync [--dry-run]
 #
 # State lives in Kubernetes labels and annotations and in the team pod, so every command can be
 # run again. The dispatcher reaches team pods only through `kubectl exec`; inside the pod, `rig`
@@ -27,6 +28,8 @@
 # RIG_DISPATCH_WATCH_TICK (default 1s) is how often a quiet stream is re-checked for the verdict and
 # the deadline; RIG_DISPATCH_WATCH_BACKSTOP (default 180s) is how often a quiet stream also gets a
 # status read anyway; RIG_DISPATCH_EVENTS_MAX_TIME (default 300s) bounds one stream.
+# Hub registry edits are serialized in the hub pod under RIG_DISPATCH_HUB_LOCK (default
+# ~/.openrig/.registry.lock there), waiting RIG_DISPATCH_HUB_LOCK_TIMEOUT seconds (default 60).
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -42,7 +45,7 @@ k() { "$KUBECTL" -n "$NS" "$@"; }
 need() { command -v "$1" >/dev/null || die "$1 is required"; }
 need jq; need "$KUBECTL"
 
-usage() { sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
+usage() { sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
 
 # PROJ-123 -> proj-123: a DNS label that is also a valid OpenRig host id (no dots).
 slug_of() {
@@ -98,19 +101,14 @@ hub_npm_root() {
   printf '%s' "$_hub_npm_root"
 }
 
-# There is no `rig host remove`, so hosts.yaml is edited directly, and host-bindings.json (the
-# trust-on-first-use alias sidecar) is cleaned in the same pass:
-#   HUB_MODE=has    exit 0 if HUB_HOST_ID is registered, 1 if it is not
-#   HUB_MODE=remove drop that entry and its alias, rewriting each file via tmp + rename at 0600
-hub_registry() {
-  local mode=$1 host=$2 root
-  root=$(hub_npm_root)
-  printf '%s\n' '
+# The part every hub-side node script needs: where the registry lives, the same YAML parser `rig host
+# add` writes with, and the tmp + rename write the CLI uses. Shared because two readers of hosts.yaml
+# that disagree about its shape is how a registry gets corrupted rather than merely edited.
+HUB_NODE_PRELUDE='
 const fs = require("fs"), path = require("path");
 const home = process.env.OPENRIG_HOME || process.env.HOME + "/.openrig";
 const yamlFile = path.join(home, "hosts.yaml");
 const bindFile = path.join(home, "host-bindings.json");
-const mode = process.env.HUB_MODE, id = process.env.HUB_HOST_ID;
 function loadYaml() {
   const r = process.env.NPM_ROOT;
   if (r) { try { return require(path.join(r, "@openrig/cli/node_modules/yaml")); } catch (e) {}
@@ -124,6 +122,124 @@ function writeAtomic(file, text) {
   fs.writeFileSync(tmp, text, { mode: 0o600 });
   fs.renameSync(tmp, file);
 }
+'
+
+# --- the registry lock -------------------------------------------------------------------------
+#
+# Every hub-side registry mutation runs under this lock. `rig host add` and the removal below each
+# read hosts.yaml, edit it in memory and write the whole file back, and `rig config set` does the same
+# to the settings file -- so a `start` and a `delete` for two different tickets, at the same moment,
+# can each read a file the other has not written yet and one team's entry is simply lost. Locking each
+# edit closes exactly that, and it is the whole of what it closes: a multi-step register is still not
+# atomic, so a crash between the bearer write and `rig host add` still leaves a half-registered team.
+# That was true before the lock, it is reported by hub_register's own errors, and `hub-sync` repairs it.
+HUB_LOCK="${RIG_DISPATCH_HUB_LOCK:-/home/openrig/.openrig/.registry.lock}"
+HUB_LOCK_TIMEOUT="${RIG_DISPATCH_HUB_LOCK_TIMEOUT:-60}"
+
+# hub_locked <cmd> [args...] -- the command, with its stdin, holding the lock.
+#
+# The fd form, not `flock -w N file -c cmd`: util-linux flock exits 1 when it gives up waiting, and 1
+# is also what a failed edit exits with, so the -c form cannot tell "someone else is editing the hub"
+# from "the edit failed". Here giving up is its own exit 97, which no edit produces, so the caller can
+# say the useful part. The lock is taken on a file in the hub's own volume, beside the files it
+# protects, and stdin passes through untouched because the bearer travels on it and must not appear in
+# any command line.
+hub_locked() {
+  hub_exec sh -c '
+    to=$1; lock=$2; shift 2
+    exec 9>>"$lock" || exit 96
+    flock -w "$to" 9 || exit 97
+    "$@"
+  ' sh "$HUB_LOCK_TIMEOUT" "$HUB_LOCK" "$@"
+}
+
+# One locked edit, with the wait explained. Hands back the command's own code, or 1 for a lock that
+# stayed busy for the whole timeout.
+hub_edit() {
+  local rc=0
+  hub_locked "$@" || rc=$?
+  if [ "$rc" = 97 ]; then
+    log "the hub's registry lock on $HUB_POD was held for ${HUB_LOCK_TIMEOUT}s by another edit, so this one stopped waiting. Run it again, or raise RIG_DISPATCH_HUB_LOCK_TIMEOUT."
+    return 1
+  fi
+  return "$rc"
+}
+
+# Everything the hub's registry is, as one JSON object: the hosts.yaml entries, the names in hosts.d,
+# and the aliases in host-bindings.json with the host id each one points at. A read, so it takes no
+# lock -- a snapshot that a concurrent edit moves on is harmless, because hub-sync re-reads before it
+# judges anything.
+hub_inspect() {
+  local root
+  root=$(hub_npm_root)
+  printf '%s%s\n' "$HUB_NODE_PRELUDE" '
+const YAML = loadYaml();
+let doc = {};
+try { doc = YAML.parse(fs.readFileSync(yamlFile, "utf8")) || {}; } catch (e) { /* no registry yet */ }
+const hosts = Array.isArray(doc.hosts) ? doc.hosts : [];
+let dir = [];
+try { dir = fs.readdirSync(path.join(home, "hosts.d")); } catch (e) { /* no bearer files yet */ }
+// The sidecar as alias -> the host id it points at, not just the names. A name cannot say who owns an
+// alias: a binding called t-something that points at a hand-made entry belongs to that entry, and an
+// orphan pass reading only the names would delete a hand-made alias along with a real leftover.
+let bindings = {};
+try {
+  const b = JSON.parse(fs.readFileSync(bindFile, "utf8")).bindings || {};
+  for (const [k, v] of Object.entries(b)) bindings[k] = v && typeof v.hostId === "string" ? v.hostId : "";
+} catch (e) { /* no sidecar */ }
+// Which hosts the hub has a per-host subscription node for. Only the NAMES come from the config file,
+// because the CLI has no verb that enumerates a dynamic key class; the VALUE stays on `rig config get`,
+// the surface that owns it. Without this list a subscription left behind by a half-finished unregister
+// is invisible, because nothing points at the host it belongs to any more.
+let subs = [];
+try {
+  const cfg = JSON.parse(fs.readFileSync(path.join(home, "config.json"), "utf8"));
+  const s = cfg && cfg.feed && typeof cfg.feed === "object" ? cfg.feed.subscriptions : null;
+  if (s && typeof s === "object" && !Array.isArray(s)) subs = Object.keys(s);
+} catch (e) { /* no config file, or no subscriptions written yet */ }
+console.log(JSON.stringify({
+  hosts: hosts.filter((h) => h && typeof h.id === "string").map((h) => ({
+    id: h.id, transport: h.transport || "", url: h.url || "", bearer_file: h.bearer_file || "",
+  })),
+  bearerFiles: dir,
+  bindings,
+  subscriptions: subs,
+}));
+' | hub_exec env NPM_ROOT="$root" node -
+}
+
+# The per-host subscription is what makes the hub read that team's queue at all; a host without it is
+# listed and shows no queue, which misleads in its own way. Read through the CLI rather than the
+# settings file, because `config set` and `config reset` are what write it -- one definition of the
+# setting, on the surface that owns it. Anything that is not exactly `true` counts as off, which covers
+# unset, false and whatever the CLI prints for a key nobody ever set, without my guessing which.
+hub_subscription() { # <host id> -> true | false
+  local v=""
+  # </dev/null: `kubectl exec -i` copies the caller's stdin into the pod whether or not the command
+  # inside reads it, so a read like this one would drink whatever the caller was reading -- and on a
+  # real cluster a repair's hub calls ate the rest of hub-sync's plan that way.
+  v=$(hub_exec rig config get "feed.subscriptions.$1.enabled" 2>/dev/null </dev/null | tail -n1) || true
+  if [ "${v:-}" = true ]; then printf true; else printf false; fi
+}
+
+# What the hub holds in a bearer file, byte for byte -- `start` writes the token with no trailing
+# newline, so this is the same bytes the team's Secret holds. A read, so it takes no lock, and a file
+# that is not there or not readable is an empty answer rather than a failed one: the caller treats
+# "not what the Secret holds" the same way whichever reason it was.
+hub_bearer_contents() { hub_exec cat "$1" 2>/dev/null </dev/null || true; }
+
+# There is no `rig host remove`, so hosts.yaml is edited directly, and host-bindings.json (the
+# trust-on-first-use alias sidecar) is cleaned in the same pass:
+#   HUB_MODE=has    exit 0 if HUB_HOST_ID is registered, 1 if it is not
+#   HUB_MODE=remove drop that entry and its alias, rewriting each file via tmp + rename at 0600
+hub_registry() {
+  local mode=$1 host=$2 root runner
+  root=$(hub_npm_root)
+  # Reading needs no lock. Writing does: both writers read hosts.yaml, change it in memory and write
+  # the whole file back, so the one that finishes last silently drops what the other just added.
+  if [ "$mode" = has ]; then runner=hub_exec; else runner=hub_edit; fi
+  printf '%s%s\n' "$HUB_NODE_PRELUDE" '
+const mode = process.env.HUB_MODE, id = process.env.HUB_HOST_ID;
 if (!fs.existsSync(yamlFile)) process.exit(mode === "has" ? 1 : 0);
 const YAML = loadYaml();
 const doc = YAML.parse(fs.readFileSync(yamlFile, "utf8")) || {};
@@ -136,6 +252,11 @@ if (kept.length !== hosts.length) {
 }
 // A leftover alias is harmless - a re-dispatched slug presents the same self-id - but it is
 // residue, and "the hub forgot the team" should mean the hub forgot the team.
+// The CLI has its own writer for this file (host-bindings.ts) and it takes a mkdir lock beside it, so
+// an observation landing on the hub while this removal is in flight could rewrite the alias back. The
+// same lock, held the same fail-open way: a busy lock must not turn a removal into a failure, and a
+// resurrected alias is self-healing residue rather than corruption.
+// (This script sits inside a single-quoted shell string, so it cannot carry apostrophes.)
 try {
   const b = JSON.parse(fs.readFileSync(bindFile, "utf8"));
   if (b && b.bindings) {
@@ -143,11 +264,20 @@ try {
     for (const [k, v] of Object.entries(b.bindings)) {
       if (k === id || (v && v.hostId === id)) { delete b.bindings[k]; n++; }
     }
-    if (n > 0) writeAtomic(bindFile, JSON.stringify(b, null, 2) + "\n");
+    if (n > 0) {
+      const lockDir = bindFile + ".lock";
+      let locked = false;
+      try { fs.mkdirSync(lockDir); locked = true; } catch (e) { /* held or unmakeable: rewrite anyway */ }
+      try {
+        writeAtomic(bindFile, JSON.stringify(b, null, 2) + "\n");
+      } finally {
+        if (locked) { try { fs.rmdirSync(lockDir); } catch (e) { /* best-effort, as the CLI does it */ } }
+      }
+    }
   }
 } catch (e) { /* no sidecar, or unreadable: nothing to clean */ }
 console.log(kept.length === hosts.length ? "absent" : "removed " + id);
-' | hub_exec env NPM_ROOT="$root" HUB_MODE="$mode" HUB_HOST_ID="$host" node -
+' | "$runner" env NPM_ROOT="$root" HUB_MODE="$mode" HUB_HOST_ID="$host" node -
 }
 
 hub_register() {
@@ -156,7 +286,7 @@ hub_register() {
   host=$(name_of "$slug"); bf=$(hub_bearer_file "$slug"); sub="feed.subscriptions.$host.enabled"
 
   if ! hub_ready; then
-    log "WARNING: no Ready hub pod $HUB_POD, so team $host is NOT registered with any hub: no hosts.yaml entry, no bearer file $bf, no $sub. The team works; the hub just does not see it. Re-run '$0 start $ticket' once the hub is Ready."
+    log "WARNING: no Ready hub pod $HUB_POD, so team $host is NOT registered with any hub: no hosts.yaml entry, no bearer file $bf, no $sub. The team works; the hub just does not see it. Re-run '$0 start $ticket' once the hub is Ready, or '$0 hub-sync' to register every team the hub is missing."
     return 0
   fi
   local url bearer
@@ -165,14 +295,14 @@ hub_register() {
   [ -n "$bearer" ] || die "secret $host has no bearer key; cannot register it with the hub"
 
   # The bearer travels on stdin, never in a command line the node can see.
-  printf '%s' "$bearer" | hub_exec sh -c "umask 077; mkdir -p $(dirname "$bf"); cat > '$bf'; chmod 0600 '$bf'" \
+  printf '%s' "$bearer" | hub_edit sh -c "umask 077; mkdir -p $(dirname "$bf"); cat > '$bf'; chmod 0600 '$bf'" \
     || die "could not write $bf in $HUB_POD; $host has no bearer file on the hub"
 
   if hub_registry has "$host" >/dev/null 2>&1; then
     log "hub already has host $host"
   else
-    hub_exec rig host add --id "$host" --transport http --url "$url" --bearer-file "$bf" \
-      --notes "ticket $ticket, rig ${rig:-none}" >/dev/null \
+    hub_edit rig host add --id "$host" --transport http --url "$url" --bearer-file "$bf" \
+      --notes "ticket $ticket, rig ${rig:-none}" </dev/null >/dev/null \
       || die "the hub refused to register $host; it has a bearer file but no hosts.yaml entry"
     # Re-read rather than trust the verb: a subscription for a host missing from
     # hosts.yaml makes the hub report the team as unreachable forever.
@@ -182,7 +312,7 @@ hub_register() {
   fi
   # Without the subscription the hub lists the host but never reads its queue state, which is
   # as misleading as a missing host, so it fails the same way instead of being logged away.
-  hub_exec rig config set "$sub" true >/dev/null \
+  hub_edit rig config set "$sub" true </dev/null >/dev/null \
     || die "host $host is registered but $sub is not true: the hub will show it without its queue"
 }
 
@@ -192,19 +322,369 @@ hub_unregister() {
   host=$(name_of "$slug"); bf=$(hub_bearer_file "$slug"); sub="feed.subscriptions.$host.enabled"
 
   if ! hub_ready; then
-    log "WARNING: no Ready hub pod $HUB_POD, so $host is STILL registered with it. Once the hub is Ready, clean it by hand: drop the $host entry from ~/.openrig/hosts.yaml, run 'rig config reset $sub', and delete ~/.openrig/hosts.d/$host.bearer."
+    log "WARNING: no Ready hub pod $HUB_POD, so $host is STILL registered with it. Once the hub is Ready, '$0 hub-sync' drops it again: the entry is stale there and no team StatefulSet backs it. If that is not enough, clean it by hand: drop the $host entry from ~/.openrig/hosts.yaml, run 'rig config reset $sub', and delete ~/.openrig/hosts.d/$host.bearer."
     return 0
   fi
   local ok=1
-  hub_registry remove "$host" >/dev/null 2>&1 || { ok=0; log "could not remove $host from the hub's hosts.yaml or host-bindings.json"; }
+  # Stdout is noise here; stderr is not. The lock timeout is printed on stderr, and swallowing it would
+  # turn "someone else is editing the hub" into a bare "could not", which is the least useful thing to
+  # say about a failure the operator can do something about.
+  hub_registry remove "$host" >/dev/null || { ok=0; log "could not remove $host from the hub's hosts.yaml or host-bindings.json"; }
   # `rig config reset` is the unset: it drops the whole feed.subscriptions.<host> node.
-  hub_exec rig config reset "$sub" >/dev/null 2>&1 || { ok=0; log "could not reset $sub on the hub"; }
-  hub_exec rm -f "$bf" >/dev/null 2>&1 || { ok=0; log "could not remove $bf from the hub"; }
+  hub_edit rig config reset "$sub" </dev/null >/dev/null || { ok=0; log "could not reset $sub on the hub"; }
+  hub_edit rm -f "$bf" </dev/null >/dev/null || { ok=0; log "could not remove $bf from the hub"; }
   if [ "$ok" = 1 ]; then
     log "unregistered $host from the hub"
   else
     log "WARNING: $host is only partly unregistered; check hosts.yaml, $sub and $bf on $HUB_POD by hand"
   fi
+}
+
+# --- hub-sync ---------------------------------------------------------------------------------
+#
+# `start` and `delete` keep the hub's registry in step for the one ticket each is about, which holds
+# only while nothing else removes a StatefulSet and every hub call each makes succeeds. When they do
+# not -- the hub was not Ready, a StatefulSet went by way of `kubectl delete`, two edits interleaved --
+# the registry and the cluster disagree for good and somebody repairs it by hand. This is that repair
+# as a command: read the cluster, read the hub, make the two agree, and say what was found.
+#
+# Nothing calls it, on purpose. `start <ticket>` rewriting some other ticket's registration is a
+# surprise with a large blast radius, and a command that did that could not keep its own exit codes;
+# `watch --all` would pay a hub read forever to fix a drift that is rare. What the drift gets instead
+# is to be announced where it is created -- the warnings in hub_register and hub_unregister name this
+# command -- so the repair is one command away and stays a deliberate, named action.
+
+# The plan's field separator. Not a tab: a tab is IFS whitespace, and `read` would collapse the empty
+# field a team with no ticket handed over has, shifting every column after it one place to the left.
+SYNC_SEP=$'\x1f'
+
+# A slug `slug_of` could have produced. That is what makes a `t-` id the dispatcher's to reason about.
+sync_is_slug() { printf '%s' "$1" | grep -Eq '^[a-z0-9][a-z0-9-]*$'; }
+
+# One line per thing the registry says about the cluster, SYNC_SEP-separated:
+#
+#   finding  action  slug  host id  what was found
+#
+# finding is ok, missing, incomplete, stale, skip or foreign; action is register, complete, rewrite,
+# unregister or none. The pass that plans the repairs and the pass that checks the result both come
+# from here, so "the registry matches the cluster" is one definition rather than two that can drift.
+# Three passes, one per place a registration can be recorded: every team the cluster has, every entry
+# the hub's hosts.yaml has, and every leftover part the hub has with no entry to hang it on.
+#
+# Ownership, which is the part that could destroy something, is decided in two pieces. An entry whose
+# id is a team's is owned because the cluster says so, whatever it currently holds -- so a team entry
+# with a wrong url is repaired. An entry with no StatefulSet behind it has nothing vouching for it, so
+# it is removed only when it is exactly what `start` writes and nothing else could plausibly be. A
+# hand-made host is never touched, and a hand-made host that merely borrowed the `t-` naming is not
+# touched either: a repair tool that deletes a person's entry is worse than one that leaves a stale
+# row and says so.
+sync_plan() { # <teams> <ready-map> <hub-state>
+  local teams=$1 ready=$2 hub=$3
+  local slug name qitem ticket rig state have url bf transport want_url want_bf why
+  while IFS=$SYNC_SEP read -r slug name qitem ticket rig; do
+    [ -n "$slug" ] || continue
+    want_url=$(hub_host_url "$slug"); want_bf=$(hub_bearer_file "$slug")
+    if [ -z "$qitem" ]; then
+      printf 'skip\x1fnone\x1f%s\x1f%s\x1fno ticket handed over yet, so the hub has no business knowing it\n' "$slug" "$name"
+      continue
+    fi
+    if [ "$(jq -r --arg n "$(pod_of "$slug")" '.[$n] // false' <<<"$ready")" != true ]; then
+      printf 'skip\x1fnone\x1f%s\x1f%s\x1fhanded over but the pod is not Ready, so there is nothing to dial yet\n' "$slug" "$name"
+      continue
+    fi
+    have=$(jq -c --arg id "$name" '.hosts[] | select(.id == $id)' <<<"$hub")
+    if [ -z "$have" ]; then
+      printf 'missing\x1fregister\x1f%s\x1f%s\x1fReady and handed over, but the hub has no %s entry\n' "$slug" "$name" "$name"
+      continue
+    fi
+    url=$(jq -r '.url // ""' <<<"$have"); bf=$(jq -r '.bearer_file // ""' <<<"$have")
+    transport=$(jq -r '.transport // ""' <<<"$have")
+    if [ "$transport" != http ] || [ "$url" != "$want_url" ] || [ "$bf" != "$want_bf" ]; then
+      printf 'incomplete\x1frewrite\x1f%s\x1f%s\x1fthe entry says transport [%s] url [%s] bearer_file [%s], not what start writes\n' \
+        "$slug" "$name" "$transport" "$url" "$bf"
+      continue
+    fi
+    # The bearer is what the hub dials with, and nothing rotates it: a Secret that changed, or a file
+    # that went empty or unreadable, leaves an entry that reads as registered and authenticates as
+    # refused. So the bytes are compared, not just the path.
+    why=""
+    if [ "$(jq -r --arg f "$name.bearer" 'if (.bearerFiles | index($f)) then "y" else "n" end' <<<"$hub")" != y ]; then
+      why="no $want_bf file on the hub"
+    elif [ "$(hub_bearer_contents "$want_bf")" != "$(team_bearer "$slug")" ]; then
+      why="the bearer file on the hub is not what secret $name holds, so the hub cannot dial it"
+    elif [ "$(hub_subscription "$name")" != true ]; then
+      why="feed.subscriptions.$name.enabled is not true, so the hub shows it without its queue"
+    fi
+    if [ -n "$why" ]; then
+      printf 'incomplete\x1fcomplete\x1f%s\x1f%s\x1f%s\n' "$slug" "$name" "$why"
+    else
+      printf 'ok\x1fnone\x1f%s\x1f%s\x1fregistered with the url, bearer and subscription start writes\n' "$slug" "$name"
+    fi
+  done < <(jq -r --arg u "$SYNC_SEP" '.[] | [.slug, .name, .qitem, .ticket, .rig] | join($u)' <<<"$teams")
+
+  local id
+  while IFS=$SYNC_SEP read -r id transport url bf; do
+    [ -n "$id" ] || continue
+    slug=${id#t-}
+    if [ "$slug" = "$id" ]; then
+      printf 'foreign\x1fnone\x1f-\x1f%s\x1fnot a team id at all, so not an entry the dispatcher wrote: left alone\n' "$id"
+      continue
+    fi
+    if ! sync_is_slug "$slug"; then
+      printf 'foreign\x1fnone\x1f-\x1f%s\x1fa t- id no ticket name could make: left alone\n' "$id"
+      continue
+    fi
+    # A team that is still there was covered by the pass above, whatever its entry looks like now.
+    if [ "$(jq -r --arg s "$slug" '[.[] | select(.slug == $s)] | length' <<<"$teams")" != 0 ]; then continue; fi
+    if [ "$transport" = http ] && [ "$url" = "$(hub_host_url "$slug")" ] && [ "$bf" = "$(hub_bearer_file "$slug")" ]; then
+      printf 'stale\x1funregister\x1f%s\x1f%s\x1fthe dispatcher wrote this entry and no team StatefulSet is behind it\n' "$slug" "$id"
+    else
+      printf 'foreign\x1fnone\x1f%s\x1f%s\x1fa t- id with a url, bearer path or transport start never writes: left alone\n' "$slug" "$id"
+    fi
+  done < <(jq -r --arg u "$SYNC_SEP" '.hosts[] | [.id, .transport // "", .url // "", .bearer_file // ""] | join($u)' <<<"$hub")
+
+  # The third pass: the parts of a registration that are NOT a hosts.yaml entry. A team whose entry is
+  # gone still has a bearer file, a subscription and an alias sitting on the hub, and the pass above
+  # cannot see them because it walks hosts.yaml. That is not a curiosity: `hub_unregister` is three
+  # independent steps and any one of them can fail -- a lock that stayed busy, for one -- and a failed
+  # `delete` leaves precisely this. With no entry pointing anywhere, the only thing that vouches for a
+  # part is its dispatcher-shaped name, so the bar is a `t-<slug>` name a ticket could have made, no
+  # entry claiming it, and no StatefulSet behind it. "Claiming" is the wide question, not the narrow
+  # one: an entry claims the id it holds, the bearer file it names and the alias that points back at
+  # it, because those are the parts an unregister of that name would remove. That is what keeps a
+  # hand-made host's files safe even when one of them is named like a team's, and it is what keeps the
+  # four-field rule above as the only way a whole entry is ever removed.
+  local part claimed
+  while IFS= read -r id; do
+    [ -n "$id" ] || continue
+    slug=${id#t-}
+    [ "$slug" != "$id" ] || continue
+    sync_is_slug "$slug" || continue
+    [ "$(jq -r --arg s "$slug" '[.[] | select(.slug == $s)] | length' <<<"$teams")" = 0 ] || continue
+    # Is this part claimed by an entry that is still in hosts.yaml? An entry claims three names: its
+    # own id, the bearer file it points at, and the alias whose binding points back at it. All three
+    # have to be asked, because the shape that destroys something is the hand-made host that keeps its
+    # token in a file named t-foo.bearer: the id t-foo has no entry of its own, so the file reads as a
+    # leftover, and "finishing" it deletes a credential while the run reports a match. The file an
+    # unregister would remove is exactly hub_bearer_file, so that is what an entry has to name to claim
+    # it -- a file elsewhere with the same name is a different file.
+    # Hands back "", or <kind>:<entry id> -- self (an entry holds the id), file (an entry names this
+    # bearer file) or alias (this alias points at a live entry). self stays quiet: that entry has its
+    # own row in the pass above, and an unregister of it takes these parts with it. file and alias are
+    # said out loud, because a part that belongs to somebody else is worth naming rather than leaving a
+    # person to wonder why a leftover is standing there.
+    claimed=$(jq -r --arg id "$id" --arg bf "$(hub_bearer_file "$slug")" '
+      (.bindings[$id] // "") as $bound
+      | ([.hosts[] | select(.id == $id)      | .id] | first // "") as $byId
+      | ([.hosts[] | select(.bearer_file == $bf) | .id] | first // "") as $byFile
+      | ([.hosts[] | select(.id == $bound)   | .id] | first // "") as $byAlias
+      | if   $byId != "" then "self:" + $byId
+        elif $byFile != "" then "file:" + $byFile
+        elif $byAlias != "" then "alias:" + $byAlias
+        else "" end' <<<"$hub")
+    case "$claimed" in
+      self:*) continue ;;
+      file:*)
+        printf 'foreign\x1fnone\x1f%s\x1f%s\x1fthe bearer file %s is what entry %s dials with, so it is not a leftover at all: left alone\n' \
+          "$slug" "$id" "$(hub_bearer_file "$slug")" "${claimed#file:}"
+        continue ;;
+      alias:*)
+        printf 'foreign\x1fnone\x1f%s\x1f%s\x1fthe %s alias points at entry %s, so it is not a leftover at all: left alone\n' \
+          "$slug" "$id" "$id" "${claimed#alias:}"
+        continue ;;
+    esac
+    part=""
+    if [ "$(jq -r --arg f "$id.bearer" 'if (.bearerFiles | index($f)) then "y" else "n" end' <<<"$hub")" = y ]; then
+      part="the bearer file $(hub_bearer_file "$slug")"
+    elif [ "$(jq -r --arg a "$id" 'if (.bindings | has($a)) then "y" else "n" end' <<<"$hub")" = y ]; then
+      part="the $id alias in host-bindings.json"
+    elif [ "$(hub_subscription "$id")" = true ]; then
+      part="feed.subscriptions.$id.enabled"
+    else
+      continue
+    fi
+    printf 'stale\x1funregister\x1f%s\x1f%s\x1fno hosts.yaml entry and no team StatefulSet, and %s is left behind\n' \
+      "$slug" "$id" "$part"
+  done < <(jq -r '([.bearerFiles[] | select(endswith(".bearer")) | .[0:-7]] + (.bindings | keys) + .subscriptions
+    | unique | .[])' <<<"$hub")
+}
+
+sync_verb() {
+  case "$1" in
+    register) printf 'registering it' ;;
+    complete) printf 'completing it' ;;
+    rewrite) printf 'rewriting it from scratch' ;;
+    unregister) printf 'unregistering it' ;;
+    *) printf '%s' "$1" ;;
+  esac
+}
+
+sync_bad_count() { printf '%s\n' "$1" | awk -F"$SYNC_SEP" '
+  BEGIN { n = 0 }
+  $1 == "stale" || $1 == "missing" || $1 == "incomplete" { n++ }
+  END { print n }'; }
+
+# The cluster side of the plan, read into SYNC_TEAMS and SYNC_READY.
+#
+# A failed read is NOT an empty cluster, and here the difference is destructive: an empty team list
+# makes every dispatcher-shaped entry look stale and unregisters all of them. `hub_ready` passing does
+# not rule it out -- one pod GET can succeed while the list times out, is throttled, or is refused by
+# RBAC -- so a failed read stops the run before it touches anything, the way `team_slugs` lets kubectl
+# fail loudly. The pod list is held to the same bar: a failed read there only makes every team look
+# not-Ready, which is safe but still lets the run end by claiming a registry matches a cluster it never
+# read.
+SYNC_TEAMS='[]'
+SYNC_READY='{}'
+
+sync_read_cluster() { # <stage, for the message> -> non-zero when nothing could be read
+  local stage=$1 sts_list pod_list
+  if ! sts_list=$(k get statefulsets -l "$ANN/role=team" -o json 2>&1); then
+    echo "hub-sync: could not ${stage} the team StatefulSets in $NS: ${sts_list}" >&2
+    return 1
+  fi
+  if ! pod_list=$(k get pods -l "$ANN/role=team" -o json 2>&1); then
+    echo "hub-sync: could not ${stage} the team pods in $NS: ${pod_list}" >&2
+    return 1
+  fi
+  SYNC_TEAMS=$(jq -c --arg a "$ANN" '[.items[] | {
+      slug: (.metadata.labels[$a + "/ticket"] // ""),
+      name: .metadata.name,
+      qitem: (.metadata.annotations[$a + "/qitem"] // ""),
+      ticket: (.metadata.annotations[$a + "/ticket-key"] // ""),
+      rig: (.metadata.annotations[$a + "/rig"] // "")}]
+    | map(select(.slug != ""))' <<<"$sts_list") || return 1
+  SYNC_READY=$(jq -c '[.items[] | {(.metadata.name): (any(.status.conditions[]?; .type == "Ready" and .status == "True"))}] | add // {}' <<<"$pod_list") || return 1
+}
+
+# Still gone? The plan is a snapshot taken before the first edit, and a team can come back while the run
+# is working -- a `delete` and a `start` of the same ticket is enough. Unregistering a team that exists
+# again is the one mistake this command must never make, so the StatefulSet is checked again here, in
+# the moment between deciding and doing.
+#
+# Only a NotFound answers "gone". A read that failed for another reason -- throttled, refused, a server
+# that would not answer -- is not evidence that the team is absent, and treating it as though it were
+# would unregister a team that is sitting right there, which is the same mistake the labelled list read
+# used to make one level up. `--ignore-not-found -o name` prints nothing and exits 0 when the
+# StatefulSet is missing and exits non-zero with the server's own words for every other failure, so the
+# two are tellable apart. Hands back 0 gone, 1 still there, 2 could not tell.
+sync_team_still_gone() { # <slug>
+  local name out rc=0
+  name=$(name_of "$1")
+  out=$(k get statefulset "$name" --ignore-not-found -o name 2>&1) || rc=$?
+  if [ "$rc" != 0 ]; then
+    echo "hub-sync: could not re-check $name before unregistering it: ${out}" >&2
+    return 2
+  fi
+  [ -z "$out" ]
+}
+
+# Each repair runs in a subshell because hub_register and hub_unregister `die` on what is fatal for
+# them, and one team that will not register should not cancel the others off the list.
+sync_apply() { # <action> <slug> <host id> <teams>
+  local action=$1 slug=$2 host=$3 teams=$4 ticket rig
+  ticket=$(jq -r --arg s "$slug" '.[] | select(.slug == $s) | .ticket' <<<"$teams")
+  rig=$(jq -r --arg s "$slug" '.[] | select(.slug == $s) | .rig' <<<"$teams")
+  case "$action" in
+    register|complete) ( hub_register "$slug" "$ticket" "$rig" ) ;;
+    rewrite) ( hub_unregister "$slug" ) && ( hub_register "$slug" "$ticket" "$rig" ) ;;
+    unregister) ( hub_unregister "$slug" ) ;;
+    *) return 1 ;;
+  esac
+}
+
+cmd_hub_sync() {
+  local dry=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --dry-run) dry=1; shift ;;
+      -*) die "unknown option $1" ;;
+      *) die "hub-sync reconciles every team in $NS and takes no ticket (got '$1')" ;;
+    esac
+  done
+  local teams ready
+
+  # Before anything else, and it touches nothing: with no hub there is no registry to read, and
+  # guessing at one from the cluster alone would mean writing to a hub that is not answering.
+  if ! hub_ready; then
+    echo "hub-sync: no Ready hub pod $HUB_POD in $NS, so nothing was read and nothing was changed."
+    echo "hub-sync: the hub itself is what is missing. Once it is Ready, run '$0 hub-sync'."
+    return 3
+  fi
+
+  local hub_state plan finding action slug host detail bad gone
+  sync_read_cluster "read" || {
+    echo "hub-sync: nothing was read and nothing was changed. A read that failed is not a cluster with no teams in it; run '$0 hub-sync' again once kubectl answers." >&2
+    return 1
+  }
+  teams=$SYNC_TEAMS; ready=$SYNC_READY
+
+  hub_state=$(hub_inspect) || { echo "hub-sync: could not read the registry from $HUB_POD" >&2; return 1; }
+  echo "hub-sync: $HUB_POD is Ready: $(jq length <<<"$teams") team StatefulSet(s), $(jq '.hosts | length' <<<"$hub_state") entr(s) in its registry."
+  if [ "$dry" = 1 ]; then echo "hub-sync: --dry-run, so nothing is changed."; fi
+
+  plan=$(sync_plan "$teams" "$ready" "$hub_state")
+  while IFS=$SYNC_SEP read -r finding action slug host detail; do
+    [ -n "$finding" ] || continue
+    if [ "$action" = none ]; then
+      printf 'hub-sync: %-10s %-14s %s\n' "$finding" "$host" "$detail"
+      continue
+    fi
+    # The plan is a snapshot, and the cluster can move while this run works -- a `delete` and a `start`
+    # of the same ticket is enough. Unregistering a team that exists again is the one thing this command
+    # must never do, so the StatefulSet is checked again in the moment between deciding and doing, and a
+    # check that could not be made counts as "do not remove it" rather than as "it is gone".
+    if [ "$action" = unregister ] && [ "$dry" != 1 ]; then
+      gone=0
+      sync_team_still_gone "$slug" || gone=$?
+      if [ "$gone" = 2 ]; then
+        printf 'hub-sync: %-10s %-14s %s\n' "skip" "$host" \
+          "its team StatefulSet could not be checked again, so it was left registered"
+        continue
+      fi
+      if [ "$gone" != 0 ]; then
+        printf 'hub-sync: %-10s %-14s %s -- left alone: its team StatefulSet is back\n' \
+          "skip" "$host" "the cluster moved while this run was working"
+        continue
+      fi
+    fi
+    if [ "$dry" = 1 ]; then
+      printf 'hub-sync: %-10s %-14s %s -- would %s\n' "$finding" "$host" "$detail" "$(sync_verb "$action")"
+      continue
+    fi
+    printf 'hub-sync: %-10s %-14s %s -- %s\n' "$finding" "$host" "$detail" "$(sync_verb "$action")"
+    # </dev/null, and not only because a repair makes hub calls: the plan is this loop's own input, and
+    # a repair that drank the caller's stdin would drink the rest of the plan with it. Every hub call
+    # below keeps its own stdin for the same reason; this is the belt beside that braces.
+    sync_apply "$action" "$slug" "$host" "$teams" </dev/null || echo "hub-sync: could not $action $host"
+  done <<<"$plan"
+
+  bad=$(sync_bad_count "$plan")
+  if [ "$dry" = 1 ]; then
+    if [ "$bad" = 0 ]; then
+      echo "hub-sync: the registry already matches the teams in $NS; there is nothing to do."
+      return 0
+    fi
+    echo "hub-sync: $bad difference(s) from the teams in $NS. Run '$0 hub-sync' without --dry-run to repair them."
+    return 1
+  fi
+
+  # Re-read the hub rather than remember what it was just told, and re-read the cluster for the same
+  # reason: a team that came back mid-run is not stale, and judging the result from the old snapshot
+  # would report a difference that is not there. Nothing is counted good because the code wrote it, and
+  # nothing is counted bad because a snapshot has gone stale.
+  hub_state=$(hub_inspect) || { echo "hub-sync: could not re-read the registry from $HUB_POD to check the result" >&2; return 1; }
+  sync_read_cluster "re-read" || { echo "hub-sync: could not re-read the teams in $NS to check the result" >&2; return 1; }
+  teams=$SYNC_TEAMS; ready=$SYNC_READY
+  plan=$(sync_plan "$teams" "$ready" "$hub_state")
+  bad=$(sync_bad_count "$plan")
+  if [ "$bad" = 0 ]; then
+    echo "hub-sync: the hub's registry matches the teams in $NS."
+    return 0
+  fi
+  echo "hub-sync: $bad difference(s) still stand, so the registry does not match the cluster:"
+  printf '%s\n' "$plan" | awk -F"$SYNC_SEP" '
+    $1 == "stale" || $1 == "missing" || $1 == "incomplete" { print "hub-sync:   " $1 " " $4 ": " $5 }'
+  return 1
 }
 
 # --- start -------------------------------------------------------------------------------------
@@ -1561,7 +2041,7 @@ cmd_answer() {
   else
     rc=0
     out=$(hub_exec env -u OPENRIG_SESSION_NAME -u RIGGED_SESSION_NAME rig queue resolve --host "$host" \
-      "$qitem" --decision "$decision" --json 2>&1) || rc=$?
+      "$qitem" --decision "$decision" --json 2>&1 </dev/null) || rc=$?
     if [ "$rc" = 0 ]; then
       log "answer: resolved on $host through $HUB_POD as the seatless human, so the audit row names the human and the origin host"
       printf '%s\n' "$out"
@@ -1663,18 +2143,24 @@ cmd_delete() {
   log "deleted $name"
 }
 
-[ $# -ge 1 ] || usage
-cmd=$1; shift
-case "$cmd" in
-  start) cmd_start "$@" ;;
-  status|ls) cmd_status "$@" ;;
-  wait) cmd_wait "$@" ;;
-  watch) cmd_watch "$@" ;;
-  archive) cmd_archive "$@" ;;
-  collect) cmd_collect "$@" ;;
-  report) cmd_report "$@" ;;
-  answer) cmd_answer "$@" ;;
-  delete|rm) cmd_delete "$@" ;;
-  -h|--help|help) usage ;;
-  *) die "unknown command $cmd" ;;
-esac
+# The dispatch block runs only when this file is executed. Sourcing it defines the helpers and stops
+# here, which is what lets a test reach `hub_register`, `sync_plan` and the rest without the file
+# immediately running a command -- and without `usage` exiting 2 over the head of whoever sourced it.
+if [ "${BASH_SOURCE[0]:-}" = "$0" ]; then
+  [ $# -ge 1 ] || usage
+  cmd=$1; shift
+  case "$cmd" in
+    start) cmd_start "$@" ;;
+    status|ls) cmd_status "$@" ;;
+    wait) cmd_wait "$@" ;;
+    watch) cmd_watch "$@" ;;
+    archive) cmd_archive "$@" ;;
+    collect) cmd_collect "$@" ;;
+    report) cmd_report "$@" ;;
+    answer) cmd_answer "$@" ;;
+    delete|rm) cmd_delete "$@" ;;
+    hub-sync) cmd_hub_sync "$@" ;;
+    -h|--help|help) usage ;;
+    *) die "unknown command $cmd" ;;
+  esac
+fi
