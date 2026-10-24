@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# rig-dispatch: one OpenRig team pod per ticket (stage 1 of docs/proposals/factory-on-kubernetes.md).
+# rig-dispatch: one OpenRig team pod per ticket (design: deploy/kubernetes/docs/architecture.md).
 #
 #   rig-dispatch start   <ticket> --repo <url> --brief-file <file> [options]
 #   rig-dispatch status  [<ticket>] [--json]
@@ -69,14 +69,14 @@ default_image() {
   awk '/newName:/{n=$2} /newTag:/{t=$2} END{if(n&&t) print n":"t}' "$kz"
 }
 
-# --- hub (stage 2) -------------------------------------------------------------------------------
+# --- hub ---------------------------------------------------------------------------------------
 #
 # The hub (../hub) is an OpenRig daemon with no rigs whose hosts.yaml lists every team pod, so one
 # TUI shows every team at once. The dispatcher keeps it in step: `start` registers a team once its
 # pod is Ready, `delete` unregisters it, and `hub-sync` repairs the two when they have drifted -- a
 # hub that was not Ready, a StatefulSet removed by some other route, an edit that failed halfway. With
 # no Ready hub pod in the namespace every helper here is a no-op and the dispatcher behaves exactly as
-# it did in stage 1. Every mutation below runs under one lock in the hub's volume; the reads do not.
+# it does without a hub. Every mutation below runs under one lock in the hub's volume; the reads do not.
 
 HUB_POD="${RIG_DISPATCH_HUB_POD:-hub-0}"
 _hub_npm_root=""

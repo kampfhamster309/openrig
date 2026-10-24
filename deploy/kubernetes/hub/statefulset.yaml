@@ -1,6 +1,6 @@
 # The hub: one OpenRig daemon that runs no rigs. Its hosts.yaml lists every team pod, so the
-# operator's TUI talks only to this daemon and sees every team. Design: stage 2 of
-# docs/proposals/factory-on-kubernetes.md.
+# operator's TUI talks only to this daemon and sees every team. Design:
+# deploy/kubernetes/docs/architecture.md.
 #
 # One replica: the hub is the single point of truth, and its volume holds hosts.yaml, config.json
 # and one bearer file per team.
