@@ -117,7 +117,7 @@ async function run(): Promise<void> {
   // Caller-owned, like reviewCache: the fleet read's last good payload and the shape of
   // the fleet it came from, so the next poll sizes its wait from the operator's real
   // budget rather than the compiled defaults.
-  const fleetRetention: FleetReadRetention = { last: null };
+  const fleetRetention: FleetReadRetention = { last: null, lastUsage: null };
   const selectedSliceDirectory = (): string | null => {
     const current = view.get();
     if (current.scopesSelected) return current.scopesSelected.slice;

@@ -34,6 +34,7 @@ import { terminalLines } from "./terminals/terminal-model.js";
 import { detailPage, fieldLine, sectionRule, listItem, alignedRow, LABEL_W, wrapDetailLines } from "./detail.js";
 import { healthAgentLines, healthDetailLines, healthListLines, healthSummaryLine } from "./health/health-model.js";
 import type { Action, FleetSnapshot, LoadState, RecentTransitionSnap, RowFlash, Screen, ViewState } from "./types.js";
+import { FLEET_USAGE_TOP_ROWS } from "./types.js";
 
 interface ContentLine {
   text: string;
@@ -589,6 +590,78 @@ interface MotionCtx {
   loading: boolean;
 }
 
+/** Compact token count for the fleet usage block: `12.4k`, `940`. Pinned to a fixed
+ *  format rather than toLocaleString so the padded columns hold in every operator
+ *  locale — a grouping mark changing width shifts every aligned cell beside it. */
+function usageTokens(value: number): string {
+  if (!Number.isFinite(value)) return "—";
+  if (Math.abs(value) >= 1000) return `${(value / 1000).toFixed(1)}k`;
+  return String(Math.round(value));
+}
+
+/** FLEET USAGE — the hub's answer to "which team is burning fastest right now".
+ *
+ *  WHY IT LIVES ON THE INSTANCE PAGE. This is the only place the TUI shows usage today:
+ *  the CTX column of the instance/rig seat tables and the seat detail's CONTEXT block.
+ *  There was no fleet-usage surface to extend — the TUI had no token-burn read at all —
+ *  so the read goes where usage already is, on the page that describes the whole
+ *  instance rather than one rig, because a fleet-wide ranking has no per-rig home. On a
+ *  hub this page is otherwise near-empty (a hub runs no rigs of its own), which is
+ *  exactly the operator who needs it. PULSE was the other candidate and was rejected:
+ *  it is an exceptions page, and "these seats are using a lot" is not an exception.
+ *
+ *  WHAT IT NEVER DOES. It does not render, sort or total `windows[]`: those are
+ *  subscription provider windows, a runtime on API keys does not observe them, and a
+ *  percentage of one seat's window is not comparable to another's. It leads on
+ *  `tokensDelta` and `tokensPerHour`, the two numbers that mean the same thing on every
+ *  seat. A host whose usage leg failed is named as unknown with the origin's reason —
+ *  never a zero row, and never a total that silently omits it. There is no fleet-wide
+ *  tokens/hour anywhere: a rate over each seat's own sample span cannot be summed.
+ *
+ *  HEIGHT IS BOUNDED (top rows + one truncation line) because this sits ABOVE the
+ *  instance table and a long fleet must not push the operator's seats off the screen. */
+function fleetUsageLines(snap: FleetSnapshot, local: boolean): ContentLine[] {
+  // Absent with no remote hosts (the read is never asked), with an older daemon that 404s
+  // the route, and until a first read answers. Every one of those renders NOTHING: a
+  // single-machine operator's instance page is exactly as it was before this existed.
+  const usage = snap.fleetUsage;
+  if (!usage || !local) return [];
+
+  const header = [`FLEET USAGE · last ${usage.windowHours}h`];
+  if (usage.totals) {
+    header.push(`${usageTokens(usage.totals.tokensDelta)} tokens`);
+    header.push(`${usage.totals.hostsAnswered} of ${usage.totals.hostsTargeted} hosts answered`);
+    if (usage.totals.seatsUnknown > 0) header.push(`${usage.totals.seatsUnknown} seats unknown`);
+  } else {
+    // null totals means NO host answered. "0 tokens" would be the loudest lie available.
+    header.push("no host answered — usage unknown");
+  }
+  const lines: ContentLine[] = [{ text: header.join(" · ") }];
+
+  const rows = usage.top.slice(0, FLEET_USAGE_TOP_ROWS);
+  for (const seat of rows) {
+    lines.push({
+      text: `  ${usageTokens(seat.tokensDelta).padStart(6)} tok · ${usageTokens(seat.tokensPerHour).padStart(6)}/h  [${seat.hostId}] ${seat.seatSession}`,
+    });
+  }
+  // Truncation is said out loud: a cut list rendered without this is a partial fleet
+  // read presented as the whole one.
+  const more = Math.max(0, usage.totalSeatsRanked - rows.length);
+  if (more > 0) lines.push({ text: `  +${more} more ranked seats` });
+
+  // A host the hub could not get a usage read from. Its own totals are ABSENT rather
+  // than zero, and it contributed nothing to the header total — which is why the header
+  // says "N of M hosts answered" instead of a bare number.
+  for (const item of usage.items) {
+    if (item.usage.state === "ok") continue;
+    lines.push({ text: `  [${item.hostId}] usage unknown${item.usage.reason ? ` — ${item.usage.reason}` : ""}` });
+  }
+
+  lines.push({ text: `  sampled context-window readings · which team is burning fastest, not token or cost accounting` });
+  lines.push({ text: "" });
+  return lines;
+}
+
 function instanceContentLines(
   state: ViewState,
   snap: FleetSnapshot,
@@ -659,6 +732,7 @@ function instanceContentLines(
 
   lines.push(healthSummaryLine(snap, scope, contentWidth));
   lines.push(...queueSampleLines(snap, contentWidth));
+  lines.push(...fleetUsageLines(snap, scope.local));
   lines.push({ text: state.filter ? `/ filter instance rows: ${state.filter} · / replace · esc clear` : "/ filter instance rows…" });
   const columns = instanceAgentColumns(contentWidth);
   lines.push({ text: tableRow(columns, { rig: "RIG", pod: "POD", seat: "SEAT", runtime: "RT", context: "CTX", status: "STATE", queue: "Q", work: "WORK", now: "NOW" }) });

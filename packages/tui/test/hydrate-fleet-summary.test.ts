@@ -114,7 +114,7 @@ describe("a failed fleet read does not blank the page", () => {
     // not blank for a frame and come back; the reader must be told they are stale.
     let fail = false;
     const { client } = hubClient(() => (fail ? new Error("fleet-summary → 504 gateway timeout") : summary([LOCAL, REMOTE])));
-    const retention = { last: null };
+    const retention = { last: null, lastUsage: null };
     const good = await hydrateSnapshot(client, undefined, undefined, undefined, undefined, pulse(), retention);
     expect(good.stalled.length).toBeGreaterThan(0);
     expect(good.readErrors).toEqual([]);
@@ -135,10 +135,10 @@ describe("a failed fleet read does not blank the page", () => {
     // (tests, or a caller with two hubs) must not inherit each other's fleet.
     let fail = false;
     const { client } = hubClient(() => (fail ? new Error("fleet-summary → 504 gateway timeout") : summary([LOCAL, REMOTE])));
-    const mine = { last: null };
+    const mine = { last: null, lastUsage: null };
     await hydrateSnapshot(client, undefined, undefined, undefined, undefined, pulse(), mine);
     fail = true;
-    const stranger = { last: null };
+    const stranger = { last: null, lastUsage: null };
     const other = await hydrateSnapshot(client, undefined, undefined, undefined, undefined, pulse(), stranger);
     expect(other.stalled).toEqual([]);
     expect(other.readErrors.some((e) => /last successful read/.test(e))).toBe(false);
@@ -195,7 +195,7 @@ describe("a failed fleet read does not blank the page", () => {
       generatedAt: "2026-10-23T12:00:00.000Z",
       stallThresholdMinutes: 30,
     }));
-    const snap = await hydrateSnapshot(client, undefined, undefined, undefined, undefined, pulse(), { last: null });
+    const snap = await hydrateSnapshot(client, undefined, undefined, undefined, undefined, pulse(), { last: null, lastUsage: null });
     expect(snap.stalled.length).toBeGreaterThan(0);
   });
 

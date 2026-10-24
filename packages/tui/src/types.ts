@@ -217,6 +217,12 @@ export interface HostDown {
  */
 export const LOCAL_HOST_ID_SENTINEL = "local";
 
+/** How many of the fleet's top seats the TUI asks for and shows. The block sits ABOVE
+ *  the instance table, so the list is bounded at the request as well as in the render —
+ *  a fleet with fifty busy seats must not push the operator's own seats off the screen.
+ *  The payload's `totalSeatsRanked` is what makes the cut visible as "+N more". */
+export const FLEET_USAGE_TOP_ROWS = 10;
+
 /** hydrate stamps a rig-down row's id with this prefix, because a rig is not a host
  * and the row has to say which it is. Consumers that mean HOSTS specifically filter on
  * it rather than re-typing the string. */
@@ -350,6 +356,72 @@ export interface FleetSummaryRead {
     tags: string[];
     tsUpdated: string | null;
   }>;
+}
+
+/** The slice of the hub-side fleet USAGE read the TUI consumes. Structural for the
+ *  same reason as `FleetSummaryRead`: an older daemon that 404s the route is a plain
+ *  miss, not a coupling.
+ *
+ *  What the page may render is narrower than what the payload carries, and that is the
+ *  whole point of declaring it here. `windows[]` is DELIBERATELY absent: the provider
+ *  windows are subscription lanes, a runtime on API keys does not observe them, and a
+ *  percentage of one seat's window cannot be compared, sorted or added to another's.
+ *  Rendering one would report a lane that does not exist. The read leads on the two
+ *  numbers that mean the same thing on every seat: `tokensDelta` and `tokensPerHour`. */
+export interface FleetUsageRead {
+  /** The window every host was asked for, and the hub's own window start. */
+  windowHours: number;
+  sinceIso: string;
+  /** The fleet's top seats across every host that answered, each labelled with its
+   *  host by the origin. Ranked by the per-seat rate the ORIGIN computed. */
+  top: Array<{
+    hostId: string;
+    seatSession: string;
+    tokensPerHour: number;
+    tokensDelta: number;
+    resets: number;
+    spanHours: number;
+    samples: number;
+  }>;
+  /** The cap the route applied; null when the request asked for none. With
+   *  `totalSeatsRanked` this tells a reader whether the list was cut — a truncated
+   *  list rendered without that is a partial fleet read as the whole one. */
+  topCap: number | null;
+  totalSeatsRanked: number;
+  /** Seats an origin could not rank, with the ORIGIN's own reason. A seat here is
+   *  unknown, never zero. */
+  unknown: Array<{ hostId: string; seatSession: string; reason: string }>;
+  /** Summed over the hosts that ANSWERED. Null when none did: a fleet that used
+   *  nothing and a fleet nobody heard from are different answers, and only one of
+   *  them is 0. */
+  totals: {
+    tokensDelta: number;
+    resets: number;
+    seatsRanked: number;
+    seatsUnknown: number;
+    hostsAnswered: number;
+    hostsTargeted: number;
+  } | null;
+  /** Per host: the usage leg's own state, and the honest sums where there is a read.
+   *  `totals` ABSENT is the field that means "no measurement" — an empty `ranked` is
+   *  not, and reading it that way is how an unknown host renders as a zero. */
+  items: Array<{
+    hostId: string;
+    kind: "local" | "remote";
+    usage: {
+      state: "ok" | "unavailable";
+      reason?: string;
+      totals?: { tokensDelta: number; resets: number; seatsRanked: number; seatsUnknown: number };
+    };
+  }>;
+  /** The fan-out's own budget, echoed. The reader sizes its NEXT wait from these
+   *  rather than from the compiled defaults — same rule as the summary. */
+  hostTimeoutMs?: number;
+  concurrency?: number;
+  targetedHostIds?: string[];
+  /** Set only when hosts.yaml EXISTS but could not be read: the fleet is local-only
+   *  for a stated reason rather than a silently thin one. */
+  registryError?: string | null;
 }
 
 import type { MissionScopesSnap } from "./scopes/scopes-model.js";
@@ -553,6 +625,12 @@ export interface FleetSnapshot {
   stallThresholdMinutes?: number;
   /** false until the fleet summary has answered — honest-unknown vs proven-none. */
   fleetProbed: boolean;
+  /** The hub-side fleet USAGE read, carried ONLY when the registry has remote hosts.
+   *  null with no remote hosts (nothing to add up), with an older daemon that 404s the
+   *  route (absent feature, named nothing), and while a first read has not answered.
+   *  A failed read after a good one keeps the last good payload and NAMES the failure
+   *  in readErrors, exactly as the summary's does. */
+  fleetUsage: FleetUsageRead | null;
   /** PULSE UP NEXT source (increment 3) — the shipped state=pending read
    * (unclaimed backlog). Carried in the daemon's served order (ts_created DESC);
    * the render keeps only unclaimed (claimedAt null) and caps for display. */

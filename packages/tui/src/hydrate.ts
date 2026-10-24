@@ -20,8 +20,8 @@ import type { ConfigRead } from "./config/config-model.js";
 import type { ConnectionsRead, ControlPlaneRead, SlackManifestRead } from "./connections/connections-model.js";
 import { DaemonClient } from "./daemon-client.js";
 import { parse as parseYaml } from "yaml";
-import type { AgentRow, FleetSnapshot, FleetSummaryRead, HealthCoverage, HealthRecord, HostNode, NeedsItem, PodNode, QueueRead, RecentTransitionSnap, RigNode, SeatActivitySummary, SliceDetailSnap, SpecEntry, ViewState } from "./types.js";
-import { LOCAL_HOST_ID_SENTINEL, RIG_DOWN_ID_PREFIX, remoteSeatAddress } from "./types.js";
+import type { AgentRow, FleetSnapshot, FleetSummaryRead, FleetUsageRead, HealthCoverage, HealthRecord, HostNode, NeedsItem, PodNode, QueueRead, RecentTransitionSnap, RigNode, SeatActivitySummary, SliceDetailSnap, SpecEntry, ViewState } from "./types.js";
+import { LOCAL_HOST_ID_SENTINEL, RIG_DOWN_ID_PREFIX, remoteSeatAddress, FLEET_USAGE_TOP_ROWS } from "./types.js";
 import { isHumanSeatSession } from "./pulse/pulse-model.js";
 
 // Narrow read-shapes: just the served fields this module consumes (names match
@@ -409,15 +409,69 @@ export type HydrateViewContext = Pick<ViewState, "project" | "section" | "viewTa
  *    when hosts are timing out. */
 export interface FleetReadRetention {
   last: FleetSummaryRead | null;
+  /** The usage read's own last good payload. Kept BESIDE `last` rather than inside it:
+   *  the two routes fail independently, and blanking one with the other's failure would
+   *  invent a fleet change that is only a read failure. */
+  lastUsage: FleetUsageRead | null;
 }
 
 /** The reader's wait for the next poll, from the last answer's own numbers. Cold start
  *  has nothing to go on and uses the shared defaults, which is what the route would have
- *  used had the operator configured nothing. */
-export function fleetReaderTimeoutFor(last: FleetSummaryRead | null): number {
+ *  used had the operator configured nothing.
+ *
+ *  Typed on the three fields BOTH hub fan-outs echo rather than on one payload type, so
+ *  the summary and the usage read size their wait by the same rule and cannot drift into
+ *  waiting two different amounts for one fleet. */
+export function fleetReaderTimeoutFor(last: { targetedHostIds?: string[]; hostTimeoutMs?: number; concurrency?: number } | null): number {
   if (!last) return fleetSummaryReaderTimeoutMs(1);
   const hosts = last.targetedHostIds?.length || 1;
   return fleetSummaryReaderTimeoutMs(hosts, last.hostTimeoutMs, last.concurrency);
+}
+
+/** Does this fleet have a REMOTE host at all? The usage read is asked only when it
+ *  does: an operator with one machine has nothing to add up, and nothing changes for a
+ *  single-machine operator — not even a fan-out's cost behind the change.
+ *
+ *  Sized from `targetedHostIds` rather than `items`, for the reason the summary's own
+ *  comment gives: `items` only carries hosts that ANSWERED, so a fleet whose one remote
+ *  host is timing out would look local exactly when the operator most needs the read.
+ *  A payload with no `targetedHostIds` is an older daemon's, and an older daemon has no
+ *  usage route to ask either, so "no remote hosts" is the honest answer, not a guess. */
+export function fleetHasRemoteHost(summary: FleetSummaryRead | null): boolean {
+  if (!summary) return false;
+  return (summary.targetedHostIds ?? []).some((id) => id !== LOCAL_HOST_ID_SENTINEL);
+}
+
+async function readFleetUsage(
+  client: DaemonClient,
+  summary: FleetSummaryRead | null,
+  retention: FleetReadRetention | undefined,
+): Promise<{ payload: FleetUsageRead | null; failed: string | null }> {
+  if (!fleetHasRemoteHost(summary)) {
+    // Drop the retained payload, do not merely stop reading. A fleet whose remotes were
+    // removed from the registry would otherwise hold its last answer indefinitely, and if
+    // a host were added back later and its first read failed, retention would serve that
+    // arbitrarily old payload as "the last successful read" — a stale fleet presented as
+    // a live one, which is the one thing this block must never do.
+    if (retention) retention.lastUsage = null;
+    return { payload: null, failed: null };
+  }
+  const last = retention?.lastUsage ?? null;
+  try {
+    // window_hours=1: the question this block answers is "which team is burning fastest
+    // RIGHT NOW". A wider window averages a finished burst into everything after it.
+    const payload = (await client.fleetUsage({
+      windowHours: 1,
+      top: FLEET_USAGE_TOP_ROWS,
+      optional: true,
+      timeoutMs: fleetReaderTimeoutFor(last),
+    })) as FleetUsageRead;
+    if (retention) retention.lastUsage = payload;
+    return { payload, failed: null };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    return fleetReadOutcome(message, last, "fleet-usage");
+  }
 }
 
 async function readFleetSummary(
@@ -452,13 +506,24 @@ async function readFleetSummary(
 export function fleetReadOutcome(
   message: string,
   lastGood: FleetSummaryRead | null,
-): { payload: FleetSummaryRead | null; failed: string | null } {
+  label?: string,
+): { payload: FleetSummaryRead | null; failed: string | null };
+export function fleetReadOutcome(
+  message: string,
+  lastGood: FleetUsageRead | null,
+  label: string,
+): { payload: FleetUsageRead | null; failed: string | null };
+export function fleetReadOutcome<T extends FleetSummaryRead | FleetUsageRead>(
+  message: string,
+  lastGood: T | null,
+  label = "fleet-summary",
+): { payload: T | null; failed: string | null } {
   if (/→ 404/.test(message)) return { payload: null, failed: null };
   return {
     payload: lastGood,
     failed: lastGood
-      ? `fleet-summary: ${message}; showing the last successful read`
-      : `fleet-summary: ${message}`,
+      ? `${label}: ${message}; showing the last successful read`
+      : `${label}: ${message}`,
   };
 }
 
@@ -576,6 +641,15 @@ export async function hydrateSnapshot(
   const wantsRecent = wantsTopologyScope && (!topologyLeaf || topologyLeaf.kind === "host" || topologyLeaf.kind === "rig");
   const focusedTopology = !!viewContext && wantsTopologyScope && viewContext.viewTab !== "pulse";
   const broadReads = !readingOnly && !focusedTopology && !wantsConnections;
+  // The fleet usage block is drawn on the hub's OWN instance page, which is a drilled
+  // topology leaf — and a drilled leaf is exactly what `focusedTopology` switches off.
+  // Gated on `broadReads` alone, the read fired only while PULSE was showing, a page that
+  // renders none of it, so the block could never appear. Gate the fan-outs on the page
+  // that draws them as well as on the broad view. A remote host's own page is included:
+  // the fan-out is the hub's, cached, and the render still refuses the block there.
+  const hostInstancePage = wantsTopologyScope && topologyLeaf?.kind === "host"
+    && viewContext?.viewTab !== "pulse";
+  const wantsFleetReads = broadReads || hostInstancePage;
   // Seat rows (Q / WORK / NOW) join these four lists: only a seat's page and the drilled table tab show them.
   const seatQueueReads = broadReads || (focusedTopology && (topologyLeaf?.kind === "agent" || (!!topologyLeaf && viewContext?.viewTab === "table")));
   const healthRequested = broadReads || viewContext?.viewTab === "health";
@@ -583,7 +657,20 @@ export async function hydrateSnapshot(
   // A pending pod/agent address needs every rig's seats to resolve.
   const pendingInventory = viewContext?.pendingDrill?.resource === "pod" || viewContext?.pendingDrill?.resource === "agent";
 
-  const [instanceHealth, healthProjection, agg, summaries, library, review, streamItems, attention, blocked, inProgress, pending, fleetRead, recentlyFinished, scopesRead, executionRead, sliceDetailRead, connectionsRead] = await Promise.all([
+  // The two hub-side fan-outs, CHAINED rather than parallel. The summary is what names
+  // the fleet's hosts, and the usage read must not be asked of a fleet that has no remote
+  // host to add up. Chaining costs one fan-out's latency on the slow path and buys that
+  // gate with no extra registry read; both legs hit the daemon's own short cache, so a
+  // steady-state poll pays it twice only when the fleet is actually being fanned out.
+  const fleetReads: Promise<{ summary: { payload: FleetSummaryRead | null; failed: string | null } | null; usage: { payload: FleetUsageRead | null; failed: string | null } | null }> =
+    !wantsFleetReads
+      ? Promise.resolve({ summary: null, usage: null })
+      : readFleetSummary(client, fleetRetention).then(async (summary) => ({
+          summary,
+          usage: await readFleetUsage(client, summary.payload, fleetRetention),
+        }));
+
+  const [instanceHealth, healthProjection, agg, summaries, library, review, streamItems, attention, blocked, inProgress, pending, fleetReadsResult, recentlyFinished, scopesRead, executionRead, sliceDetailRead, connectionsRead] = await Promise.all([
     safe<InstanceHealthRead>("health", () => client.health()),
     !healthRequested ? Promise.resolve(null) : safe<HealthProjectionRead>("health-findings", () => client.healthFindings()),
     !broadReads ? Promise.resolve(null) : safe<AttentionAggregateRead>("attention-aggregate", () => client.attentionAggregate()),
@@ -600,8 +687,9 @@ export async function hydrateSnapshot(
     // The hub-side fleet summary: ONE fan-out answering reachability, per-seat
     // activity on OTHER hosts, and the stall verdict. OPTIONAL — an older daemon
     // 404s and every field below stays empty, which is what the page rendered
-    // before this read existed.
-    !broadReads ? Promise.resolve(null) : readFleetSummary(client, fleetRetention),
+    // before this read existed. The fleet USAGE read rides behind it, gated on the
+    // hosts this one names.
+    fleetReads,
     !broadReads ? Promise.resolve(null) : safe<QueueItemRead[]>("queue-recently-finished", () => client.queueRecentlyFinished()),
     !broadReads ? Promise.resolve(null) : safe<{ missions: unknown[]; sourceObservation?: { state: string } }>("scopes", () => client.scopesDetailed() as Promise<{ missions: unknown[] }>),
     !broadReads ? Promise.resolve(null) : safe<{ rows: unknown[] }>("execution", () => client.execution(executionMission ?? undefined) as Promise<{ rows: unknown[] }>),
@@ -622,9 +710,15 @@ export async function hydrateSnapshot(
   // A failed fleet read is NAMED, not swallowed: STALLED and the remote rows may be
   // showing the last good read rather than the current state, and a reader is entitled
   // to know that the sections they can see are not freshly confirmed.
-  const fleetSummary = fleetRead?.payload ?? null;
-  if (fleetRead?.failed) readErrors.push(fleetRead.failed);
+  const fleetSummary = fleetReadsResult?.summary?.payload ?? null;
+  if (fleetReadsResult?.summary?.failed) readErrors.push(fleetReadsResult.summary.failed);
   if (fleetSummary?.registryError) readErrors.push(`fleet-summary registry: ${fleetSummary.registryError}`);
+  // The usage read failed the same way and gets the same treatment: the last good
+  // payload stands, and the failure is NAMED rather than left as a block that quietly
+  // stopped growing.
+  const fleetUsage = fleetReadsResult?.usage?.payload ?? null;
+  if (fleetReadsResult?.usage?.failed) readErrors.push(fleetReadsResult.usage.failed);
+  if (fleetUsage?.registryError) readErrors.push(`fleet-usage registry: ${fleetUsage.registryError}`);
   if (scopesRead?.sourceObservation?.state === "unavailable") readErrors.push("scopes: proof source updates unavailable; current HTTP basis only");
   if (review?.registryError) readErrors.push(`review-fleet registry: ${review.registryError}`);
   const recentTransitionsRig = currentRigName ?? (!viewContext ? summaries?.[0]?.name : null) ?? null;
@@ -1048,6 +1142,7 @@ export async function hydrateSnapshot(
     stalled: stalledRows,
     stallThresholdMinutes: fleetSummary?.stallThresholdMinutes,
     fleetProbed: fleetSummary != null,
+    fleetUsage,
     pending: (pending ?? []).map(toQueueRead),
     recentlyFinished: (recentlyFinished ?? []).map(toQueueRead),
     hydratedAt: new Date().toISOString(),

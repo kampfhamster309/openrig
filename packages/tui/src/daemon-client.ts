@@ -381,6 +381,15 @@ export class DaemonClient {
     // legs up, and the page would lose STALLED and its remote rows for that poll.
     return this.get(`/api/fleet/summary`, options.optional ? this.optionalFetchImpl : this.fetchImpl, options.timeoutMs ?? 5_000);
   }
+  /** The hub-side fleet USAGE read: ONE fan-out answering each host's top-burn seats
+   *  for a window, and the fleet's top seats across every host that answered. OPTIONAL
+   *  for the same reason as the summary — a daemon that predates the route 404s and the
+   *  page renders exactly as before. Only asked when the registry has remote hosts: an
+   *  operator with one machine has nothing to add up and pays nothing. */
+  fleetUsage(options: { windowHours: number; top?: number; optional?: boolean; timeoutMs?: number }) {
+    const top = options.top === undefined ? "" : `&top=${options.top}`;
+    return this.get(`/api/fleet/usage?window_hours=${options.windowHours}${top}`, options.optional ? this.optionalFetchImpl : this.fetchImpl, options.timeoutMs ?? 5_000);
+  }
   rigStatus(rigId: string) {
     return this.get(`/api/rigs/${encodeURIComponent(rigId)}/status`);
   }

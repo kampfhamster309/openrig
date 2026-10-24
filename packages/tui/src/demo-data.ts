@@ -188,6 +188,7 @@ export function demoSnapshot(): FleetSnapshot {
     remoteSeatActivity: [],
     stalled: [],
     fleetProbed: false,
+    fleetUsage: null,
     // PULSE ○ UP NEXT source — shaped like the shipped state=pending read
     // (unclaimed backlog, served ts_created DESC → carried verbatim). SIX items
     // exercise the display-cap overflow: the view renders the first four + a "…"
