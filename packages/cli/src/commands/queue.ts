@@ -442,8 +442,9 @@ function remoteHostOf(hostId: string | undefined): string | undefined {
 }
 
 /** A cross-host queue write waits for the selected daemon's own answer. That daemon gives the remote 10 s
- *  (`QUEUE_FORWARD_TIMEOUT_MS` in the daemon's routes/queue.ts), so waiting only the client's 5 s default
- *  turns a slow remote's answer into an unknown outcome. */
+ *  (`QUEUE_FORWARD_TIMEOUT_MS` in the daemon's routes/queue.ts, and `REMOTE_ACTION_TIMEOUT_MS` in
+ *  routes/mission-control.ts for `resolve`), so waiting only the client's 5 s default turns a slow
+ *  remote's answer into an unknown outcome. */
 const CROSS_HOST_QUEUE_WRITE_TIMEOUT_MS = 15_000;
 
 function crossHostWriteOptions(hostId: string | undefined): { timeoutMs: number } | undefined {
@@ -1136,7 +1137,7 @@ export function queueCommand(depsOverride?: QueueDeps): Command {
           ...(actorClaim ? { actorSession: actorClaim } : {}),
           // The host rides the out-of-band envelope, never the session string.
           ...(remoteHost !== undefined ? { hostId: remoteHost } : {}),
-        });
+        }, crossHostWriteOptions(remoteHost));
         await printQueueItemResult(client, qitemId, opts.json ?? false, res.data, res.status, writeReceipt(opts.full, { verb: "update", remoteHost }));
       }, false, remoteHost);
     });
@@ -1250,7 +1251,9 @@ workspace home that is deferred/not-imminent belongs in its mission/slice.`)
             // The host rides the out-of-band envelope, never the session string.
             ...(remoteHost !== undefined ? { hostId: remoteHost } : {}),
           },
-          bearer ? { headers: { Authorization: `Bearer ${bearer}` } } : undefined,
+          bearer || remoteHost !== undefined
+            ? { ...(bearer ? { headers: { Authorization: `Bearer ${bearer}` } } : {}), ...crossHostWriteOptions(remoteHost) }
+            : undefined,
         );
         await printQueueItemResult(client, qitemId, opts.json ?? false, res.data, res.status);
       }, false, remoteHost);

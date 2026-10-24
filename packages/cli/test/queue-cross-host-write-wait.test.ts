@@ -91,6 +91,31 @@ describe("cross-host queue writes wait for the daemon's answer", () => {
     });
   }
 
+  // Answering a team from the hub: the same forward deadline, through /update and through mission control.
+  const ANSWERS: Array<{ verb: string; argv: (host?: string) => string[] }> = [
+    { verb: "update", argv: (host) => ["update", "qitem-src-1", "--note", "n", ...(host ? ["--host", host] : [])] },
+    { verb: "resolve", argv: (host) => ["resolve", "qitem-src-1", "--decision", "ship it", ...(host ? ["--host", host] : [])] },
+  ];
+  const UPDATED: Reply = { status: 200, data: { qitemId: "qitem-src-1", state: "in-progress" } };
+
+  for (const a of ANSWERS) {
+    it(`${a.verb} --host waits longer than the daemon's 10 s forward deadline`, async () => {
+      const requests = await run(a.argv("vps-b"), [UPDATED]);
+      expect(requests[0]!.options?.timeoutMs).toBe(15_000);
+    });
+
+    it(`${a.verb} on this daemon keeps the client's default wait`, async () => {
+      const requests = await run(a.argv(), [UPDATED]);
+      expect(requests[0]!.options?.timeoutMs).toBeUndefined();
+    });
+  }
+
+  it("resolve --host keeps the operator bearer beside the longer wait", async () => {
+    vi.stubEnv("OPENRIG_AUTH_BEARER_TOKEN", "test-bearer");
+    const requests = await run(["resolve", "qitem-src-1", "--decision", "ship it", "--host", "vps-b"], [UPDATED]);
+    expect(requests[0]!.options).toMatchObject({ timeoutMs: 15_000, headers: { Authorization: "Bearer test-bearer" } });
+  });
+
   it("a create that gets no answer in time reads as unknown, never as a failure, with the ID to reconcile by", async () => {
     await expect(run(["create", "--destination", "dev@rig-b@vps-b", "--body", "b", "--summary", "s"],
       [new DaemonTimeoutError("Request to http://localhost:7433/api/queue/create timed out after 15000ms")])).rejects.toThrow();
