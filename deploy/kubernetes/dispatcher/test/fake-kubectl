@@ -8,18 +8,41 @@
 # `--start retained` would read no history at all, so it is recorded as a failure here.
 #
 # Knobs a test sets: FAKE_FIXTURES, FAKE_CALLS, FAKE_POD_READY, FAKE_FAIL_USAGE_TOP,
-# FAKE_STALL_EVENTS, FAKE_NO_RESULT, FAKE_ANSWER, FAKE_NO_HUB, FAKE_NOT_REGISTERED,
-# FAKE_EMPTY_BUNDLE, FAKE_FAIL_BUNDLE, FAKE_SHOW_STATE, FAKE_SHOW_BLOCKED,
-# FAKE_WATERMARK_EVENTS, FAKE_WATERMARK_TRANSITIONS, FAKE_STS_CREATED, FAKE_EVENTS,
-# FAKE_EVENTS2, FAKE_EVENTS3, FAKE_EVENTS_SEEN, FAKE_EVENTS_FAIL.
+# FAKE_NO_HUB, FAKE_NOT_REGISTERED, FAKE_EMPTY_BUNDLE, FAKE_FAIL_BUNDLE, FAKE_SHOW_STATE,
+# FAKE_SHOW_BLOCKED, FAKE_WATERMARK_EVENTS, FAKE_WATERMARK_TRANSITIONS, FAKE_STS_CREATED,
+# FAKE_STS_EXISTS, FAKE_FAIL_STS_LIST, FAKE_FAIL_STS_GET, FAKE_FAIL_POD_LIST, FAKE_STS_LIST2,
+# FAKE_POD_LIST2,
+# FAKE_EVENTS, FAKE_EVENTS2, FAKE_EVENTS3, FAKE_EVENTS_SEEN, FAKE_EVENTS_FAIL.
+#
+# With FAKE_HUB_HOME set, calls aimed at the hub pod stop being recorded answers and become real work
+# on a real directory -- see "the hub's own side" below. FAKE_NPM_ROOT says where the `yaml` stand-in
+# the hub's node scripts load lives, and FAKE_STS_LIST / FAKE_POD_LIST name the recorded inventory.
 set -u
 
 : "${FAKE_FIXTURES:?fake-kubectl needs FAKE_FIXTURES}"
 : "${FAKE_CALLS:?fake-kubectl needs FAKE_CALLS}"
 printf '%s\n' "$*" >> "$FAKE_CALLS"
 
+# The hub's registry is real state, so the node scripts the dispatcher pipes in are really run against
+# it. That means the hub's home has to be somewhere this test may write, and every absolute path the
+# dispatcher names has to be read as a path inside it.
+HUB_HOME_REAL=/home/openrig/.openrig
+if [ -n "${FAKE_HUB_HOME:-}" ]; then
+  export OPENRIG_HOME="$FAKE_HUB_HOME"
+  mkdir -p "$FAKE_HUB_HOME/hosts.d"
+fi
+FAKE_EXEC_POD=""
+
 fix() { cat "$FAKE_FIXTURES/$1"; }
 nope() { echo "fake kubectl: no recorded response for [$*]" >&2; exit 1; }
+# Is this StatefulSet one the test says exists? FAKE_STS_EXISTS is a space-separated list of names, and
+# a named read for one of them answers as if it were there. `hub-sync` re-checks a team right before it
+# unregisters it, and that check needs a real answer rather than "no recording for that".
+sts_named_exists() { # <name>
+  local n=$1 e
+  for e in ${FAKE_STS_EXISTS:-}; do [ "$e" = "$n" ] && return 0; done
+  return 1
+}
 # Real `kubectl exec` writes this to ITS OWN stderr when the remote command exits non-zero, so a
 # caller that merges the two streams sees it beside the command's JSON. The dispatcher has to parse
 # around it; without this line the fake is more polite than kubectl and hides that.
@@ -107,7 +130,175 @@ pod_sh() {
   esac
 }
 
+# --- the hub's own side ------------------------------------------------------------------------
+#
+# With FAKE_HUB_HOME set, the hub is not a recording: it is a directory with a hosts.yaml, a hosts.d,
+# a host-bindings.json and a settings file, and the node scripts the dispatcher pipes in are the
+# dispatcher's own, really executed. A fake that only answered "yes, it is registered" would leave the
+# reader of hosts.yaml untested, and that reader is what hub-sync stands or falls on. The lock is a
+# real flock, so contention is contention rather than a claim in a comment.
+
+# The hub's absolute paths, moved into the directory this test may write.
+hub_to_fake() { printf '%s' "${1//$HUB_HOME_REAL/$FAKE_HUB_HOME}"; }
+hub_to_real() { printf '%s' "${1//$FAKE_HUB_HOME/$HUB_HOME_REAL}"; }
+
+hub_has_host() { # <id>
+  jq -e --arg id "$1" '[.hosts[]? | select(.id == $id)] | length > 0' \
+    "$FAKE_HUB_HOME/hosts.yaml" >/dev/null 2>&1
+}
+
+# One hub command, after `kubectl exec -i hub-0 -c daemon --`.
+hub_side() {
+  case "${1:-}" in
+    sh)
+      [ "${2:-}" = "-c" ] || nope "hub sh without -c"
+      case "$3" in
+        *"npm root"*) printf '%s\n' "${FAKE_NPM_ROOT:-/usr/lib/node_modules}" ;;
+        *"flock -w"*)
+          # Run the dispatcher's own lock wrapper verbatim, with only the lock path moved. Real flock,
+          # real timeout, real exit 97 -- the lock is tested as it will actually run. What follows the
+          # script is the wrapper's own argv, starting with its $0, so it goes through unchanged.
+          local script=$3; shift 3
+          local -a out=(); local a
+          for a in "$@"; do out+=("$(hub_to_fake "$a")"); done
+          sh -c "$script" "${out[@]}" ;;
+        *) nope "hub sh: $3" ;;
+      esac ;;
+    env)
+      # `env VAR=... node -`: apply the assignments the dispatcher chose and hand the piped script to a
+      # real node. OPENRIG_HOME is already the fake hub's home, which is what makes it read real files.
+      shift
+      while [ $# -gt 0 ]; do
+        case "$1" in
+          *=*) export "$1"; shift ;;
+          *) break ;;
+        esac
+      done
+      [ "${1:-}" = node ] || nope "hub env command: $*"
+      exec node - ;;
+    rig) shift; hub_rig "$@" ;;
+    cat)
+      # `hub_bearer_contents` reads a bearer back to compare it with the team's Secret.
+      shift
+      local -a cout=(); local ca
+      for ca in "$@"; do cout+=("$(hub_to_fake "$ca")"); done
+      exec cat "${cout[@]}" ;;
+    rm)
+      shift
+      local -a out=(); local a
+      for a in "$@"; do out+=("$(hub_to_fake "$a")"); done
+      rm -f "${out[@]}" ;;
+    *) nope "hub: $*" ;;
+  esac
+}
+
+# The hub's own CLI, as far as the dispatcher reaches it. `rig host add` refuses a duplicate id, and
+# that refusal is what forces a rewrite to remove before it adds -- a fake that overwrote would hide
+# exactly the mistake worth catching here.
+hub_rig() {
+  local group="${1:-}" sub="${2:-}"
+  if [ $# -gt 1 ]; then shift 2; else shift $#; fi
+  case "$group $sub" in
+    "host add")
+      local id="" transport="" url="" bearer="" notes=""
+      while [ $# -gt 0 ]; do
+        case "$1" in
+          --id) id=$2; shift 2 ;;
+          --transport) transport=$2; shift 2 ;;
+          --url) url=$2; shift 2 ;;
+          --bearer-file) bearer=$2; shift 2 ;;
+          --notes) notes=$2; shift 2 ;;
+          *) shift ;;
+        esac
+      done
+      if [ -f "$FAKE_HUB_HOME/hosts.yaml" ] && hub_has_host "$id"; then
+        printf 'duplicate host id %s (each host id must be unique within the registry)\n' "$id" >&2
+        return 1
+      fi
+      HUB_ADD_ID="$id" HUB_ADD_TRANSPORT="$transport" HUB_ADD_URL="$url" \
+        HUB_ADD_BEARER="$(hub_to_real "$bearer")" HUB_ADD_NOTES="$notes" \
+        NPM_ROOT="${FAKE_NPM_ROOT:-}" OPENRIG_HOME="$FAKE_HUB_HOME" node - <<'NODE'
+const fs = require("fs"), path = require("path");
+const YAML = require(path.join(process.env.NPM_ROOT, "@openrig/cli/node_modules/yaml"));
+const file = path.join(process.env.OPENRIG_HOME, "hosts.yaml");
+let doc = {};
+try { doc = YAML.parse(fs.readFileSync(file, "utf8")) || {}; } catch (e) { /* no registry yet */ }
+const hosts = Array.isArray(doc.hosts) ? doc.hosts : [];
+const entry = { id: process.env.HUB_ADD_ID, transport: process.env.HUB_ADD_TRANSPORT };
+if (process.env.HUB_ADD_URL) entry.url = process.env.HUB_ADD_URL;
+if (process.env.HUB_ADD_BEARER) entry.bearer_file = process.env.HUB_ADD_BEARER;
+if (process.env.HUB_ADD_NOTES) entry.notes = process.env.HUB_ADD_NOTES;
+hosts.push(entry);
+// The real verb rewrites the whole file through a tmp + rename, at 0600.
+const tmp = file + ".tmp-" + process.pid;
+fs.writeFileSync(tmp, YAML.stringify({ hosts }), { mode: 0o600 });
+fs.renameSync(tmp, file);
+NODE
+      printf 'Added host %s to the registry\n' "$id" ;;
+    "config get") hub_config get "$@" ;;
+    "config set") hub_config set "$@" ;;
+    "config reset") hub_config reset "$@" ;;
+    *) nope "hub rig $group $sub" ;;
+  esac
+}
+
+# The hub's settings, as far as the dispatcher reaches them. The real CLI keeps them in
+# ~/.openrig/config.json as nested JSON -- `feed.subscriptions.<id>.enabled` lives at
+# feed.subscriptions.<id>.enabled -- and `hub_inspect` now reads that file for the host NAMES it cannot
+# enumerate through the CLI, so the fake keeps the real shape rather than a convenient one. `get`
+# answers a registered-but-unset per-host key with its default, `false`, the way the real store does
+# (config-store.ts resolve), and `reset` drops the whole host node, which is what the real dynamic-class
+# reset does (config-store.ts:1360-1368).
+hub_config() {
+  local verb=$1 key=${2:-} val=${3:-}
+  local f="$FAKE_HUB_HOME/config.json"
+  [ -f "$f" ] || printf '{}\n' >"$f"
+  case "$verb" in
+    get) node -e '
+          const fs = require("fs");
+          let d = {}; try { d = JSON.parse(fs.readFileSync(process.argv[1], "utf8")); } catch (e) {}
+          let c = d;
+          for (const p of process.argv[2].split(".")) {
+            c = (c && typeof c === "object" && !Array.isArray(c)) ? c[p] : undefined;
+          }
+          console.log(c === undefined || c === null ? "false" : String(c));
+        ' "$f" "$key" ;;
+    set) node -e '
+          const fs = require("fs");
+          const [f, key, val] = process.argv.slice(1);
+          let d = {}; try { d = JSON.parse(fs.readFileSync(f, "utf8")); } catch (e) {}
+          const p = key.split(".");
+          let c = d;
+          for (const k of p.slice(0, -1)) { if (typeof c[k] !== "object" || c[k] === null) c[k] = {}; c = c[k]; }
+          c[p[p.length - 1]] = val === "true" ? true : (val === "false" ? false : val);
+          fs.writeFileSync(f, JSON.stringify(d, null, 2) + "\n");
+        ' "$f" "$key" "$val" ;;
+    reset) node -e '
+          const fs = require("fs");
+          const [f, key] = process.argv.slice(1);
+          let d = {}; try { d = JSON.parse(fs.readFileSync(f, "utf8")); } catch (e) {}
+          const m = key.match(/^feed\.subscriptions\.([^.]+)\.enabled$/);
+          if (m) {
+            const subs = d && d.feed && typeof d.feed === "object" ? d.feed.subscriptions : null;
+            if (subs && typeof subs === "object") delete subs[m[1]];
+          } else {
+            const p = key.split(".");
+            let c = d;
+            for (const k of p.slice(0, -1)) { if (!c[k] || typeof c[k] !== "object") { c = null; break; } c = c[k]; }
+            if (c) delete c[p[p.length - 1]];
+          }
+          fs.writeFileSync(f, JSON.stringify(d, null, 2) + "\n");
+        ' "$f" "$key" ;;
+  esac
+}
+
 serve() {
+  # The hub answers itself when there is a hub to answer from; everything else keeps the recorded
+  # responses the archive and watch tests were written against.
+  if [ -n "${FAKE_HUB_HOME:-}" ] && [ "${FAKE_EXEC_POD:-}" = "${FAKE_HUB_POD:-hub-0}" ]; then
+    hub_side "$@"
+    return
+  fi
   case "${1:-}" in
     rig)
       case "${2:-} ${3:-}" in
@@ -243,6 +434,16 @@ serve() {
 
 ns=""
 declare -a rest=()
+
+# The hub's own `rig`, reached from inside the lock wrapper the fake really executes. It arrives as its
+# own process because the wrapper runs a plain command line, and the real `rig` on this machine must
+# never be what answers it.
+if [ "${1:-}" = hub-rig ]; then
+  shift
+  [ -n "${FAKE_HUB_HOME:-}" ] || nope "hub-rig with no FAKE_HUB_HOME"
+  hub_rig "$@"
+  exit $?
+fi
 while [ $# -gt 0 ]; do
   case "$1" in
     -n) ns=${2:-}; shift 2 ;;
@@ -261,30 +462,122 @@ case "${rest[0]:-}" in
         # `status --all` and `watch --all` list the teams by label instead of naming one, which is a
         # different recorded answer from the single-StatefulSet read.
         if [ "${rest[2]:-}" = "-l" ]; then
-          fix statefulsets-team.json
-        elif [ "${#rest[@]}" -gt 2 ] && [ "${rest[2]}" != "t-demo" ]; then
-          nope "statefulset ${rest[2]}"
-        elif [ -n "${FAKE_STS_CREATED:-}" ]; then
-          # FAKE_STS_CREATED stands in for a re-dispatched ticket: same slug, newer pod.
-          fix statefulset.json | jq -c --arg c "$FAKE_STS_CREATED" '.metadata.creationTimestamp = $c'
+          # A list that fails is a different thing from a list that came back empty, and `hub-sync`
+          # treats it as fatal rather than as "no teams", so the fake has to be able to fail it.
+          if [ "${FAKE_FAIL_STS_LIST:-0}" = 1 ]; then
+            echo "E1023 Unable to connect to the server: dial tcp 10.96.0.1:443: i/o timeout" >&2
+            exit 1
+          fi
+          # A test can move the cluster mid-run: the first labelled read answers FAKE_STS_LIST and every
+          # one after it answers FAKE_STS_LIST2. That is how a test puts a StatefulSet back while
+          # `hub-sync` sits between planning an unregister and doing it, which no static recording can.
+          if [ -n "${FAKE_STS_LIST2:-}" ] && [ "$(grep -c ' get statefulsets -l' "$FAKE_CALLS")" -ge 2 ]; then
+            fix "$FAKE_STS_LIST2"
+          else
+            fix "${FAKE_STS_LIST:-statefulsets-team.json}"
+          fi
         else
-          fix statefulset.json
+          # A named read. `--ignore-not-found` and `-o name` change what the answer looks like, and
+          # `hub-sync` depends on the difference: a StatefulSet that is not there prints nothing and
+          # exits 0, while a read that failed for another reason exits non-zero. Only the first is
+          # evidence the team is gone, so the fake has to answer them differently.
+          ignore_nf=0
+          out_name=0
+          prev=""
+          for a in "${rest[@]}"; do
+            case "$a" in
+              --ignore-not-found) ignore_nf=1 ;;
+              name) [ "$prev" = "-o" ] && out_name=1 ;;
+            esac
+            prev=$a
+          done
+          if [ "${FAKE_FAIL_STS_GET:-0}" = 1 ]; then
+            echo "E1023 Unable to connect to the server: dial tcp 10.96.0.1:443: i/o timeout" >&2
+            exit 1
+          elif sts_named_exists "${rest[2]:-}"; then
+            # A named read for a StatefulSet this test says exists. `hub-sync` re-checks a team right
+            # before it unregisters it, and that check needs a real answer, not "no recording for that".
+            if [ "$out_name" = 1 ]; then printf 'statefulset.apps/%s\n' "${rest[2]}"
+            else fix statefulset.json | jq -c --arg n "${rest[2]}" '.metadata.name = $n'; fi
+          elif [ "$ignore_nf" = 1 ]; then
+            : # NotFound: no output, exit 0, exactly as the real thing.
+          elif [ "${#rest[@]}" -gt 2 ] && [ "${rest[2]}" != "t-demo" ]; then
+            nope "statefulset ${rest[2]}"
+          elif [ -n "${FAKE_STS_CREATED:-}" ]; then
+            # FAKE_STS_CREATED stands in for a re-dispatched ticket: same slug, newer pod.
+            fix statefulset.json | jq -c --arg c "$FAKE_STS_CREATED" '.metadata.creationTimestamp = $c'
+          else
+            fix statefulset.json
+          fi
         fi ;;
       pod)
         # hub_ready() asks about the hub pod by name, so a test can take the hub away on its own.
         if [ "${rest[2]:-}" = "hub-0" ] && [ "${FAKE_NO_HUB:-0}" = 1 ]; then fix pod-not-ready.json
         elif [ "${FAKE_POD_READY:-1}" = 1 ]; then fix pod-ready.json
         else fix pod-not-ready.json; fi ;;
+      pods)
+        # `hub-sync` reads every team pod in one labelled read, so a test records the whole set.
+        [ "${rest[2]:-}" = "-l" ] || nope "get pods $*"
+        if [ "${FAKE_FAIL_POD_LIST:-0}" = 1 ]; then
+          echo "E1023 Unable to connect to the server: dial tcp 10.96.0.1:443: i/o timeout" >&2
+          exit 1
+        fi
+        if [ -n "${FAKE_POD_LIST2:-}" ] && [ "$(grep -c ' get pods -l' "$FAKE_CALLS")" -ge 2 ]; then
+          fix "$FAKE_POD_LIST2"
+        else
+          fix "${FAKE_POD_LIST:-pods-team.json}"
+        fi ;;
+      secret)
+        # `team_bearer` asks for one jsonpath field and pipes it through base64 -d, so the fake answers
+        # the way kubectl does: with the base64 of what the secret holds.
+        printf '%s' "bearer-for-${rest[2]:-}" | base64 ;;
       *) nope "get $*" ;;
     esac ;;
   exec)
-    declare -a cmd=()
-    seen=0
-    for a in "${rest[@]}"; do
-      [ "$seen" = 1 ] && cmd+=("$a")
-      [ "$a" = "--" ] && seen=1
+    FAKE_EXEC_POD=""
+    FAKE_EXEC_INTERACTIVE=0
+    set -- "${rest[@]}"
+    shift   # drop "exec"
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        -i) FAKE_EXEC_INTERACTIVE=1; shift ;;
+        -c) shift 2 ;;
+        --) shift; break ;;
+        *) [ -n "$FAKE_EXEC_POD" ] || FAKE_EXEC_POD=$1; shift ;;
+      esac
     done
-    [ "${#cmd[@]}" -gt 0 ] || nope "exec with no command"
-    serve "${cmd[@]}" ;;
+    [ $# -gt 0 ] || nope "exec with no command"
+    # `kubectl exec -i` copies the caller's stdin into the pod whether or not the command inside it
+    # ever reads, so whatever it left unconsumed is gone from the caller. That is how one hub read in
+    # the middle of a loop ate the rest of the loop's input on a real cluster while a fake that
+    # ignored stdin stayed green. Model it -- for the commands that do not read stdin for themselves:
+    # `env ... node -` takes the dispatcher's own script that way and the bearer write is a `cat >`,
+    # and neither may be robbed of it. Take it in the background and stop with the command, because a
+    # real kubectl exits when the remote command does rather than waiting for EOF: a stream reader
+    # that had to wait for one would outlive the watch that started it.
+    reads_stdin=0
+    case "$*" in *"node -"*|*"cat >"*) reads_stdin=1 ;; esac
+    drain=""
+    if [ "$FAKE_EXEC_INTERACTIVE" = 1 ] && [ ! -t 0 ] && [ "$reads_stdin" = 0 ]; then
+      # A background command gets /dev/null on stdin in a script, so the caller's stdin has to be held
+      # on a named descriptor for the drain to be reading the bytes kubectl would have taken.
+      exec 7<&0
+      cat <&7 >/dev/null 2>&1 & drain=$!
+    fi
+    serve "$@"
+    exec_rc=$?
+    if [ -n "$drain" ]; then
+      # Let it take what is there, then stop: a real kubectl exits when the remote command does, rather
+      # than waiting for EOF, and a stream reader made to wait for one would outlive its watch. A
+      # buffered caller (a plan, a here-string) is drained in the first few milliseconds; only a live
+      # stream runs to the bound.
+      for drain_n in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30; do
+        kill -0 "$drain" 2>/dev/null || break
+        sleep 0.01
+      done
+      kill "$drain" 2>/dev/null; wait "$drain" 2>/dev/null
+    fi
+    exit "$exec_rc"
+    ;;
   *) nope "$*" ;;
 esac
