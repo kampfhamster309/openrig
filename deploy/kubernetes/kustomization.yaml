@@ -19,6 +19,7 @@ configMapGenerator:
   - name: openrig-kit
     files:
       - rig.yaml=kit/rig.yaml
+      - rig-one.yaml=kit/rig-one.yaml
       - lead-monitoring.md=kit/guidance/lead-monitoring.md
       - pi-seat-status=kit/bin/pi-seat-status
       - openrig-heartbeat.ts=kit/pi-extensions/openrig-heartbeat.ts

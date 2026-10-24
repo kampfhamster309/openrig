@@ -756,6 +756,7 @@ team_manifests() {
              volumes: [{name: "kit", configMap: {name: "openrig-kit", defaultMode: 292,
                items: [
                  {key: "rig.yaml", path: "rig.yaml"},
+                 {key: "rig-one.yaml", path: "rig-one.yaml"},
                  {key: "lead-monitoring.md", path: "guidance/lead-monitoring.md"},
                  {key: "pi-seat-status", path: "bin/pi-seat-status", mode: 365},
                  {key: "openrig-heartbeat.ts", path: "pi-extensions/openrig-heartbeat.ts"},
