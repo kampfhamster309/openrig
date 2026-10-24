@@ -103,7 +103,8 @@ import { workflowRoutes } from "./routes/workflow.js";
 import { missionControlRoutes } from "./routes/mission-control.js";
 import { slicesRoutes } from "./routes/slices.js";
 import { reviewRoutes } from "./routes/review.js";
-import { fleetRoutes } from "./routes/fleet.js";
+import { createFleetReads, fleetRoutes } from "./routes/fleet.js";
+import { metricsRoutes } from "./routes/metrics.js";
 import { rigModeRoutes } from "./routes/rig-mode.js";
 import { missionsRoutes } from "./routes/missions.js";
 import { rigCmuxRoutes } from "./routes/rig-cmux.js";
@@ -650,14 +651,27 @@ export function createApp(deps: AppDeps): Hono {
 
   // Browser boundary: target name and browser Origin, checked once per /api request
   // (WebSocket upgrades included), before the remote read-through and every route.
-  app.use("/api/*", browserBoundary({
+  // ONE instance, mounted on two paths. `/metrics` composes exactly the fleet reads
+  // `/api/fleet/*` composes, so it has to refuse a request addressed to some other name
+  // in exactly the same way: a page the operator visits that rebinds its own hostname to
+  // loopback would otherwise read the whole fleet's metrics while `/api/fleet/summary`
+  // refuses it. A second instance would be a second opinion about what this machine is
+  // called. A valid bearer already waives the Host check, so a scraper that authenticates
+  // is unaffected, and so is a loopback or IP-literal scrape; addressing the hub by a
+  // cluster DNS name now needs OPENRIG_ALLOWED_HOSTS or the bearer, which is the rule
+  // `/api/fleet/*` already has. Only the Host check stops rebinding — a same-origin GET
+  // carries no Origin header, so an Origin-only check would not be enough.
+  const boundary = browserBoundary({
     webUiEnabled: deps.webUiEnabled === true,
     bearerTokens: [deps.terminalBearerToken, deps.missionControlBearerToken],
     allowedOrigins: process.env.OPENRIG_ALLOWED_ORIGINS,
     allowedHosts: process.env.OPENRIG_ALLOWED_HOSTS,
     discoverSelfNames: deps.selfNameDiscovery,
     onDecision: deps.browserBoundaryObserver,
-  }));
+  });
+  app.use("/api/*", boundary);
+  app.use("/metrics", boundary);
+  app.use("/metrics/*", boundary);
 
   // OPR.0.4.6.MH2 FR-2/FR-7 — the single-host READ-THROUGH edge (the read
   // twin of the mission-control remote-forward). Consumes a `?host=<id>`
@@ -812,7 +826,18 @@ export function createApp(deps: AppDeps): Hono {
   // The ONE fleet read: per-host reachability, rigs, seats, open queue items in
   // every open state, and the progress/stall verdict. Composed only from routes
   // an older remote daemon already serves.
-  app.route("/api/fleet", fleetRoutes());
+  //
+  // ONE reads holder for every surface that reads the fleet, so the Prometheus
+  // scrape below answers from the fan-out a TUI or CLI poll already paid for
+  // instead of starting a second one for the same fleet.
+  const fleetReads = createFleetReads();
+  app.route("/api/fleet", fleetRoutes(fleetReads));
+  // The fleet as ONE Prometheus scrape target: team pods come and go, the hub
+  // already fans out to all of them, so the hub is where a dashboard should look.
+  // Built on the two reads above, through their cache, and gated by the daemon's
+  // existing bearer for non-browser clients (null on a loopback/tailnet bind,
+  // where every other read here is open too).
+  app.route("/metrics", metricsRoutes({ reads: fleetReads, bearerToken: deps.terminalBearerToken ?? null }));
   // OPR.0.4.6.02 C3 — the canonical non-rig-scoped terminal composer + the
   // rig-scoped thin alias (composes view=rig:<rigId>, delegates to the same
   // TerminalService; arch R1 / guard b1).

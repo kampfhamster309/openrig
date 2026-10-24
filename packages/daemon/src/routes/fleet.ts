@@ -13,10 +13,14 @@
 // routes an OLD team-pod daemon already serves. Bearers never leave the daemon.
 //
 // A short cache with single-flight means one fan-out serves every TUI and CLI
-// reader at once; `?fresh=1` bypasses it.
+// reader at once; `?fresh=1` bypasses it. The caches live behind `createFleetReads()`
+// rather than on this route module, so the Prometheus scrape surface
+// (`routes/metrics.ts`) reads through the SAME fan-out instead of paying for a
+// second one — one holder is passed to both at daemon startup.
 
 import { existsSync } from "node:fs";
 import { Hono } from "hono";
+import type { Context } from "hono";
 import type Database from "better-sqlite3";
 import { defaultHostRegistryPath, loadHostRegistry, type HostRegistryLoadResult } from "../domain/hosts/hosts-registry-reader.js";
 import { attachTerminalActivityAndWork, getNodeInventoryForAllRigs } from "../domain/node-inventory.js";
@@ -54,16 +58,115 @@ import {
   type UsageLeg,
 } from "../domain/fleet/fleet-usage.js";
 import type { FleetUsageWindow } from "../domain/fleet/fleet-usage.js";
+import type { FleetSummaryPayload } from "../domain/fleet/fleet-summary-types.js";
+import type { FleetUsagePayload } from "../domain/fleet/fleet-usage-types.js";
 
-/** The usage cache, per route module / daemon process, for the same reason the
- *  summary's is: one fan-out serves every reader, and a test that builds a fresh
- *  app gets a fresh cache. */
-const usageCaches = new WeakMap<Hono, FleetUsageCache>();
+/** A fleet read this daemon cannot answer because the services it reads are not
+ *  wired. The route turns it into the family's 503; it is an error rather than a
+ *  null so a caller cannot forget the check and render an empty fleet. */
+export class FleetReadUnavailableError extends Error {
+  constructor(readonly code: string) {
+    super(code);
+    this.name = "FleetReadUnavailableError";
+  }
+}
 
-/** The cache lives per route module, which is per daemon process. A test that
- *  builds a fresh app gets a fresh cache; a production daemon has exactly one,
- *  which is the point (one fan-out, every reader). */
-const caches = new WeakMap<Hono, FleetSummaryCache>();
+/**
+ * The fleet reads, behind ONE holder that owns the caches.
+ *
+ * The caches used to live on the `/api/fleet` route module, which meant only that
+ * route could use them. A scrape surface (`/metrics`) must share them or every
+ * scrape would be a second fan-out for the same fleet — the exact cost the cache
+ * exists to prevent. So the caches live here, and every route that reads the fleet
+ * is handed the SAME holder.
+ *
+ * Deps are still resolved per request inside each read, so a settings flip (stall
+ * threshold, host budget, concurrency) still applies to the next fan-out rather
+ * than being frozen at whichever request happened to build the cache first.
+ */
+export interface FleetReads {
+  readSummary(c: Context, fresh: boolean): Promise<FleetSummaryPayload>;
+  readUsage(c: Context, windowHours: number, fresh: boolean): Promise<FleetUsagePayload>;
+}
+
+export function createFleetReads(): FleetReads {
+  let summaryCache: FleetSummaryCache | undefined;
+  let usageCache: FleetUsageCache | undefined;
+
+  return {
+    async readSummary(c, fresh) {
+      const deps = getDeps(c);
+      if (!deps.psService || !deps.rigRepo || !deps.queueRepo) {
+        throw new FleetReadUnavailableError("fleet_summary_unavailable");
+      }
+      if (!summaryCache) {
+        summaryCache = createFleetSummaryCache(
+          (thresholdMinutes) => composeFleetSummary({
+            readLocalHost: () => buildLocalHostFacts(deps),
+            loadRegistry: deps.registryLoader,
+            registryExists: deps.registryProbe,
+            stallThresholdMinutes: thresholdMinutes,
+            hostTimeoutMs: resolveHostTimeoutMs(deps.settingsStore),
+            concurrency: resolveFanoutConcurrency(deps.settingsStore),
+            fetchImpl: deps.fetchImpl,
+          }),
+          { ttlMs: FLEET_SUMMARY_CACHE_MS },
+          {
+            // A background refresh nobody awaits. Swallowing the rejection is required
+            // (an unhandled rejection would take the daemon down); saying nothing is not.
+            // If this repeats, the page is being served an increasingly stale fleet.
+            onBackgroundRefreshError: (err) => {
+              console.warn(`[fleet/summary] background refresh failed; serving stale until the bound: ${(err as Error)?.message ?? String(err)}`);
+            },
+          },
+        );
+      }
+      // The threshold is resolved per read, per fan-out. Resolving it once and closing
+      // over it would freeze whatever the first request happened to see: the payload
+      // would state one threshold while the verdicts were computed under another, which
+      // is worse than not reporting it at all. The cache is keyed on it for the same
+      // reason — a cached verdict judged by the old rule must not be served as if the
+      // new one had been applied.
+      return summaryCache.read(fresh, resolveStallThresholdMinutes(deps.settingsStore));
+    },
+
+    async readUsage(c, windowHours, fresh) {
+      const deps = getDeps(c);
+      if (!deps.rigRepo) throw new FleetReadUnavailableError("fleet_usage_unavailable");
+      if (!usageCache) {
+        usageCache = createFleetUsageCache(
+          (window) => composeFleetUsage({
+            // The LOCAL host in-process, the same ruling the summary's local leg
+            // follows. On a hub this is usually empty — a hub has no seats — and an
+            // operator running this daemon as their only host gets their own teams.
+            readLocalUsage: (w: FleetUsageWindow): UsageLeg => {
+              try {
+                return { ok: true, body: computeTopBurn(deps.rigRepo!.db, { windowHours: w.windowHours, nowIso: new Date().toISOString() }) };
+              } catch (err) {
+                // No samples table, an unreadable db — either way this host's usage is
+                // UNKNOWN, which is a different fact from "this host used nothing".
+                return { ok: false, reason: `this daemon's own usage samples could not be read: ${(err as Error)?.message ?? String(err)}` };
+              }
+            },
+            loadRegistry: deps.registryLoader,
+            registryExists: deps.registryProbe,
+            windowHours: window,
+            hostTimeoutMs: resolveHostTimeoutMs(deps.settingsStore),
+            concurrency: resolveFanoutConcurrency(deps.settingsStore),
+            fetchImpl: deps.fetchImpl,
+          }),
+          {},
+          {
+            onBackgroundRefreshError: (err) => {
+              console.warn(`[fleet/usage] background refresh failed; serving stale until the bound: ${(err as Error)?.message ?? String(err)}`);
+            },
+          },
+        );
+      }
+      return usageCache.read(fresh, String(windowHours));
+    },
+  };
+}
 
 function getDeps(c: { get: (key: string) => unknown }) {
   return {
@@ -114,7 +217,7 @@ export function resolveFanoutConcurrency(store: SettingsStore | undefined): numb
  *  hub must not accept a window its own remote legs would reject with a 400. A bad
  *  value is a 400 naming the parameter, never a silent default that leaves the
  *  reader holding numbers for a window nobody asked for. */
-function resolveUsageWindow(raw: string | undefined): { windowHours: number } | { error: string } {
+export function resolveUsageWindow(raw: string | undefined): { windowHours: number } | { error: string } {
   const value = raw === undefined || raw === "" ? 1 : Number(raw);
   if (!Number.isFinite(value) || value <= 0) {
     return { error: `invalid window_hours "${raw}" — must be a positive number of hours` };
@@ -230,51 +333,20 @@ export function buildLocalHostFacts(deps: ReturnType<typeof getDeps>): LocalHost
   };
 }
 
-export function fleetRoutes(): Hono {
+export function fleetRoutes(reads: FleetReads = createFleetReads()): Hono {
   const app = new Hono();
 
   app.get("/summary", async (c) => {
-    const deps = getDeps(c);
-    if (!deps.psService || !deps.rigRepo || !deps.queueRepo) {
-      return c.json({ error: "fleet_summary_unavailable" }, 503);
+    try {
+      const payload = await reads.readSummary(c, c.req.query("fresh") === "1");
+      // `payload.stallThresholdMinutes` is the rule the verdicts were actually judged
+      // under, so it is what gets echoed. A reader never renders a rule that was not
+      // applied, and never has to guess which one produced the verdicts.
+      return c.json(payload);
+    } catch (err) {
+      if (err instanceof FleetReadUnavailableError) return c.json({ error: err.code }, 503);
+      throw err;
     }
-    const fresh = c.req.query("fresh") === "1";
-
-    // The threshold is resolved INSIDE the build, per fan-out. Resolving it here and
-    // closing over it would freeze whatever the first request happened to see: the
-    // payload would then state one threshold while the verdicts were computed under
-    // another, which is worse than not reporting it at all. The cache is keyed on it
-    // for the same reason — a cached verdict judged by the old rule must not be
-    // served as if the new one had been applied.
-    let cache = caches.get(app);
-    if (!cache) {
-      cache = createFleetSummaryCache(
-        (thresholdMinutes) => composeFleetSummary({
-          readLocalHost: () => buildLocalHostFacts(deps),
-          loadRegistry: deps.registryLoader,
-          registryExists: deps.registryProbe,
-          stallThresholdMinutes: thresholdMinutes,
-          hostTimeoutMs: resolveHostTimeoutMs(deps.settingsStore),
-          concurrency: resolveFanoutConcurrency(deps.settingsStore),
-          fetchImpl: deps.fetchImpl,
-        }),
-        { ttlMs: FLEET_SUMMARY_CACHE_MS },
-        {
-          // A background refresh nobody awaits. Swallowing the rejection is required
-          // (an unhandled rejection would take the daemon down); saying nothing is not.
-          // If this repeats, the page is being served an increasingly stale fleet.
-          onBackgroundRefreshError: (err) => {
-            console.warn(`[fleet/summary] background refresh failed; serving stale until the bound: ${(err as Error)?.message ?? String(err)}`);
-          },
-        },
-      );
-      caches.set(app, cache);
-    }
-    const payload = await cache.read(fresh, resolveStallThresholdMinutes(deps.settingsStore));
-    // `payload.stallThresholdMinutes` is the rule the verdicts were actually judged
-    // under, so it is what gets echoed. A reader never renders a rule that was not
-    // applied, and never has to guess which one produced the verdicts.
-    return c.json(payload);
   });
 
   // GET /api/fleet/usage — what every team is using, read from the hub.
@@ -287,48 +359,19 @@ export function fleetRoutes(): Hono {
   // than it used. A host that did not answer is reported as unknown and adds
   // nothing to a total; it is never shown as zero.
   app.get("/usage", async (c) => {
-    const deps = getDeps(c);
-    if (!deps.rigRepo) return c.json({ error: "fleet_usage_unavailable" }, 503);
     const window = resolveUsageWindow(c.req.query("window_hours"));
     if ("error" in window) return c.json({ code: "fleet_usage_invalid_request", error: window.error }, 400);
     const top = resolveUsageTop(c.req.query("top"));
     if ("error" in top) return c.json({ code: "fleet_usage_invalid_request", error: top.error }, 400);
     const fresh = c.req.query("fresh") === "1";
-    const db = deps.rigRepo.db;
 
-    let cache = usageCaches.get(app);
-    if (!cache) {
-      cache = createFleetUsageCache(
-        (windowHours) => composeFleetUsage({
-          // The LOCAL host in-process, the same ruling the summary's local leg
-          // follows. On a hub this is usually empty — a hub has no seats — and an
-          // operator running this daemon as their only host gets their own teams.
-          readLocalUsage: (w: FleetUsageWindow): UsageLeg => {
-            try {
-              return { ok: true, body: computeTopBurn(db, { windowHours: w.windowHours, nowIso: new Date().toISOString() }) };
-            } catch (err) {
-              // No samples table, an unreadable db — either way this host's usage is
-              // UNKNOWN, which is a different fact from "this host used nothing".
-              return { ok: false, reason: `this daemon's own usage samples could not be read: ${(err as Error)?.message ?? String(err)}` };
-            }
-          },
-          loadRegistry: deps.registryLoader,
-          registryExists: deps.registryProbe,
-          windowHours,
-          hostTimeoutMs: resolveHostTimeoutMs(deps.settingsStore),
-          concurrency: resolveFanoutConcurrency(deps.settingsStore),
-          fetchImpl: deps.fetchImpl,
-        }),
-        {},
-        {
-          onBackgroundRefreshError: (err) => {
-            console.warn(`[fleet/usage] background refresh failed; serving stale until the bound: ${(err as Error)?.message ?? String(err)}`);
-          },
-        },
-      );
-      usageCaches.set(app, cache);
+    let payload: FleetUsagePayload;
+    try {
+      payload = await reads.readUsage(c, window.windowHours, fresh);
+    } catch (err) {
+      if (err instanceof FleetReadUnavailableError) return c.json({ error: err.code }, 503);
+      throw err;
     }
-    const payload = await cache.read(fresh, String(window.windowHours));
     // The cap is applied AFTER the cache, because it is a view over a ranking the
     // fan-out already completed, not a rule it was judged under. A reader asking for
     // 5 seats and a reader asking for 10 then share one fan-out instead of
