@@ -18,8 +18,9 @@ spec:
   podSelector:
     matchLabels:
       app: openrig-hub
+  # Ingress listed with no ingress rules denies all ingress. No `ingress: []`: the API server drops
+  # an empty list, so every apply would report the policy as configured without changing it.
   policyTypes: [Ingress, Egress]
-  ingress: []
   egress:
     # Cluster DNS: the hub resolves t-<slug>-0.teams.openrig.svc for every team.
     - to:

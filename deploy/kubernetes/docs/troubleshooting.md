@@ -72,7 +72,7 @@ HUB="kubectl -n $NS exec -i hub-0 -c daemon --"
 
 | Symptom | Cause and fix |
 |---|---|
-| `kubectl apply -k` reports NetworkPolicies as `configured` without a change in the repository. | Someone changed them in the cluster. The apply restored the repository's version. Find out who changed them before relying on the isolation. |
+| `kubectl apply -k` reports NetworkPolicies as `configured` without a change in the repository. | Check with `kubectl diff -k deploy/kubernetes` first. If only `generation` differs, nothing changed: a manifest from before this fix carries `ingress: []`, which the API server drops, so every apply re-sends it. If a rule differs, someone changed the policy in the cluster; the apply restored the repository's version, and you should find out who before relying on the isolation. |
 | A team pod restarted. | Its seats stopped with it; the volume kept state, sessions and workspace. `status` shows `degraded`; `wait` (or `start` again) brings the rig back with `rig up <rig> --existing`. `watch` only reports it. |
 | The hub pod restarted. | Its registry and settings are on its volume. The fleet cache refills on the first read. Restart your port-forward. |
 | Teams run an older image than the hub. | Expected: the image is fixed per team at `start`, and the hub only uses routes older images serve. New tickets get the new pin. |
