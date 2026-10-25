@@ -127,10 +127,12 @@ Claude Code lead. It keeps working after the command returns, which is the point
 **Open the TUI first — this is its step.** Three things, in this order:
 
 1. **PULSE** — type `tab pulse` in the `cmd` line. `DEMO-A` sits under **▲ NEEDS YOU** with a dim
-   `[t-demo-a]` label in front of its summary, and the same row is under **⚑ STALLED** with
-   `Nm since last progress, 1 open`. Say both: the team is waiting for you *and* the hub has already
-   called it stalled, and that is not a contradiction — a parked row is open work that makes no queue
-   transitions. Step 5 comes back to what the second badge means.
+   `[t-demo-a]` label in front of its summary, and its team is under **⚑ STALLED** as well — named by its
+   **rig**, not by the parked question. Rehearsal 2 read
+   `⚑ [t-demo-a] demo-one — 5m since last progress, 1 open · threshold 3m`, and that `1 open` is the
+   team's open-work count rather than one named row. Say both: the team is waiting for you *and* the hub
+   has already called it stalled, and that is not a contradiction — a parked row is open work that makes
+   no queue transitions. Step 5 comes back to what the second badge means.
 2. **TOPOLOGY** — in the explorer, open `hub-0` and then a remote host: it expands into its rig and its
    seats, each with its state. A remote rig prints `reach: read-only from here · rig capture|send
    <seat>@<rig>@<host>` where a local one offers a terminal, because the terminal would open on the wrong
@@ -155,7 +157,9 @@ kubectl -n $NS exec hub-0 -c daemon -- rig usage top --all-hosts
 
 Say what the audience is looking at: every seat of every team, and a token-burn table that adds up across
 hosts. No agent runs on your machine. `rig ps` answers per host, so it prints a `[host=t-demo-a]` block
-per team; `usage top` is the one that labels each seat row with its `[host]`.
+per team — and with `--nodes -A` that block is a **JSON array** of the team's seats, not a table, so point
+at the `logicalId`/`sessionStatus` pair instead of reading it aloud. `usage top` is the one that prints as
+a table and labels each seat row with its `[host]`.
 
 **And this is where the stall is true.** `DEMO-A` parked its question an hour ago, it holds open work,
 and a parked row makes no queue transitions — which is exactly what the hub counts as progress. Show it
@@ -169,11 +173,14 @@ Expect `openrig_fleet_host_stalled{host="t-demo-a"} 1` next to
 `openrig_fleet_stall_threshold_seconds 180`. Step 5 comes back to what that number means, after step 3
 has answered the row and restarted its clock.
 
-Say honestly that this read is the rule applied, not something a rehearsal has yet seen at this point in
-the run: in rehearsal 1 the only `1` that came back was later, and it belonged to a row that had
-re-parked (step 3 explains how). The rule is what makes it safe to promise here — open work includes a
-row parked on a human, the only progress source is a queue transition, and a system actor's note is not
-one. Rehearsal 2 takes this reading at this point in the run, before anything is answered.
+Say it as a measured fact, not a rule applied on faith. Rehearsal 2 took this read at exactly this point in
+the run — before anything was answered — and got
+`openrig_fleet_host_stalled{host="t-demo-a"} 1` and
+`openrig_fleet_rig_stalled{host="t-demo-a",rig="demo-one"} 1` against
+`openrig_fleet_stall_threshold_seconds 180`, while `t-demo-b` and `t-demo-c` read `0`. (Rehearsal 1 never
+reached this point with a `1`: its only `1` came later and belonged to a row that had re-parked.) The rule
+under it is what makes it repeatable — open work includes a row parked on a human, the only progress source
+is a queue transition, and a system actor's note is not one.
 
 The `?fresh=1` is not decoration. The verdict is computed from a cached fleet read, and in rehearsal 1 a
 scrape still said `0` about twenty seconds after the row had passed the threshold while a fresh read said
@@ -210,15 +217,18 @@ A row the fleet read showed on another host is routed there, so this answers DEM
 from the hub. Or from the shell:
 
 ```bash
-$D answer DEMO-A "$Q_A" "Use '<words> <lines>' (B)" | jq -c '{verb: .verb, reason: .closedQitem.resolution}'
+$D answer DEMO-A "$Q_A" "Use '<words> <lines>' (B)" | jq -c '{verb: .verb, state: .state}'
 ```
 
 Type one of the two literal orders, with the letter that names it. The team takes the words literally:
 in the rehearsal an answer that quoted option A's order under option B's letter came back as a re-park
 saying "those conflict: A = …; B = … Which do you want?" — which is the team being right, and a wasted
 minute on stage. The `jq` is there because `answer` prints the whole queue row, which is several hundred
-lines of JSON on a projector; it keeps the two fields the audience needs, the verb and the decision that
-closed the row. Piping costs you `answer`'s exit code, which is the thing that tells you the hub path was
+lines of JSON on a projector; it keeps the verb and the state the row closed to. Do not ask that line for
+the decision text: rehearsal 2 found `answer`'s JSON has no `closedQitem` in it at all — the word appears
+nowhere in `rig-dispatch` — so `{reason: .closedQitem.resolution}` printed `null` over a resolve that had
+worked. The audit read below is where the decision text and its origin host are proved. Piping costs you
+`answer`'s exit code, which is the thing that tells you the hub path was
 refused — with `set -o pipefail` in your shell it still fails the line, otherwise read the output.
 
 Then show what the team now has, and who it thinks it came from:
@@ -274,8 +284,10 @@ progress, 1 open`") and as the metric line (`openrig_fleet_host_stalled{host="t-
 says what the two of them mean.
 
 Say the sentence from the step 2 read. Do **not** go pointing at `DEMO-A` again here: step 3 answered it,
-and that answer is itself a queue transition made by a human, which restarts its stall clock. By step 5 it
-has been a few minutes of answered, working, maybe finished — no badge, and saying otherwise would be wrong.
+and that answer is itself a queue transition made by a human, which restarts its stall clock. Rehearsal 2
+re-read the metric fresh after step 3 and got `openrig_fleet_host_stalled{host="t-demo-a"} 0` — the badge
+went because the answer landed, not because anything was cleared by hand. By step 5 `DEMO-A` has been a few
+minutes of answered, working, maybe finished — no badge, and saying otherwise would be wrong.
 
 **Do not promise `DEMO-C` as the stalled team.** The rehearsal measured it: `DEMO-C`'s row went
 `pending` → `in-progress` → `done` in **44 seconds**, both parts of its brief included. A scope with no
@@ -346,13 +358,14 @@ $D hub-sync
 ```
 
 **Audience sees.** The hub said "unreachable" the moment the pod went, not after a human noticed. In the
-rehearsal that read came back inside twelve seconds as
+rehearsal that read came back inside thirteen seconds as
 `[host=t-demo-c] FAILED (remote-daemon-unreachable): host did not answer its health probe`. `--dry-run`
 prints what it would reconcile — the team is registered there and nothing backs it — and `hub-sync` fixes
 it, after which `rig ps --all-hosts` no longer names the team at all.
 
-Expect `--dry-run` to **exit 1** here. Drift is what it reports, and a non-zero exit is it doing its job —
-say that before you run it, so a red exit code on screen is not read as a failure. (Pipe it through `tail`
+Expect `--dry-run` to **exit 1** here, and expect the `rig ps` above it to **exit 3** while a host is
+FAILED. Both red codes are the finding, not a broken command — say that before you run them, so a red exit
+code on screen is not read as a failure. (Pipe it through `tail`
 and `$?` becomes `tail`'s; check the code on the command itself.)
 
 **If it does not appear.**
