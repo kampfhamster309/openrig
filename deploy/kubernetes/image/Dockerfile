@@ -16,7 +16,7 @@ RUN set -eux; \
     rm -rf /var/lib/apt/lists/*
 ENV LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8 TERM=xterm-256color
 
-ARG NODE_VERSION=22.22.1
+ARG NODE_VERSION=22.23.4
 ARG TARGETARCH
 RUN set -eux; \
     case "${TARGETARCH}" in \
