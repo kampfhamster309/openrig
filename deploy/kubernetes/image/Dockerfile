@@ -6,11 +6,12 @@ ARG BASE_IMAGE
 FROM ${BASE_IMAGE}
 
 # tmux runs the seats; python3/make/g++ build better-sqlite3 on install (see the testbed Dockerfile);
-# python3 also runs pi-seat-status. ripgrep, jq, less and rsync are for the agents and test suites.
+# python3 also runs pi-seat-status. ripgrep, jq, less and rsync are for the agents and test suites;
+# lsof lets the daemon check at startup that no other daemon has its database open.
 RUN set -eux; \
     apt-get update; \
     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-      ca-certificates curl xz-utils git tmux tini procps locales \
+      ca-certificates curl xz-utils git tmux tini procps lsof locales \
       python3 make g++ ripgrep jq less rsync; \
     sed -i 's/^# *en_US.UTF-8/en_US.UTF-8/' /etc/locale.gen; locale-gen; \
     rm -rf /var/lib/apt/lists/*
