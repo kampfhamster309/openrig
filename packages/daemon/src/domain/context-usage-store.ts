@@ -4,7 +4,7 @@ import { join } from "node:path";
 import os from "node:os";
 import { closeSync, existsSync, openSync, readFileSync, readSync, statSync, unlinkSync } from "node:fs";
 import { resolveCodexDbPaths } from "./codex-thread-id.js";
-import type { ContextUsage, ContextUnknownReason } from "./types.js";
+import type { ContextUsage, ContextUsageSource, ContextUnknownReason } from "./types.js";
 import { parseSqliteUtcMs } from "./sqlite-time.js";
 import {
   contextUsageDirectory,
@@ -164,11 +164,12 @@ export class ContextUsageStore {
     }
   }
 
-  /** Read sidecar and normalize into ContextUsage in one step. */
-  readAndNormalize(sessionName: string): ContextUsage {
+  /** Read sidecar and normalize into ContextUsage in one step. `source` names the writer of this
+   *  seat's sidecar; it is the caller's knowledge (the runtime), never a guess from the file. */
+  readAndNormalize(sessionName: string, source: ContextUsageSource = "claude_statusline_json"): ContextUsage {
     const result = this.readSidecar(sessionName);
     if (!result.ok) return this.unknownUsage(result.reason);
-    return this.normalizeSample(result.data);
+    return this.normalizeSample(result.data, source);
   }
 
   /** Read the latest Codex token_count event for a thread and normalize it. */
@@ -195,8 +196,12 @@ export class ContextUsageStore {
     return this.readCodexThread(threadId)?.rollout_path ?? null;
   }
 
-  /** Normalize raw sidecar data into a ContextUsage record. */
-  normalizeSample(raw: SidecarRaw | null): ContextUsage {
+  /** Normalize raw sidecar data into a ContextUsage record.
+   *
+   *  The sidecar format is runtime-neutral (the stub runtime writes it too), so the file itself does
+   *  not say who wrote it. `source` defaults to Claude's collector because that is what has always
+   *  written this file; a caller reading for another runtime must pass it explicitly. */
+  normalizeSample(raw: SidecarRaw | null, source: ContextUsageSource = "claude_statusline_json"): ContextUsage {
     if (!raw) {
       return this.unknownUsage("missing_sidecar");
     }
@@ -212,7 +217,7 @@ export class ContextUsageStore {
     return {
       availability: "known",
       reason: null,
-      source: "claude_statusline_json",
+      source,
       usedPercentage: cw.used_percentage ?? null,
       remainingPercentage: cw.remaining_percentage ?? null,
       contextWindowSize: cw.context_window_size ?? null,

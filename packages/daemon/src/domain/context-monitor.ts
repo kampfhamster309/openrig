@@ -8,7 +8,7 @@ import {
   type ReadinessResult,
 } from "./runtime-adapter.js";
 import type { UsageSamplesStore, ProviderWindowSampleInput } from "./usage-samples-store.js";
-import type { ContextUsage } from "./types.js";
+import type { ContextUsage, ContextUsageSource } from "./types.js";
 import { getLatestStartupFailedEvent, hasClaudeResumeIdentityWork, readPendingStartupContext } from "./startup-orchestrator.js";
 import { claudeResumeRotation, SessionRegistry } from "./session-registry.js";
 
@@ -36,6 +36,18 @@ interface EligibleSession {
   binding_updated_at: string | null;
   generation_uuid: string | null;
   startup_event_seq: number | null;
+}
+
+/** Which writer produced this runtime's context sidecar.
+ *
+ *  A Pi or OMP seat's sidecar is written from the Pi side (the `pi-openrig-context` extension), not
+ *  by a Claude status line, and the label is what lets a consumer tell the two apart. The sidecar
+ *  format itself is runtime-neutral, so the runtime - not the file - decides the label.
+ *
+ *  OMP is included because it reads the same sidecar contract when its harness writes one; when it
+ *  never does, the seat stays `unknown` (never a zero), exactly as a missing sidecar always has. */
+export function contextSourceForRuntime(runtime: string | null): ContextUsageSource {
+  return runtime === "pi" || runtime === "omp" ? "pi_context_usage_json" : "claude_statusline_json";
 }
 
 interface ClaudeContextProvisioner {
@@ -270,6 +282,7 @@ export class ContextMonitor {
       WHERE (
           (n.runtime = 'claude-code' AND s.status = 'running')
           OR (n.runtime = 'stub' AND s.status = 'running')
+          OR (n.runtime IN ('pi', 'omp') AND s.status = 'running')
           OR (
             n.runtime = 'codex'
             AND (
@@ -296,14 +309,16 @@ export class ContextMonitor {
     // Only claude-code seats get the Claude context collector provisioned into
     // their cwd. A runtime:stub seat self-provides its context sidecar, so the
     // monitor consumes it via readAndNormalize below WITHOUT writing any
-    // Claude-specific collector config into the stub's cwd.
+    // Claude-specific collector config into the stub's cwd. The same holds for a Pi or OMP seat:
+    // its sidecar comes from the Pi-side extension, and OpenRig writes nothing into a seat's Pi
+    // agent directory (docs/reference/rig-spec.md, "Pi").
     if (session.runtime === "claude-code") {
       this.claudeContextProvisioner?.ensureContextCollector({
         cwd: session.cwd ?? undefined,
         tmuxSession: session.session_name,
       });
     }
-    return this.store.readAndNormalize(session.session_name);
+    return this.store.readAndNormalize(session.session_name, contextSourceForRuntime(session.runtime));
   }
 
   private async normalizeStartupStatus(session: EligibleSession): Promise<void> {

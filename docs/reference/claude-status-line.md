@@ -15,6 +15,9 @@ contain an older session ID; without one, context and capture report
 `missing_sidecar`, and provider usage reports `no_statusline_cache_yet` unless an
 earlier cache remains.
 
+This page is about Claude's collector. For the other runtimes' context readings and
+the sidecar contract they share, see [Context usage sources](context-usage-sources.md).
+
 ## Feed both commands the same input
 
 On macOS, Linux or WSL2, save a wrapper such as this, replacing the three
