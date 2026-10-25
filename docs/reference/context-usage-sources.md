@@ -54,12 +54,13 @@ kept unrounded under `current_usage.percent`.
 What the reader makes of it:
 
 - **`used_percentage` must be a number for the seat to read as known.** The reasons then split by what
-  the file actually did: a **missing file** is `unknown` with reason `missing_sidecar`; a **present,
-  well-formed `context_window` whose `used_percentage` is null** is `unknown` with reason `no_data` —
-  that is a valid "no reading right now", which is what Pi writes after a compaction, and not a
-  malformed file; anything genuinely **absent or malformed** (no `context_window`, or one that is not
-  an object) is `unknown` with reason `parse_error`. **Unknown is never rendered as zero**, on any
-  surface.
+  the file actually did: a **missing file** is `unknown` with reason `missing_sidecar`; a present,
+  well-formed `context_window` whose `used_percentage` is **explicitly `null`** is `unknown` with
+  reason `no_data` — that is a valid "no reading right now", which is what Pi writes after a
+  compaction, and not a malformed file; anything genuinely **malformed** stays `unknown` with reason
+  `parse_error` — no `context_window`, a `context_window` that is not an object, a `used_percentage`
+  key that is absent, or one that is a non-number such as `"42"`. **Unknown is never rendered as
+  zero**, on any surface.
 - **`session_name` must be the seat's current session name.** A sidecar naming a different session is
   refused as `session_mismatch`.
 - **`sampled_at` decides both freshness and the generation guard.** A sample older than ten minutes is

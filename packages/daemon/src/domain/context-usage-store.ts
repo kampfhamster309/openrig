@@ -210,12 +210,15 @@ export class ContextUsageStore {
     if (!cw || typeof cw !== "object") {
       return this.unknownUsage("parse_error");
     }
-    if (typeof cw.used_percentage !== "number") {
-      // A well-formed sidecar that reports no reading right now is not a malformed file. Pi writes
+    if (cw.used_percentage === null) {
+      // An explicit null is a well-formed sidecar reporting "no reading right now". Pi writes
       // exactly this shape after a compaction, when its own usage stays unknown until the next model
       // response, so calling it `parse_error` would blame the writer for an honest absence. Still
-      // unknown, never zero.
+      // unknown, never zero. A *missing* key or a non-number is malformed, and stays parse_error.
       return this.unknownUsage("no_data");
+    }
+    if (typeof cw.used_percentage !== "number") {
+      return this.unknownUsage("parse_error");
     }
 
     const sampledAt = raw.sampled_at ?? null;

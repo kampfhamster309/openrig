@@ -185,6 +185,23 @@ describe("ContextUsageStore", () => {
     }
   });
 
+  // Only an explicit null means "no reading right now". A missing key or a non-number is a
+  // malformed file, and must not be excused as no_data.
+  it("only an explicit null used_percentage is no_data; a missing key or a non-number is parse_error", () => {
+    const base = { context_window_size: 262144 };
+    const withPct = (value: unknown) =>
+      store.normalizeSample({ session_id: "x", context_window: { ...base, used_percentage: value } } as any);
+
+    expect(withPct(null).reason).toBe("no_data");
+
+    for (const bad of [undefined, "42", "high", {}, []]) {
+      const usage = withPct(bad);
+      expect(usage.availability).toBe("unknown");
+      expect(usage.reason).toBe("parse_error");
+      expect(usage.usedPercentage).toBeNull();
+    }
+  });
+
   // T4: Stale sample -> fresh=false but values retained
   it("stale sample has fresh=false but retains persisted values", () => {
     const stale = {
