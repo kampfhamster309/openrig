@@ -12,7 +12,8 @@
 # FAKE_SHOW_BLOCKED, FAKE_WATERMARK_EVENTS, FAKE_WATERMARK_TRANSITIONS, FAKE_STS_CREATED,
 # FAKE_STS_EXISTS, FAKE_FAIL_STS_LIST, FAKE_FAIL_STS_GET, FAKE_FAIL_POD_LIST, FAKE_STS_LIST2,
 # FAKE_POD_LIST2,
-# FAKE_EVENTS, FAKE_EVENTS2, FAKE_EVENTS3, FAKE_EVENTS_SEEN, FAKE_EVENTS_FAIL, FAKE_RUN_TAG.
+# FAKE_EVENTS, FAKE_EVENTS2, FAKE_EVENTS3, FAKE_EVENTS_SEEN, FAKE_EVENTS_FAIL, FAKE_RUN_TAG,
+# FAKE_LIVE_TAIL.
 #
 # With FAKE_HUB_HOME set, calls aimed at the hub pod stop being recorded answers and become real work
 # on a real directory -- see "the hub's own side" below. FAKE_NPM_ROOT says where the `yaml` stand-in
@@ -72,9 +73,15 @@ telemetry() {
     esac
     shift
   done
+  # The events stream ends at seq 3. FAKE_WATERMARK_EVENTS moves only its end, to stand for a stream
+  # that has run on past what a read can enumerate; FAKE_LIVE_TAIL names one real event of that type
+  # that sits past the end, so a test can tell the daemon's own ticks from the team's own history.
+  local ev_wm=${FAKE_WATERMARK_EVENTS:-3}
+  [ "${FAKE_R3_WRITES:-0}" = 1 ] && ev_wm=9
+  [ -n "${FAKE_LIVE_TAIL:-}" ] && ev_wm=4
   if [ -z "$cursor" ] && [ "$started" != retained ]; then
     case "$stream" in
-      events) fix events-latest.json | jq -c --arg wm "${FAKE_WATERMARK_EVENTS:-$( [ "${FAKE_R3_WRITES:-0}" = 1 ] && echo 9 || echo 3 )}" '.page.retainedHighWatermark = $wm' ;;
+      events) fix events-latest.json | jq -c --arg wm "$ev_wm" '.page.retainedHighWatermark = $wm' ;;
       transitions) fix transitions-latest.json | jq -c --arg wm "${FAKE_WATERMARK_TRANSITIONS:-5}" '.page.retainedHighWatermark = $wm' ;;
       *) nope "telemetry $stream latest window" ;;
     esac
@@ -84,11 +91,16 @@ telemetry() {
     events:) fix events-page1.json ;;
     events:CURSOR-E1)
       if [ "${FAKE_STALL_EVENTS:-0}" = 1 ]; then fix events-page1.json
-      elif [ "${FAKE_R3_WRITES:-0}" = 1 ]; then
-        # The team wrote while the read was running: the window's `through` stays where it opened, but
-        # the high watermark the daemon reports has moved past what this read can include.
-        fix events-page2.json | jq -c '.page.retainedHighWatermark = "9"'
-      else fix events-page2.json; fi ;;
+      elif [ -n "${FAKE_LIVE_TAIL:-}" ]; then
+        # One more event landed after the window the archive took, of the type the test names.
+        fix events-page2.json | jq -c --arg t "$FAKE_LIVE_TAIL" --arg wm "$ev_wm" \
+          '.rows += [{"seq":"4","rigId":"demo-rig","nodeId":"n-1","type":$t,"createdAt":"2026-10-23T20:31:00Z"}]
+           | .page.through = $wm | .page.lastScanned = $wm | .page.retainedHighWatermark = $wm'
+      else
+        # The window this page belongs to closed at seq 3, but the stream's own end is whatever the
+        # case says it is: when that is further on, rows exist past the window and no read reaches them.
+        fix events-page2.json | jq -c --arg wm "$ev_wm" '.page.retainedHighWatermark = $wm'
+      fi ;;
     transitions:) fix transitions-page1.json ;;
     transitions:CURSOR-T1) fix transitions-page2.json ;;
     *) nope "telemetry $stream cursor $cursor" ;;

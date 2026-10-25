@@ -279,6 +279,44 @@ if grep -q "the team has moved on since" "$WORK/delete-moved-watermark.err"; the
 else bad "and says the team moved on (got: $(head -c 200 "$WORK/delete-moved-watermark.err"))"; fi
 in_calls "the guard read the live watermark, not the archived one" "telemetry events --json"
 
+echo "== delete: the daemon's own timer is not the team moving on"
+# A team daemon writes a `snapshot.created` event to itself every few minutes whether anyone is
+# working or not. One of those landing after the collect is not the team having moved on; in the
+# recorded run it cost a second collect for nothing.
+run_archive del-tick "$WORK/del-tick"
+run_dispatch delete-idle-tick FAKE_LIVE_TAIL=snapshot.created -- delete DEMO --dir "$WORK/del-tick"
+eq "delete runs when the only event after the archive is the daemon's own tick" 0 "$RC"
+if grep -q "deleted t-demo" "$WORK/delete-idle-tick.err"; then ok "and deletes the team"
+else bad "and deletes the team (got: $(head -c 200 "$WORK/delete-idle-tick.err"))"; fi
+in_calls "and it read past the archived watermark to learn whose event it was" "--start retained"
+
+# The same archive and the same one extra event, one type later: a queue row is the team working.
+run_dispatch delete-real-event FAKE_LIVE_TAIL=queue.updated -- delete DEMO --dir "$WORK/del-tick"
+eq "delete still refuses when a real event landed after the archive" 1 "$RC"
+if grep -q "events(new activity)" "$WORK/delete-real-event.err"; then ok "and names the new activity as the reason"
+else bad "and names the new activity as the reason (got: $(head -c 200 "$WORK/delete-real-event.err"))"; fi
+
+# What an archive written by the older dispatcher does under this check. It recorded the raw end of
+# the window it read, and so does this one: the manifest field never changed meaning, so there is no
+# old archive to special-case. Here that end sits on a tick, and the delete may still trust it.
+run_archive del-oldstyle "$WORK/del-oldstyle" FAKE_LIVE_TAIL=snapshot.created
+jqis "the recorded watermark is the raw end of the window, tick and all" "$WORK/del-oldstyle/demo/manifest.json" \
+  '.watermarks.events' "4"
+jqis "and the tick itself is archived, not dropped from the history" "$WORK/del-oldstyle/demo/events.json" \
+  '[.rows[].type] | last' "snapshot.created"
+run_dispatch delete-oldstyle FAKE_LIVE_TAIL=snapshot.created -- delete DEMO --dir "$WORK/del-oldstyle"
+eq "an archive whose watermark sits on a tick is still the current one" 0 "$RC"
+
+# A watermark that is not a number cannot bound a read, so nothing past it can be classified. The
+# conservative answer is the one an unreadable stream already gets: refuse, and say so.
+run_archive del-unparseable "$WORK/del-unparseable"
+jq '.watermarks.events = "seq:00000000ff"' "$WORK/del-unparseable/demo/manifest.json" > "$WORK/del-unparseable/demo/m.new" \
+  && mv "$WORK/del-unparseable/demo/m.new" "$WORK/del-unparseable/demo/manifest.json"
+run_dispatch delete-unparseable-watermark -- delete DEMO --dir "$WORK/del-unparseable"
+eq "delete refuses a watermark it cannot place on the number line" 1 "$RC"
+if grep -q "events(cannot be read to its end)" "$WORK/delete-unparseable-watermark.err"; then ok "and says it could not read the stream to its end"
+else bad "and says it could not read the stream to its end (got: $(head -c 200 "$WORK/delete-unparseable-watermark.err"))"; fi
+
 echo "== an archive records what it holds, not what the stream had reached"
 # The team wrote while the archive was reading. The window's `through` stays where it opened; the
 # watermark the daemon reports on the last page has moved past the rows this read could include.

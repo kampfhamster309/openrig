@@ -1758,6 +1758,60 @@ live_watermark() { # live_watermark <slug> <events|transitions>
   inpod "$1" rig telemetry "$2" --json 2>/dev/null | jq -r '.page.retainedHighWatermark // empty' || true
 }
 
+# The events a team daemon writes to itself on a timer while nobody on the team does anything, as a
+# JSON array for jq. `snapshot.created` is the periodic snapshot every daemon takes for itself
+# (OPENRIG_SNAPSHOTS_PERIODIC_*): in the recorded run one landed 17 s after a collect and the delete
+# was refused as stale, and that run's own DEMO-B archive holds six of them after the team's last
+# real event. The list is deliberately short, because a missed real change is worse than a refused
+# delete. `watchdog.evaluation_skipped` is NOT in it: the daemon already keeps the reasons that are
+# pure polling quiet (QUIET_SKIP_REASONS in watchdog-policy-engine.ts) and records only a skip it
+# thought worth recording, and it wrote none during that same idle half-hour. Queue, seat, node and
+# rig events and every transition row still count, and so does any row this cannot classify.
+IDLE_TICK_EVENTS='["snapshot.created"]'
+
+# Did the team write real history past <after>? Pages the live stream from the retained floor exactly
+# as `archive` pages it, and stops at the first activity row, so the answer costs one page whenever
+# the team really did move on. A stream that has run past what this read could enumerate is answered
+# as moved: rows nobody could read are treated as activity, never as absent. Returns 0 for activity,
+# 1 for nothing but the daemon's own ticks, 2 for a stream this read could not enumerate to its end.
+live_activity_after() { # live_activity_after <slug> <events|transitions> <after>
+  local slug=$1 stream=$2 after=$3
+  local cursor="" pages=0 last="" scanned next page through="" wm="" w
+  # A watermark this cannot put on the number line cannot bound a read, so it is not answered here.
+  case "$after" in ''|*[!0-9]*) return 2 ;; esac
+  while :; do
+    local -a args=(--limit "$TELEMETRY_PAGE" --json)
+    if [ -n "$cursor" ]; then args+=(--cursor "$cursor"); else args+=(--start retained); fi
+    page=$(inpod "$slug" rig telemetry "$stream" "${args[@]}" 2>/dev/null) || return 2
+    jq -e . >/dev/null 2>&1 <<<"$page" || return 2
+    # A row past the archived window that is not one of the daemon's own ticks is the team moving on.
+    # A row whose seq this cannot place as a number is treated as past, and as activity.
+    if jq -e --argjson skip "$IDLE_TICK_EVENTS" --argjson after "$after" '
+        [ .rows[]?
+          | ((.seq // "") | tostring) as $s
+          | select(if ($s | test("^[0-9]+$")) then ($s | tonumber) > $after else true end)
+          | select((.type // "") as $t | ($skip | index($t)) | not)
+        ] | length > 0' >/dev/null 2>&1 <<<"$page"; then
+      return 0
+    fi
+    w=$(jq -r '.page.through // ""' <<<"$page"); [ -n "$w" ] && through=$w
+    w=$(jq -r '.page.retainedHighWatermark // ""' <<<"$page"); [ -n "$w" ] && wm=$w
+    pages=$((pages + 1))
+    [ "$(jq -r '.page.hasMore' <<<"$page")" = true ] || break
+    scanned=$(jq -r '.page.lastScanned // ""' <<<"$page")
+    next=$(jq -r '.page.nextCursor // ""' <<<"$page")
+    if [ -z "$next" ] || [ "$next" = "$cursor" ] || [ "$scanned" = "$last" ]; then return 2; fi
+    cursor=$next; last=$scanned
+    [ "$pages" -lt "$MAX_PAGES" ] || return 2
+  done
+  # The window this read opened closed before the stream's own end, so rows exist past it that were
+  # never seen. Their types are unknown, and unknown counts as activity.
+  case "$through" in ''|*[!0-9]*) return 2 ;; esac
+  case "$wm" in ''|*[!0-9]*) return 2 ;; esac
+  [ "$wm" -le "$through" ] || return 2
+  return 1
+}
+
 # Is it safe to delete this ticket's pod? Three separate questions, all answered before anything is
 # touched, because `delete` is the step that cannot be undone: is the archive COMPLETE (its manifest
 # says so and no part failed), is it REAL (every part it claims was saved is on disk, parses, and
@@ -1765,7 +1819,7 @@ live_watermark() { # live_watermark <slug> <events|transitions>
 # history since). A complete archive of an earlier moment, or of an earlier team that used the same
 # slug, answers none of the third. Prints the reason it is not safe, or nothing when it is.
 archive_check() { # archive_check <root> <slug>
-  local dir=$1/$2 bad missing complete name f want have sts live inc at moved wm want_wm have_wm
+  local dir=$1/$2 bad missing complete name f want have sts live inc at moved wm want_wm have_wm rc
   if [ ! -f "$dir/manifest.json" ]; then
     printf 'there is no archive at %s (no manifest.json); run archive or collect first' "$dir"
     return 0
@@ -1820,7 +1874,13 @@ archive_check() { # archive_check <root> <slug>
         [ -n "$want_wm" ] || continue
         have_wm=$(live_watermark "$2" "$wm")
         if [ -z "$have_wm" ]; then moved="$moved $wm(cannot be read now)"; continue; fi
-        [ "$have_wm" = "$want_wm" ] || moved="$moved $wm"
+        [ "$have_wm" = "$want_wm" ] && continue
+        # The stream has run on since the archive. That is only the team moving on if one of the rows
+        # past the archived window is team activity: the daemon writes events to itself on a timer,
+        # and an archive must not go stale because one of those fired.
+        live_activity_after "$2" "$wm" "$want_wm"; rc=$?
+        if [ "$rc" = 0 ]; then moved="$moved $wm(new activity)"
+        elif [ "$rc" = 2 ]; then moved="$moved $wm(cannot be read to its end)"; fi
       done
       if [ -n "$moved" ]; then
         printf 'the team has moved on since the archive at %s was taken (%s); archive again' "$dir" "${moved# }"
