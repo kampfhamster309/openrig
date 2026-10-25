@@ -12,7 +12,8 @@
 # FAKE_SHOW_BLOCKED, FAKE_WATERMARK_EVENTS, FAKE_WATERMARK_TRANSITIONS, FAKE_STS_CREATED,
 # FAKE_STS_EXISTS, FAKE_FAIL_STS_LIST, FAKE_FAIL_STS_GET, FAKE_FAIL_POD_LIST, FAKE_STS_LIST2,
 # FAKE_POD_LIST2,
-# FAKE_EVENTS, FAKE_EVENTS2, FAKE_EVENTS3, FAKE_EVENTS_SEEN, FAKE_EVENTS_FAIL, FAKE_RUN_TAG.
+# FAKE_EVENTS, FAKE_EVENTS2, FAKE_EVENTS3, FAKE_EVENTS_SEEN, FAKE_EVENTS_FAIL, FAKE_RUN_TAG,
+# FAKE_LIVE_TAIL, FAKE_LIVE_TAIL_TICKS, FAKE_RESET_PAGE, FAKE_PAGED_STALE, FAKE_WITHHELD.
 #
 # With FAKE_HUB_HOME set, calls aimed at the hub pod stop being recorded answers and become real work
 # on a real directory -- see "the hub's own side" below. FAKE_NPM_ROOT says where the `yaml` stand-in
@@ -59,6 +60,21 @@ sts_named_exists() { # <name>
 # around it; without this line the fake is more polite than kubectl and hides that.
 kfail() { printf 'command terminated with exit code %s\n' "$1" >&2; exit "$1"; }
 
+# A page that scanned rows and did not return them: `withheld` counts a record over the size cap and a
+# transition id that conflicts between the active and archive tables. The page still looks complete --
+# `lastScanned` reaches `through`, the watermark equals it, coverage is only `partial` -- so the count is
+# the only thing that says a row sitting somewhere in the window went unexamined.
+withhold() {
+  if [ "${FAKE_WITHHELD:-0}" = 1 ]; then
+    jq -c '.page.withheld = 1
+           | .coverage = (.coverage | .status = "partial"
+                          | .gapCount = ((.gapCount // 0) + 1)
+                          | .gaps = (.gaps + [{code: "record_byte_limit"}]))'
+  else
+    cat
+  fi
+}
+
 # One telemetry stream. The archive opens a history with `--start retained` and then follows the
 # cursor. A read with neither asks for the CURRENT window and gets no rows back, which is exactly how
 # the delete guard learns how far the stream has reached without dragging the whole history along.
@@ -72,23 +88,73 @@ telemetry() {
     esac
     shift
   done
+  # The events stream ends at seq 3. FAKE_WATERMARK_EVENTS moves only its end, to stand for a stream
+  # that has run on past what a read can enumerate; FAKE_LIVE_TAIL names one real event of that type
+  # that sits past the end, so a test can tell the daemon's own ticks from the team's own history.
+  # FAKE_LIVE_TAIL_TICKS puts that many of the daemon's own `snapshot.created` rows BEFORE it, so the
+  # real event is not the first row past the window and a reader has to keep looking to find it.
+  local ev_wm=${FAKE_WATERMARK_EVENTS:-3}
+  local ev_ticks=0
+  [ "${FAKE_R3_WRITES:-0}" = 1 ] && ev_wm=9
+  if [ -n "${FAKE_LIVE_TAIL:-}" ]; then
+    ev_ticks=${FAKE_LIVE_TAIL_TICKS:-0}
+    case "$ev_ticks" in ''|*[!0-9]*) ev_ticks=0 ;; esac
+    ev_wm=$((4 + ev_ticks))
+  fi
   if [ -z "$cursor" ] && [ "$started" != retained ]; then
     case "$stream" in
-      events) fix events-latest.json | jq -c --arg wm "${FAKE_WATERMARK_EVENTS:-$( [ "${FAKE_R3_WRITES:-0}" = 1 ] && echo 9 || echo 3 )}" '.page.retainedHighWatermark = $wm' ;;
+      events) fix events-latest.json | jq -c --arg wm "$ev_wm" '.page.retainedHighWatermark = $wm' ;;
       transitions) fix transitions-latest.json | jq -c --arg wm "${FAKE_WATERMARK_TRANSITIONS:-5}" '.page.retainedHighWatermark = $wm' ;;
       *) nope "telemetry $stream latest window" ;;
     esac
     return
   fi
   case "$stream:$cursor" in
-    events:) fix events-page1.json ;;
+    events:)
+      if [ "${FAKE_RESET_PAGE:-0}" = 1 ]; then
+        # The read opened its window when the stream already ended at $ev_wm and has scanned seqs 1-2
+        # of it, so `through` is the live end here. The next page is the restart.
+        fix events-page1.json | jq -c --arg wm "$ev_wm" \
+          '.page.through = $wm | .page.retainedHighWatermark = $wm'
+      else
+        fix events-page1.json
+      fi ;;
     events:CURSOR-E1)
       if [ "${FAKE_STALL_EVENTS:-0}" = 1 ]; then fix events-page1.json
-      elif [ "${FAKE_R3_WRITES:-0}" = 1 ]; then
-        # The team wrote while the read was running: the window's `through` stays where it opened, but
-        # the high watermark the daemon reports has moved past what this read can include.
-        fix events-page2.json | jq -c '.page.retainedHighWatermark = "9"'
-      else fix events-page2.json; fi ;;
+      elif [ "${FAKE_RESET_PAGE:-0}" = 1 ]; then
+        # The daemon restarted between the two pages. `finite-telemetry.ts` sees a new boot epoch,
+        # marks the page `reset`, reads no rows at all, ends the read (`hasMore` false, no
+        # nextCursor) and sets coverage to `unavailable`. `lastScanned` stays where the last real
+        # page got to, and `through` equals the watermark, so nothing on this page says "seqs 3 up to
+        # the window end were never looked at" except those two facts. A reader that only compares the
+        # watermark to `through` reads this as a complete read of a stream that ended at the window end.
+        fix events-page1.json | jq -c --arg wm "$ev_wm" \
+          '.rows = [] | .source.bootEpoch = "boot-2"
+           | .page = {requestedAfter:"2",requestedBefore:null,lastScanned:"2",through:$wm,
+                      retainedHighWatermark:$wm,hasMore:false,nextCursor:null,
+                      restartCursor:"CURSOR-RESTART",fetched:0,scanned:0,filtered:0,
+                      withheld:0,returned:0,capReason:null}
+           | .coverage = {status:"unavailable",historyCompleteness:"unknown",retainedMinimum:"1",
+                          gaps:[{code:"boot_boundary_history_unverified"}],gapCount:1,
+                          gapDetailsTruncated:false,eventPayloads:"not_read"}'
+      elif [ -n "${FAKE_LIVE_TAIL:-}" ]; then
+        # Real rows landed after the window the archive took: $ev_ticks of the daemon's own ticks,
+        # then one event of the type the test names. This read opens a FRESH window, so its `through`
+        # is the live end and it really does reach these rows -- which is what the real daemon does
+        # (`through` is fixed to the stream end when the read starts), and what lets a guard answer
+        # "new activity" instead of "I could not enumerate".
+        fix events-page2.json | jq -c --arg t "$FAKE_LIVE_TAIL" --arg wm "$ev_wm" --argjson n "$ev_ticks" \
+          '.rows += ([range(4; 4 + $n) | {seq: (. | tostring), rigId: "demo-rig", nodeId: "n-1", type: "snapshot.created", createdAt: "2026-10-23T20:31:00Z"}]
+                    + [{seq: ((4 + $n) | tostring), rigId: "demo-rig", nodeId: "n-1", type: $t, createdAt: "2026-10-23T20:31:00Z"}])
+           | .page.through = $wm | .page.lastScanned = $wm | .page.retainedHighWatermark = $wm' | withhold
+      else
+        # The window this page belongs to closed at seq 3, but the stream's own end is whatever the
+        # case says it is: when that is further on, rows exist past the window and no read reaches them.
+        # FAKE_PAGED_STALE is the opposite lie: the paged read reports a window AND a watermark still
+        # sitting at the archived number, though the cheap latest read said the stream had moved.
+        fix events-page2.json | jq -c --arg wm "$ev_wm" --arg stale "${FAKE_PAGED_STALE:-0}" \
+          '.page.retainedHighWatermark = (if $stale == "1" then .page.through else $wm end)' | withhold
+      fi ;;
     transitions:) fix transitions-page1.json ;;
     transitions:CURSOR-T1) fix transitions-page2.json ;;
     *) nope "telemetry $stream cursor $cursor" ;;
@@ -136,6 +202,10 @@ pod_sh() {
     *result.json*)
       # `cat ... 2>/dev/null; true` prints nothing when the file is absent, and still exits 0.
       [ "${FAKE_NO_RESULT:-0}" = 1 ] || fix result.json ;;
+    *"cat >"*)
+      # The brief write: the dispatcher pipes the file in on stdin and the pod takes it. Consume it, or
+      # the writer is left holding a pipe nobody reads and the handover never finishes.
+      cat >/dev/null ;;
     *"npm root"*) printf '/usr/lib/node_modules\n' ;;
     *) nope "pod shell: $script" ;;
   esac
@@ -328,6 +398,23 @@ serve() {
           printf '{"qitemId":"qitem-a","state":"%s","blockedOn":%s}\n' \
             "${FAKE_SHOW_STATE:-blocked}" \
             "$(if [ -n "$blocked" ]; then printf '"%s"' "$blocked"; else printf 'null'; fi)" ;;
+        "queue create")
+          # The real CLI writes a request-identity note to stderr on EVERY create, before it even asks the
+          # daemon -- so it is there on a create that then fails as well. The dispatcher reads the id from
+          # stdout; `start` must not put this in front of an audience, and must not lose a real failure.
+          printf 'Queue create request ID: qitem-20260101000000-0123456789abcdef (not proof of persistence). At the same endpoint and OPENRIG_HOME, run: rig queue show qitem-20260101000000-0123456789abcdef --full --json. If retrying, repeat the same create with --id qitem-20260101000000-0123456789abcdef.\n' >&2
+          if [ "${FAKE_QUEUE_CREATE:-ok}" = fail ]; then
+            printf '{"error":"destination_unknown","detail":"no such session for the destination"}\n' >&2
+            kfail 2
+          elif [ "${FAKE_QUEUE_CREATE:-ok}" = garbage ]; then
+            # A create whose stdout is not the JSON at all: `kubectl exec` dropped mid-stream, or the CLI
+            # wrote prose where the id was due. The reader must not die on it, and the failure must still
+            # be the loudest thing on the screen.
+            printf 'Error: daemon unreachable\n'
+            printf '{"error":"econnreset","detail":"the stream ended before the row was written"}\n' >&2
+            kfail 1
+          fi
+          printf '{"qitemId":"qitem-handed-over-1","state":"pending"}\n' ;;
         "queue resolve")
           # The hub's forwarded answer, or the team pod's own. FAKE_ANSWER picks which outcome the
           # test is exercising: ok, a routing failure only the hub can hit (it is the one passing
@@ -466,8 +553,14 @@ done
 case "${rest[0]:-}" in
   delete)
     # `kubectl delete` on the way out: succeed quietly; the test asserts on the calls it saw.
-    : ;;
-  get)
+    ;;
+  wait)
+    # `wait --for=condition=Ready pod/...`: the pod fixtures already answer Ready or not-Ready, and a
+    # test picks which with FAKE_POD_READY.
+    ;;
+  annotate)
+    # `annotate --overwrite statefulset ...`: recorded in the call log, which is what the test reads.
+    : ;;  get)
     case "${rest[1]:-}" in
       statefulset|statefulsets)
         # `status --all` and `watch --all` list the teams by label instead of naming one, which is a
@@ -517,6 +610,10 @@ case "${rest[0]:-}" in
           elif [ -n "${FAKE_STS_CREATED:-}" ]; then
             # FAKE_STS_CREATED stands in for a re-dispatched ticket: same slug, newer pod.
             fix statefulset.json | jq -c --arg c "$FAKE_STS_CREATED" '.metadata.creationTimestamp = $c'
+          elif [ "${FAKE_STS_NO_QITEM:-0}" = 1 ]; then
+            # A team that is up but has never been handed its ticket: this is the state `start` does the
+            # handover in, and the only one where `rig queue create` runs at all.
+            fix statefulset.json | jq -c 'del(.metadata.annotations["openrig.dev/qitem"])'
           else
             fix statefulset.json
           fi

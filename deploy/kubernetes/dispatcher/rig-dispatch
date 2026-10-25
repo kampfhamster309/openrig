@@ -886,15 +886,40 @@ cmd_start() {
   sts=$(sts_json "$slug")
   if [ -z "$(annotation "$sts" qitem)" ]; then
     [ -n "$brief" ] && [ -f "$brief" ] || die "--brief-file is required to hand over the ticket"
-    local rig session qitem
+    local rig session qitem qitem_out qitem_err qitem_rc
     rig=$(annotation "$sts" rig)
     session=$(lead_session "$slug" "$rig" "$lead")
     [ -n "$session" ] || die "no seat '$lead' in rig $rig (use --lead <logicalId>)"
     brief_with_contract "$slug" "$brief" | inpod_stdin "$slug" sh -c "cat > $WORK/brief.md"
-    qitem=$(inpod "$slug" rig queue create --source "dispatcher@$NS" --destination "$session" \
+    # `rig queue create` prints a request-identity note to stderr on every success, before it even asks the
+    # daemon: it is a request id and explicitly not a commit receipt, which is why the CLI puts it on
+    # stderr rather than in the JSON. On success the dispatcher already holds the real id from stdout, so
+    # on stage that note is three lines of noise on every single start -- drop exactly that line and keep
+    # everything else the CLI said. On a create that did NOT come back with an id the note is the opposite
+    # of noise: the CLI prints it because a missing row does not rule out a pending commit, and that id is
+    # the only handle for reconciling one. Dropping it there too would leave the operator's natural move --
+    # re-run `start` -- free to mint a second id, and possibly a second row for the team.
+    # And nothing in this block may abort on its own. The file runs under `set -e`, the create's output is
+    # buffered in these two files rather than streamed live, and a jq that chokes on a truncated stdout
+    # would end `start` before one line of the failure was shown: a quieter failure than the one being
+    # fixed. So jq cannot fail the script, and the captured output is printed before the files go away.
+    qitem_out=$(mktemp) qitem_err=$(mktemp)
+    qitem_rc=0
+    inpod "$slug" rig queue create --source "dispatcher@$NS" --destination "$session" \
       --tags "ticket:$slug" --summary "$(annotation "$sts" ticket-key): $(head -n1 "$brief" | sed 's/^#* *//' | cut -c1-100)" \
-      --body-file "$WORK/brief.md" --json | jq -r '.qitemId // .qitem.qitemId // empty')
-    [ -n "$qitem" ] || die "queue create returned no qitem id"
+      --body-file "$WORK/brief.md" --json >"$qitem_out" 2>"$qitem_err" || qitem_rc=$?
+    qitem=$(jq -r '.qitemId // .qitem.qitemId // empty' "$qitem_out" 2>/dev/null || true)
+    if [ -n "$qitem" ]; then
+      grep -v '^Queue create request ID: ' "$qitem_err" >&2 || true
+    else
+      cat "$qitem_err" >&2 || true
+      if [ -s "$qitem_out" ]; then cat "$qitem_out" >&2 || true; fi
+    fi
+    rm -f "$qitem_out" "$qitem_err"
+    if [ -z "$qitem" ]; then
+      [ "$qitem_rc" = 0 ] || die "queue create failed (exit $qitem_rc)"
+      die "queue create returned no qitem id"
+    fi
     annotate "$slug" qitem "$qitem"
     annotate "$slug" lead "$lead"
     log "handed $ticket to $session as $qitem"
@@ -1758,6 +1783,80 @@ live_watermark() { # live_watermark <slug> <events|transitions>
   inpod "$1" rig telemetry "$2" --json 2>/dev/null | jq -r '.page.retainedHighWatermark // empty' || true
 }
 
+# The events a team daemon writes to itself on a timer while nobody on the team does anything, as a
+# JSON array for jq. `snapshot.created` is the periodic snapshot every daemon takes for itself
+# (OPENRIG_SNAPSHOTS_PERIODIC_*): in the recorded run one landed 17 s after a collect and the delete
+# was refused as stale, and that run's own DEMO-B archive holds six of them after the team's last
+# real event. The list is deliberately short, because a missed real change is worse than a refused
+# delete. `watchdog.evaluation_skipped` is NOT in it: the daemon already keeps the reasons that are
+# pure polling quiet (QUIET_SKIP_REASONS in watchdog-policy-engine.ts) and records only a skip it
+# thought worth recording, and it wrote none during that same idle half-hour. Queue, seat, node and
+# rig events and every transition row still count, and so does any row this cannot classify.
+IDLE_TICK_EVENTS='["snapshot.created"]'
+
+# Did the team write real history past <after>? Pages the live stream from the retained floor exactly
+# as `archive` pages it, and stops at the first activity row, so the answer costs one page whenever
+# the team really did move on. A stream that has run past what this read could enumerate is answered
+# as moved: rows nobody could read are treated as activity, never as absent. Returns 0 for activity,
+# 1 for nothing but the daemon's own ticks, 2 for a stream this read could not enumerate to its end.
+live_activity_after() { # live_activity_after <slug> <events|transitions> <after>
+  local slug=$1 stream=$2 after=$3
+  local cursor="" pages=0 last="" scanned next page through="" wm="" w coverage=""
+  # A watermark this cannot put on the number line cannot bound a read, so it is not answered here.
+  case "$after" in ''|*[!0-9]*) return 2 ;; esac
+  while :; do
+    local -a args=(--limit "$TELEMETRY_PAGE" --json)
+    if [ -n "$cursor" ]; then args+=(--cursor "$cursor"); else args+=(--start retained); fi
+    page=$(inpod "$slug" rig telemetry "$stream" "${args[@]}" 2>/dev/null) || return 2
+    jq -e . >/dev/null 2>&1 <<<"$page" || return 2
+    # A row past the archived window that is not one of the daemon's own ticks is the team moving on.
+    # Events count by `seq`; a transition row carries `transitionId` and no `type` at all, so it is read
+    # by the same number line and always counts as activity -- which is right: a queue transition IS the
+    # team. A row whose place on that line this cannot find is treated as past, and as activity.
+    if jq -e --argjson skip "$IDLE_TICK_EVENTS" --argjson after "$after" '
+        [ .rows[]?
+          | ((.seq // .transitionId // "") | tostring) as $s
+          | select(if ($s | test("^[0-9]+$")) then ($s | tonumber) > $after else true end)
+          | select((.type // "") as $t | ($skip | index($t)) | not)
+        ] | length > 0' >/dev/null 2>&1 <<<"$page"; then
+      return 0
+    fi
+    w=$(jq -r '.page.through // ""' <<<"$page"); [ -n "$w" ] && through=$w
+    w=$(jq -r '.page.retainedHighWatermark // ""' <<<"$page"); [ -n "$w" ] && wm=$w
+    w=$(jq -r '.page.lastScanned // ""' <<<"$page"); [ -n "$w" ] && scanned=$w
+    w=$(jq -r '.coverage.status // ""' <<<"$page"); [ -n "$w" ] && coverage=$w
+    # A page can scan a row and still not return it: `withheld` counts a record over the size cap and a
+    # transition id that conflicts between the active and archive tables. Such a row is never classified
+    # above, and the page still reads as complete -- `lastScanned` reached `through`, the watermark equals
+    # `through`, coverage is only `partial` -- so this count is the only thing that says a row sitting
+    # somewhere past the archive went unexamined. Rows nobody could read are not rows that did not happen.
+    w=$(jq -r '.page.withheld // 0' <<<"$page")
+    case "$w" in ''|*[!0-9]*) w=0 ;; esac
+    [ "$w" = 0 ] || return 2
+    pages=$((pages + 1))
+    [ "$(jq -r '.page.hasMore' <<<"$page")" = true ] || break
+    next=$(jq -r '.page.nextCursor // ""' <<<"$page")
+    if [ -z "$next" ] || [ "$next" = "$cursor" ] || [ "$scanned" = "$last" ]; then return 2; fi
+    cursor=$next; last=$scanned
+    [ "$pages" -lt "$MAX_PAGES" ] || return 2
+  done
+  # Leaving the loop is not the same as having read to the end of the stream, and the ways it can lie are
+  # all in the one direction the brief ranks worst -- a missed real change. Each is answered as moved on,
+  # because rows nobody could read are not rows that did not happen:
+  #   the window closed before the stream's own end, so rows past it were never seen;
+  #   the last page did not scan as far as its own window end, so rows inside it were skipped;
+  #   the daemon restarted mid-read: that page carries no rows, `hasMore` false, coverage `unavailable`,
+  #     and a `through` belonging to the cursor this read lost, so nothing past it was read at all;
+  #   the window never got past the archived watermark, so the question was never asked.
+  case "$through" in ''|*[!0-9]*) return 2 ;; esac
+  case "$wm" in ''|*[!0-9]*) return 2 ;; esac
+  [ "$wm" -le "$through" ] || return 2
+  [ "$scanned" = "$through" ] || return 2
+  [ "$coverage" != unavailable ] || return 2
+  [ "$through" -gt "$after" ] || return 2
+  return 1
+}
+
 # Is it safe to delete this ticket's pod? Three separate questions, all answered before anything is
 # touched, because `delete` is the step that cannot be undone: is the archive COMPLETE (its manifest
 # says so and no part failed), is it REAL (every part it claims was saved is on disk, parses, and
@@ -1765,7 +1864,7 @@ live_watermark() { # live_watermark <slug> <events|transitions>
 # history since). A complete archive of an earlier moment, or of an earlier team that used the same
 # slug, answers none of the third. Prints the reason it is not safe, or nothing when it is.
 archive_check() { # archive_check <root> <slug>
-  local dir=$1/$2 bad missing complete name f want have sts live inc at moved wm want_wm have_wm
+  local dir=$1/$2 bad missing complete name f want have sts live inc at moved wm want_wm have_wm rc
   if [ ! -f "$dir/manifest.json" ]; then
     printf 'there is no archive at %s (no manifest.json); run archive or collect first' "$dir"
     return 0
@@ -1820,7 +1919,21 @@ archive_check() { # archive_check <root> <slug>
         [ -n "$want_wm" ] || continue
         have_wm=$(live_watermark "$2" "$wm")
         if [ -z "$have_wm" ]; then moved="$moved $wm(cannot be read now)"; continue; fi
-        [ "$have_wm" = "$want_wm" ] || moved="$moved $wm"
+        [ "$have_wm" = "$want_wm" ] && continue
+        # A live watermark that is not AHEAD of the archived one is not a team that moved on: it is a
+        # store replaced under the same pod -- a reset, or a volume swapped while the StatefulSet and its
+        # creation timestamp stayed -- so everything written since sits AT OR BELOW the number this
+        # archive recorded and no row past it would ever be looked at. The old `live == archived`
+        # comparison refused that by accident; refuse it on purpose, before spending a paged read on it.
+        case "$want_wm" in ''|*[!0-9]*) moved="$moved $wm(cannot be read to its end)"; continue ;; esac
+        case "$have_wm" in ''|*[!0-9]*) moved="$moved $wm(cannot be read to its end)"; continue ;; esac
+        if [ "$have_wm" -le "$want_wm" ]; then moved="$moved $wm(cannot be read to its end)"; continue; fi
+        # The stream has run on since the archive. That is only the team moving on if one of the rows
+        # past the archived window is team activity: the daemon writes events to itself on a timer,
+        # and an archive must not go stale because one of those fired.
+        live_activity_after "$2" "$wm" "$want_wm"; rc=$?
+        if [ "$rc" = 0 ]; then moved="$moved $wm(new activity)"
+        elif [ "$rc" = 2 ]; then moved="$moved $wm(cannot be read to its end)"; fi
       done
       if [ -n "$moved" ]; then
         printf 'the team has moved on since the archive at %s was taken (%s); archive again' "$dir" "${moved# }"

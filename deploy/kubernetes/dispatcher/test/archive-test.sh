@@ -272,12 +272,97 @@ if grep -q "different incarnation" "$WORK/delete-stale-incarnation.err"; then ok
 else bad "and says it is another incarnation (got: $(head -c 200 "$WORK/delete-stale-incarnation.err"))"; fi
 
 run_archive del-moved "$WORK/del-moved"
-# The same pod, more history: the team kept working after the archive was taken.
-run_dispatch delete-moved-watermark FAKE_WATERMARK_EVENTS=99 -- delete DEMO --dir "$WORK/del-moved"
+# The same pod, more history: the team kept working after the archive was taken. The live read opens a
+# fresh window that reaches the stream's own end, so the guard really does see these rows: three of
+# the daemon's own ticks, then a queue row. The real event is NOT the first row past the window, so
+# an answer of "only ticks" here would mean the reader stopped looking too early.
+run_dispatch delete-moved-watermark FAKE_LIVE_TAIL=queue.updated FAKE_LIVE_TAIL_TICKS=3 -- delete DEMO --dir "$WORK/del-moved"
 eq "delete refuses when the team has written more since the archive" 1 "$RC"
 if grep -q "the team has moved on since" "$WORK/delete-moved-watermark.err"; then ok "and says the team moved on"
 else bad "and says the team moved on (got: $(head -c 200 "$WORK/delete-moved-watermark.err"))"; fi
+if grep -q "events(new activity)" "$WORK/delete-moved-watermark.err"; then ok "and names new activity as the reason, not a read it could not finish"
+else bad "and names new activity as the reason, not a read it could not finish (got: $(head -c 200 "$WORK/delete-moved-watermark.err"))"; fi
 in_calls "the guard read the live watermark, not the archived one" "telemetry events --json"
+
+echo "== delete: the daemon's own timer is not the team moving on"
+# A team daemon writes a `snapshot.created` event to itself every few minutes whether anyone is
+# working or not. One of those landing after the collect is not the team having moved on; in the
+# recorded run it cost a second collect for nothing.
+run_archive del-tick "$WORK/del-tick"
+run_dispatch delete-idle-tick FAKE_LIVE_TAIL=snapshot.created -- delete DEMO --dir "$WORK/del-tick"
+eq "delete runs when the only event after the archive is the daemon's own tick" 0 "$RC"
+if grep -q "deleted t-demo" "$WORK/delete-idle-tick.err"; then ok "and deletes the team"
+else bad "and deletes the team (got: $(head -c 200 "$WORK/delete-idle-tick.err"))"; fi
+in_calls "and it read past the archived watermark to learn whose event it was" "--start retained"
+
+# The same archive and the same one extra event, one type later: a queue row is the team working.
+run_dispatch delete-real-event FAKE_LIVE_TAIL=queue.updated -- delete DEMO --dir "$WORK/del-tick"
+eq "delete still refuses when a real event landed after the archive" 1 "$RC"
+if grep -q "events(new activity)" "$WORK/delete-real-event.err"; then ok "and names the new activity as the reason"
+else bad "and names the new activity as the reason (got: $(head -c 200 "$WORK/delete-real-event.err"))"; fi
+
+# What an archive written by the older dispatcher records. The manifest field never changed meaning:
+# it is the raw end of the window the read took, tick and all, so there is no old archive to
+# special-case. (That such an archive is still trusted one tick later is `delete-idle-tick` above.
+# Deleting here against the SAME watermark only reaches the equality shortcut in `archive_check`, so
+# it would pass without the idle-tick rule ever being reached and prove nothing.)
+run_archive del-oldstyle "$WORK/del-oldstyle" FAKE_LIVE_TAIL=snapshot.created
+jqis "an archive whose watermark sits on a tick records the raw end of the window, tick and all" \
+  "$WORK/del-oldstyle/demo/manifest.json" '.watermarks.events' "4"
+jqis "and the tick itself is archived, not dropped from the history" "$WORK/del-oldstyle/demo/events.json" \
+  '[.rows[].type] | last' "snapshot.created"
+
+echo "== delete: a read that did not reach the end of the stream is not a clean read"
+# Each case below lets the guard finish its read and still leaves rows past the window unexamined --
+# which is the direction the old `live == archived` comparison happened to refuse, and the one direction
+# this guard must not get wrong. Nothing here earns the conclusion "and every row past the window was a
+# tick".
+#   (a) The daemon restarted between two pages of the guard's own read. The reset page carries no
+#   rows, ends the read, and reports `through` equal to the watermark; only `lastScanned` and
+#   `coverage.status` say that the rest of the window was never scanned.
+run_dispatch delete-reset-page FAKE_RESET_PAGE=1 FAKE_WATERMARK_EVENTS=40 -- delete DEMO --dir "$WORK/del-moved"
+eq "delete refuses when a daemon restart cut the guard's read short" 1 "$RC"
+if grep -q "events(cannot be read to its end)" "$WORK/delete-reset-page.err"; then ok "and says it could not read the stream to its end"
+else bad "and says it could not read the stream to its end (got: $(head -c 200 "$WORK/delete-reset-page.err"))"; fi
+in_calls "and it did page the stream before refusing" "--start retained"
+
+#   (b) The live stream ends BELOW the archived watermark: the pod's store was reset, or its volume
+#   was swapped while the StatefulSet and its creation timestamp stayed, so the incarnation check
+#   passes. Everything written since sits AT OR BELOW the number this archive recorded, and a read
+#   from that number would look at none of it. Refused before a paged read is even spent.
+run_dispatch delete-watermark-behind FAKE_WATERMARK_EVENTS=2 -- delete DEMO --dir "$WORK/del-moved"
+eq "delete refuses a live watermark that is behind the archived one" 1 "$RC"
+if grep -q "events(cannot be read to its end)" "$WORK/delete-watermark-behind.err"; then ok "and says it could not read the stream to its end"
+else bad "and says it could not read the stream to its end (got: $(head -c 200 "$WORK/delete-watermark-behind.err"))"; fi
+not_in_calls "and it refused without spending a paged read on it" "--start retained"
+
+#   (c) The cheap read said the stream moved, but the paged read's own window closed AT the archived
+#   watermark, so the question "what is past the window" was never actually asked. Nothing else on
+#   that page looks wrong -- `lastScanned` reached its `through`, coverage is `retained_window`, the
+#   watermark equals `through` -- so only `through > after` can notice.
+run_dispatch delete-window-never-past FAKE_WATERMARK_EVENTS=40 FAKE_PAGED_STALE=1 -- delete DEMO --dir "$WORK/del-moved"
+eq "delete refuses when the paged read never got past the archived watermark" 1 "$RC"
+if grep -q "events(cannot be read to its end)" "$WORK/delete-window-never-past.err"; then ok "and says it could not read the stream to its end"
+else bad "and says it could not read the stream to its end (got: $(head -c 200 "$WORK/delete-window-never-past.err"))"; fi
+
+#   (d) A page scanned a row and did not return it. `withheld` counts a record over the size cap and a
+#   transition id that conflicts between the active and archive tables. The row sits somewhere past the
+#   archive and was never classified, yet every other field on the page still says "complete", so the
+#   count is the only evidence there is.
+run_dispatch delete-withheld-row FAKE_LIVE_TAIL=snapshot.created FAKE_WITHHELD=1 -- delete DEMO --dir "$WORK/del-moved"
+eq "delete refuses when a page withheld a row it had scanned" 1 "$RC"
+if grep -q "events(cannot be read to its end)" "$WORK/delete-withheld-row.err"; then ok "and says it could not read the stream to its end"
+else bad "and says it could not read the stream to its end (got: $(head -c 200 "$WORK/delete-withheld-row.err"))"; fi
+
+# A watermark that is not a number cannot bound a read, so nothing past it can be classified. The
+# conservative answer is the one an unreadable stream already gets: refuse, and say so.
+run_archive del-unparseable "$WORK/del-unparseable"
+jq '.watermarks.events = "seq:00000000ff"' "$WORK/del-unparseable/demo/manifest.json" > "$WORK/del-unparseable/demo/m.new" \
+  && mv "$WORK/del-unparseable/demo/m.new" "$WORK/del-unparseable/demo/manifest.json"
+run_dispatch delete-unparseable-watermark -- delete DEMO --dir "$WORK/del-unparseable"
+eq "delete refuses a watermark it cannot place on the number line" 1 "$RC"
+if grep -q "events(cannot be read to its end)" "$WORK/delete-unparseable-watermark.err"; then ok "and says it could not read the stream to its end"
+else bad "and says it could not read the stream to its end (got: $(head -c 200 "$WORK/delete-unparseable-watermark.err"))"; fi
 
 echo "== an archive records what it holds, not what the stream had reached"
 # The team wrote while the archive was reading. The window's `through` stays where it opened; the
@@ -291,6 +376,8 @@ run_dispatch delete-r3 FAKE_R3_WRITES=1 -- delete DEMO --dir "$WORK/r3"
 eq "delete refuses, because rows past the window's through were never archived" 1 "$RC"
 if grep -q "the team has moved on since" "$WORK/delete-r3.err"; then ok "and it says the team moved on"
 else bad "and it says the team moved on (got: $(head -c 200 "$WORK/delete-r3.err"))"; fi
+if grep -q "events(cannot be read to its end)" "$WORK/delete-r3.err"; then ok "and it says why: the stream ran past what this read can enumerate"
+else bad "and it says why (got: $(head -c 200 "$WORK/delete-r3.err"))"; fi
 
 echo "== report: from the archive alone"
 run_dispatch report -- report DEMO --dir "$WORK/complete"
