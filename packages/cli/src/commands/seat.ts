@@ -28,6 +28,7 @@ interface SeatStatusResponse {
   runtime: string | null;
   /** Slice 16: an open runtime switch, or one recovery stopped short of finishing. */
   runtimeSwitch?: { id: string; phase: string; from: string; to: string; committed: boolean; startedAt: string; attention: string | null; outcome: string | null };
+  compaction?: { stage: string; detail: string };
   current_occupant: string | null;
   typingGuard?: { desired: boolean; effective: boolean; pending: boolean; heldCount: number;
     desiredMode?: string; effectiveMode?: string; desiredLevel?: string; effectiveLevel?: string; };
@@ -55,10 +56,17 @@ interface SeatStatusResponse {
       openRigAdds: { claudeAllow: string[]; claudeAsk: string[]; notes: string[] };
       unknown: string[];
       controls: string[];
+      advisories?: string[];
     };
   };
   session_status: string | null;
   launch_cwd?: string | null;
+  runtime_home?: {
+    variable: string;
+    home: string | null;
+    source: "member" | "rig" | "daemon" | "native_default";
+    ignored?: { source: string; value: string };
+  };
   session_reason?: string | null;
   startup_status: string | null;
   occupant_lifecycle: string;
@@ -187,6 +195,13 @@ function printHuman(status: SeatStatusResponse): void {
   console.log(`Logical ID: ${status.logical_id}`);
   console.log(`Current occupant: ${display(status.current_occupant)}`);
   if (status.launch_cwd !== undefined) console.log(`Working directory for future launches: ${display(status.launch_cwd)}`);
+  if (status.runtime_home) {
+    const h = status.runtime_home;
+    const from = h.source === "member" || h.source === "rig" ? `the seat's own, from its ${h.source} env`
+      : h.source === "daemon" ? "the daemon's" : "the native default";
+    console.log(`Runtime home (${h.variable}) for launches: ${display(h.home)} (${from}; configured, not proof of the login a running session uses)`);
+    if (h.ignored) console.log(`  Ignored: its ${h.ignored.source} env sets ${h.variable}=${h.ignored.value}, which isn't an absolute path`);
+  }
   if (status.typingGuard) {
     const g = status.typingGuard;
     const mode = g.effectiveLevel ?? g.effectiveMode ?? (g.effective ? "on" : "off");
@@ -198,6 +213,7 @@ function printHuman(status: SeatStatusResponse): void {
     else console.log("Hold pauses all automatic input, including writing lifecycle. Changing mode does not replay held messages.");
   }
   console.log(`Session: ${display(status.session_status, "unknown")}`);
+  if (status.compaction) console.log(`Managed compaction (${status.compaction.stage}): ${status.compaction.detail}`);
   const reason = sessionReason(status.session_reason);
   if (reason) console.log(`Reason: ${reason}`);
   if (status.permissions?.account) {
@@ -205,6 +221,7 @@ function printHuman(status: SeatStatusResponse): void {
     const a = p.account!;
     console.log("Permissions, planned for the next fresh managed launch (not observed):");
     console.log(`  ${a.summary}`);
+    for (const advisory of a.advisories ?? []) console.log(`  ${advisory}`);
     if (a.overrides.length) console.log(`  This seat's choice is used instead of the ${a.overrides.join(" and the ")}.`);
     for (const note of a.openRigAdds.notes) console.log(`  ${note}`);
     if (a.openRigAdds.claudeAllow.length) console.log("  The exact allowance and ask lists are in --json, under permissions.account.openRigAdds.");

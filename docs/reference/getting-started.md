@@ -39,6 +39,12 @@ The `rigs` skill is the procedure: follow it in order. This page is what it look
 
 ## Before you start
 
+Setup and launch are separate: declining `rig setup` avoids its `~/.tmux.conf` change, but starting Codex seats can
+still write workspace trust and selected MCP/config fragments. `runtime.codex.hooks_enabled=false` controls hooks;
+it isn't a no-global-config option. Setup has no project-only mode. Trusted project `.codex/config.toml` settings
+don't redirect OpenRig's home-config writes. A separate selected `CODEX_HOME` keeps Codex config, login and sessions
+together in that home; it needs its own working sign-in and doesn't relocate `~/.tmux.conf`.
+
 > **What OpenRig changes on your machine**
 > - **Install:** `@openrig/cli` goes in globally with npm.
 > - **Setup:** `rig setup` adds an OpenRig block to `~/.tmux.conf`. It can install tmux (with Homebrew on macOS), and
@@ -46,7 +52,8 @@ The `rigs` skill is the procedure: follow it in order. This page is what it look
 >   Claude Code and Codex and may install a missing one; `rig setup --providers claude` (or `codex`) limits it to
 >   yours.
 > - **Starting OpenRig, for the coding agent you use** (paths are the usual defaults):
->   - Codex: hooks and trust in `~/.codex/config.toml`.
+>   - Codex: hooks, workspace trust and team-selected config fragments (including MCP) in the selected
+>     `CODEX_HOME/config.toml`, default `~/.codex/config.toml`. These affect other Codex sessions using that home.
 >   - Claude Code: workspace trust in `~/.claude.json`, and activity hooks in the project's
 >     `.claude/settings.local.json`, plus a status line unless you already have your own.
 >   - Discovery skills go in `~/.claude/skills` and `~/.agents/skills`.
@@ -384,13 +391,14 @@ caller's Herdr endpoint must match the daemon's endpoint; a mismatch is reported
 without opening a window or putting the view in another session.
 
 The shared TUI (`rig tui --shared`) runs in the daemon's tmux server, so its own environment never
-carries the Herdr you are looking at; the markers are on the tmux client attached to it. When you
+carries the Herdr or Rex you are looking at; the markers are on the tmux client attached to it. When you
 open a terminal view from it on Linux, the TUI passes the markers of the client that was active last
-(normally the one that pressed the key) to the command, which then opens the view in that Herdr. The
+(normally the one that pressed the key) to the command, which then opens the view in that Herdr, or as
+a new session on that Rex server. The
 chosen client may belong to a different viewer: tmux only counts keys a client types, so a key sent
 by an agent (`send-keys`) or by a control-mode client doesn't count as any client's activity, and the
-view opens in the Herdr of the interactive client that typed last, however long ago. With no client
-attached, more than one client active in the same second, or a client that isn't in Herdr or can't be
+view opens in the Herdr or Rex of the interactive client that typed last, however long ago. With no client
+attached, more than one client active in the same second, or a client that is in neither or can't be
 read, nothing is passed and the result is what it was before. Other platforms, and every other way of
 running `rig terminal open`, keep the previous result too.
 
@@ -1108,6 +1116,10 @@ absolute working directory, then uses that exact path for discovery and launch.
 It does not use interactive shell aliases or a shell's modified PATH. Relative
 PATH entries and a relative `CLAUDE_CONFIG_DIR` resolve from the seat directory.
 
+In `plan` mode Claude Code answers with Sonnet when the seat's model is the alias
+`haiku` (a full Haiku model id, set with `rig seat set-model`, keeps Haiku), and the
+launch result and `rig seat status` say so for that pairing.
+
 For these explicit native modes, fresh, resume, fork and legacy restore use the
 same managed environment: PATH, HOME, `CLAUDE_CONFIG_DIR` (default HOME/.claude)
 and the configured classic-renderer setting. Other shell customizations are
@@ -1232,6 +1244,9 @@ using the selected database. To stop before opening that database instead, run
 `rig config set daemon.db_conflict stop` (set it to `warn` for the default).
 The check requires an open-file holder, a matching `daemon.json`, and a listener
 reporting the same PID; missing or inconclusive evidence does not stop startup.
+When the check can't run (`lsof` is missing, fails or times out, or a recorded daemon's
+listener doesn't answer), startup warns that ownership is unknown rather than reporting
+no conflict, in either setting.
 Selecting a database outside `OPENRIG_HOME` alone only warns; a confirmed live-daemon
 conflict there still stops when `daemon.db_conflict` is `stop`.
 
