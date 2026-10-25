@@ -172,14 +172,62 @@ team_asks_human() { # <ticket> -> 0 when the team holds a queue item in state bl
   jq -e '[.[] | (.open // [])[] | select(.state == "blocked")] | length > 0' <<<"$out" >/dev/null 2>&1
 }
 
-# Wait until a one-shot check succeeds. Same timeout shape as wait_phase, for a check that is a yes/no
-# rather than a phase string.
-wait_until() { # <timeout-seconds> <what it is waiting for> <command...>
-  local timeout=$1 desc=$2; shift 2
-  local deadline=$((SECONDS + timeout))
+# Which of this team's seats say they are waiting for input in their own pane? The pod's daemon already
+# decides this, and `rig-dispatch status --json` carries the answer per seat: the daemon watches each
+# seat's pane and serves `needs_input` for a selection or a permission prompt (`agentActivity.state`,
+# whose reason for a menu is `selection_prompt`). Nothing here reads a screen -- this is the daemon's own
+# report. A seat that parked its question on the queue shows no dialog; a seat waiting for a keystroke
+# from a person who is not in that terminal does, and nobody is ever going to give it. That is the
+# recorded failure: DEMO-A's lead opened Claude Code's own question dialog, neither the hub nor anyone
+# saw it, and prepare.sh waited its full twenty minutes for a queue row that was never coming.
+team_dialog_sessions() { # <ticket> -> one session per seat waiting on a dialog; empty when none
+  local out
+  out=$("$DISPATCH" status "$(demo_ticket "$1")" --json 2>/dev/null) || return 0
+  jq -r '[ .[] | (.seats // [])[] | select(.activity == "needs_input") | (.session // .seat) ] | .[]' \
+      <<<"$out" 2>/dev/null || true
+}
+
+# What to do about a seat waiting on a dialog, spelled out as the four hand steps that fix it. This is
+# the recovery the recorded run used, done by hand: `Esc` in the pane, which chooses nothing, then one
+# message pointing the seat back at its brief. Deliberately not automatic -- sending keys into another
+# agent's dialog is the riskier path, and prepare.sh runs an hour before an audience, where a clear stop
+# costs a minute and a wrong keystroke costs the talk.
+dialog_recovery() { # <ticket> <session>
+  local slug session ask
+  slug=$(demo_ticket "$1" | tr '[:upper:]' '[:lower:]')
+  session=$2
+  ask='Read step 1 of your brief. The question goes on the queue with rig queue block --on human@host, not on your own screen: nobody is watching this pane, so a dialog there never reaches the human. Press Esc so no option is chosen, then park the row.'
+  printf 'Recover it by hand, in about a minute:\n'
+  printf '  1. see what it is waiting on:\n     %s -n %s exec t-%s-0 -c daemon -- rig capture %s --lines 40\n' \
+    "$KUBECTL" "$NS" "$slug" "$session"
+  printf '  2. press Esc in that pane so nothing is chosen (tmux ls inside the pod names the sessions):\n     %s -n %s exec -it t-%s-0 -c daemon -- tmux ls\n' \
+    "$KUBECTL" "$NS" "$slug"
+  printf '  3. point the seat back at its brief:\n     %s -n %s exec t-%s-0 -c daemon -- rig send %s %s\n' \
+    "$KUBECTL" "$NS" "$slug" "$session" "$(printf '%q' "$ask")"
+  printf '  4. re-run this script. It re-checks rather than starting a second team.\n'
+}
+
+# Wait for a team to park its question on the human, and stop early when it is not going to because it
+# asked the wrong place. One reading of a dialog does not stop a run: a prompt the seat clears between two
+# polls would kill a healthy team, so this wants the same seat reporting it twice in a row, DEMO_WAIT_POLL
+# apart. A detection that never fires costs exactly what it costs today -- the full wait, then a message
+# that names the possibility -- so it cannot break a run that is going well. Sets DEMO_DIALOG_SESSION to
+# the seat it stopped on. -> 0 parked, 1 timed out, 2 sitting at a dialog
+DEMO_DIALOG_SESSION=""
+wait_team_parks() { # <ticket>
+  local ticket=$1 deadline=$((SECONDS + DEMO_WAIT_SECONDS)) seen=0 session
+  DEMO_DIALOG_SESSION=""
   while :; do
-    if "$@" >/dev/null 2>&1; then return 0; fi
-    [ "$SECONDS" -lt "$deadline" ] || { log "still waiting for $desc after ${timeout}s"; return 1; }
+    if team_asks_human "$ticket"; then return 0; fi
+    session=$(team_dialog_sessions "$ticket")
+    if [ -n "$session" ]; then
+      # shellcheck disable=SC2034  # prepare.sh reads this after the call; it sources this file.
+      if [ "$seen" = 1 ]; then DEMO_DIALOG_SESSION=$session; return 2; fi
+      seen=1
+    else
+      seen=0
+    fi
+    [ "$SECONDS" -lt "$deadline" ] || return 1
     sleep "$DEMO_WAIT_POLL"
   done
 }

@@ -40,6 +40,14 @@ case "$cmd" in
     skey="seats_$(printf '%s' "$ticket" | tr '[:lower:]-' '[:upper:]_')"
     seats=$(sed -n "s/^$skey=//p" "$DEMO_FAKE_STATE" | tail -n1)
     [ -n "$seats" ] || seats='[{"session":"orch-lead@demo-one","status":"running"}]'
+    # A seat sitting at a dialog, for the first N status reads of this ticket and not after: a prompt the
+    # seat clears between two polls must not stop a healthy run, so a test can say how long the report
+    # lasts and watch whether the script acted on one reading or insisted on two.
+    dkey="dialog_$(printf '%s' "$ticket" | tr '[:lower:]-' '[:upper:]_')"
+    dreads=$(sed -n "s/^$dkey=//p" "$DEMO_FAKE_STATE" | tail -n1)
+    if [ -n "$dreads" ] && [ "$(grep -c "status $ticket --json" "$DEMO_FAKE_CALLS")" -le "$dreads" ]; then
+      seats='[{"session":"orch-lead@demo-one","status":"running","activity":"needs_input"}]'
+    fi
     printf '[{"slug":"%s","phase":"%s","open":%s,"seats":%s}]\n' \
       "$(printf '%s' "$ticket" | tr '[:upper:]' '[:lower:]')" "$phase" "$open" "$seats"
     ;;

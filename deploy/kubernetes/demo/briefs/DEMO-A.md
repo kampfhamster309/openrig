@@ -11,6 +11,12 @@ your own passing run of `sh test/run.sh`. Do not look for a peer or wait for one
 
 ## 1. Ask first — change nothing until the answer arrives
 
+**Ask on the queue, and nowhere else.** Nobody is watching your terminal. A question the runtime puts on
+your own screen — Claude Code's question dialog, a permission prompt, anything that waits for a keystroke
+in this pane — reaches no one, and the team sits there until the talk is over. `rig queue block` is the
+only way to ask here. If you have already opened such a dialog: press `Esc` so that no option is chosen,
+and park the row instead.
+
 Find your own ticket item — it is the row tagged with this ticket — then park it on the human with
 exactly one either/or question:
 

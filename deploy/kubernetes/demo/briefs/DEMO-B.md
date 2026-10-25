@@ -6,7 +6,9 @@ how it is used. Add one. This is deliberately small: it should take you a few mi
 ## How this team works
 
 One seat: you. There is no reviewer to ask, so the completion contract's review step is satisfied by
-your own passing run of `sh test/run.sh`. Do not look for a peer or wait for one.
+your own passing run of `sh test/run.sh`. Do not look for a peer or wait for one. Nobody is watching your
+terminal either: a question or a permission prompt on your own screen reaches no one and the team waits
+there forever. Nothing in this brief needs one — it settles every choice — so decide and carry on.
 
 ## The change
 

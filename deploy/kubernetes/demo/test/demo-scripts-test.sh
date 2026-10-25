@@ -185,6 +185,44 @@ sed -i 's/^phase_DEMO_A=.*/phase_DEMO_A=working/; s/^open_DEMO_A=.*/open_DEMO_A=
 run_prepare
 eq "a team with an open item that is not parked is not 'waiting for a human'" 1 "$RC"
 
+printf '\n# B-2: a seat that asked its own pane instead of the queue\n'
+# The recorded run: DEMO-A's lead opened Claude Code's own question dialog in its pane. Nobody watches
+# that pane, the row was never parked, and prepare.sh waited its full twenty minutes and then named the
+# phase, which was not the problem. The pod's daemon already reports a seat waiting on a dialog, so the
+# wait can stop in seconds and say what to do about it.
+new_state
+sed -i 's/^open_DEMO_A=.*/open_DEMO_A=none/' "$DEMO_FAKE_STATE"
+printf 'dialog_DEMO_A=999\n' >> "$DEMO_FAKE_STATE"
+run_prepare
+eq "prepare stops when the seat is sitting at a dialog" 1 "$RC"
+in_err "and names the seat that is waiting" "orch-lead@demo-one"
+in_err "it says where the question has to go" "The question has to be a queue row"
+in_err "and it gives the hand steps, starting with reading the pane" "rig capture orch-lead@demo-one --lines 40"
+in_err "pressing Esc so that nothing is chosen" "press Esc in that pane"
+in_err "one message back to the brief" "rig send orch-lead@demo-one"
+in_err "and a re-run, which re-checks rather than starting a second team" "re-run this script"
+in_err "and it says plainly why this is a stop, not a warning" "until the talk is over"
+not_in_err "and it did not sit out the timeout to say something vaguer" "never parked a question"
+
+# One reading of a dialog is not enough to stop a run for: a prompt the seat clears between two polls
+# would kill a healthy team. The same seat reporting it twice in a row is one dialog still waiting.
+new_state
+sed -i 's/^open_DEMO_A=.*/open_DEMO_A=none/' "$DEMO_FAKE_STATE"
+printf 'dialog_DEMO_A=1\n' >> "$DEMO_FAKE_STATE"
+run_prepare
+eq "a dialog that clears before the second reading does not stop the run" 1 "$RC"
+in_err "and it reports the wait it really did run out of" "never parked a question"
+in_err "and points at the seat's own activity as the thing to check" "needs_input means a dialog"
+not_in_err "without dialog recovery steps for a dialog it did not see twice" "press Esc in that pane"
+
+# A parked row is the answer whatever the pane says: the question is on the queue, which is all the talk
+# needs. The parked check goes first, on purpose.
+new_state
+printf 'dialog_DEMO_A=999\n' >> "$DEMO_FAKE_STATE"
+run_prepare
+eq "a parked question wins over a dialog reading" 0 "$RC"
+not_in_err "and it is not called a seat stuck at a dialog" "sitting at a question dialog"
+
 printf '\n# S-1: what a bare `kubectl delete statefulset` leaves behind\n'
 # Run sheet step 7 deletes a StatefulSet with kubectl. The pod and the volume go; the Secret does not --
 # only the dispatcher's own delete removes that. So "no StatefulSet" must not mean "nothing to do".

@@ -62,9 +62,14 @@ start_team DEMO-B
 # lets the file win, so the phase reads `result:needs-human` while the team is waiting perfectly well.
 # Waiting on the phase would call that "finished without asking" and kill a rehearsal that is going fine.
 log "waiting for DEMO-A to be waiting for a human (up to $((DEMO_WAIT_SECONDS / 60))m)"
-if ! wait_until "$DEMO_WAIT_SECONDS" "DEMO-A to park a question on the human" team_asks_human DEMO-A; then
-  die "DEMO-A never parked a question on the human in $((DEMO_WAIT_SECONDS / 60))m (last phase: $(team_phase DEMO-A)). Its brief is the first thing to look at: $HERE/briefs/DEMO-A.md"
+parked=0; wait_team_parks DEMO-A || parked=$?
+if [ "$parked" = 2 ]; then
+  printf 'demo: DEMO-A will never ask: its seat %s is sitting at a question dialog in its own pane, and nobody is watching that pane, so it waits there until the talk is over. The question has to be a queue row (last phase: %s).\n' \
+    "$DEMO_DIALOG_SESSION" "$(team_phase DEMO-A)" >&2
+  dialog_recovery DEMO-A "$DEMO_DIALOG_SESSION" >&2
+  exit 1
 fi
+[ "$parked" = 0 ] || die "DEMO-A never parked a question on the human in $((DEMO_WAIT_SECONDS / 60))m (last phase: $(team_phase DEMO-A)). Its brief is the first thing to look at: $HERE/briefs/DEMO-A.md. Then check whether its seat is waiting on its own screen, which nothing out here can answer for it: $DISPATCH status DEMO-A --json, and read .[0].seats[].activity -- needs_input means a dialog is waiting for a keystroke nobody is going to send."
 log "DEMO-A has a queue item parked on human@host, which is what the audience will answer"
 
 log "waiting for DEMO-B to finish (up to $((DEMO_WAIT_SECONDS / 60))m)"

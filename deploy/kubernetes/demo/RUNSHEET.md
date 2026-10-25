@@ -72,6 +72,12 @@ An hour before, in a plain terminal:
    two agents, and rehearsal 1 measured 8m27s. (Rehearsal 2 finished in about two minutes only because it
    re-used the queue rows an earlier attempt had already created; that is not the timing to plan a talk
    around.)
+   If DEMO-A's lead puts its question on its **own screen** instead of on the queue — Claude Code's
+   question dialog, a permission prompt — nobody can answer it, and the recorded run waited the full 20
+   minutes for a row that was never coming. `prepare.sh` now reads what the pod's daemon already reports
+   and stops in about 30 seconds instead, naming the seat and printing the four hand steps: look at the
+   pane, press `Esc` in it so nothing is chosen, send the seat one message pointing at step 1 of its
+   brief, re-run. About a minute of your time, and the re-run re-checks rather than starting a second team.
 2. Start the port-forward it printed: `kubectl -n $NS port-forward pod/hub-0 17433:7433 &`
 3. Start the hub TUI it printed, in the window you will present:
    `OPENRIG_HOME=$HOME/.openrig-hub-view OPENRIG_URL=http://127.0.0.1:17433 node "$CLIENT/tui/dist/main.js" --url http://127.0.0.1:17433`
@@ -122,6 +128,11 @@ Claude Code lead. It keeps working after the command returns, which is the point
   `kubectl apply -k ..` and re-run the start.
 - No time to spare: DEMO-A and DEMO-B already show everything the rest of the talk needs. Say "the
   third team is coming up" and move on; it will be there for step 5.
+- The pod is Ready and the seat just stops: it is waiting on a dialog in its own pane, which reaches
+  nobody. `$D status DEMO-C --json | jq '.[0].seats'` says `needs_input`, and
+  `kubectl -n $NS exec t-demo-c-0 -c daemon -- rig capture <seat> --lines 40` shows it. Press `Esc` in
+  that pane so nothing is chosen, then `rig send` the seat back to its brief. Its brief now says the
+  question goes on the queue, so this should not happen.
 
 ---
 
