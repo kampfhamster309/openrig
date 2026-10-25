@@ -242,6 +242,40 @@ describe("ContextMonitor with a Pi seat", () => {
     expect(send.mock.calls[0]?.[1]).toContain("compaction");
   });
 
+  it("the extension's real post-compaction sample reads as no_data, not parse_error", async () => {
+    // The literal bytes the Pi-side extension writes at session_compact, captured live in the P3
+    // proof. They are well-formed and say "no reading right now", so the reason must be no_data.
+    const now = Date.parse("2026-10-02T12:00:00Z");
+    vi.spyOn(Date, "now").mockReturnValue(now);
+    const { node, sessionName } = seedSeat("pi", "dev.probe@pi-nodata-fixture");
+    writeFileSync(
+      sidecarPath(sessionName),
+      JSON.stringify({
+        context_window: {
+          context_window_size: 262144,
+          used_percentage: null,
+          remaining_percentage: null,
+          total_input_tokens: null,
+          total_output_tokens: null,
+          current_usage: { runtime: "pi", tokens: null, context_window: 262144, percent: null },
+        },
+        session_id: "01a172ba-0dfb-76b8-8c00-9c35ddbfdb44",
+        session_name: sessionName,
+        occupant_generation: "4eafc1f2-9b9e-49b3-a87d-755480982cb6",
+        transcript_path: "/tmp/x.jsonl",
+        cost: null,
+        sampled_at: new Date(now).toISOString(),
+      }),
+    );
+
+    await monitor.pollOnce();
+
+    const usage = store.getForNode(node.id, sessionName);
+    expect(usage.availability).toBe("unknown");
+    expect(usage.reason).toBe("no_data");
+    expect(usage.usedPercentage).toBeNull();
+  });
+
   it("a failed Pi seat whose runner reports ready is normalised to ready (F2)", async () => {
     // Including pi/omp in getEligibleSessions also runs normalizeStartupStatus for them for the
     // first time. This pins that behaviour, which was previously unannounced: the Pi readiness

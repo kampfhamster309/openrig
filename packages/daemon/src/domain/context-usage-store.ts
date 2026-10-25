@@ -207,8 +207,15 @@ export class ContextUsageStore {
     }
 
     const cw = raw.context_window;
-    if (!cw || typeof cw.used_percentage !== "number") {
+    if (!cw || typeof cw !== "object") {
       return this.unknownUsage("parse_error");
+    }
+    if (typeof cw.used_percentage !== "number") {
+      // A well-formed sidecar that reports no reading right now is not a malformed file. Pi writes
+      // exactly this shape after a compaction, when its own usage stays unknown until the next model
+      // response, so calling it `parse_error` would blame the writer for an honest absence. Still
+      // unknown, never zero.
+      return this.unknownUsage("no_data");
     }
 
     const sampledAt = raw.sampled_at ?? null;

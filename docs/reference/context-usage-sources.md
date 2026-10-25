@@ -53,9 +53,13 @@ kept unrounded under `current_usage.percent`.
 
 What the reader makes of it:
 
-- **`used_percentage` must be a number for the seat to read as known.** Anything else — absent, null,
-  a string — is `unknown` with reason `parse_error`. A missing file is `unknown` with reason
-  `missing_sidecar`. **Unknown is never rendered as zero**, on any surface.
+- **`used_percentage` must be a number for the seat to read as known.** The reasons then split by what
+  the file actually did: a **missing file** is `unknown` with reason `missing_sidecar`; a **present,
+  well-formed `context_window` whose `used_percentage` is null** is `unknown` with reason `no_data` —
+  that is a valid "no reading right now", which is what Pi writes after a compaction, and not a
+  malformed file; anything genuinely **absent or malformed** (no `context_window`, or one that is not
+  an object) is `unknown` with reason `parse_error`. **Unknown is never rendered as zero**, on any
+  surface.
 - **`session_name` must be the seat's current session name.** A sidecar naming a different session is
   refused as `session_mismatch`.
 - **`sampled_at` decides both freshness and the generation guard.** A sample older than ten minutes is
@@ -118,11 +122,12 @@ into the kit, is the second source of truth this page argues against. Which of t
 the same operator decision as automatic provisioning below. **OpenRig does not depend on the
 extension's repository in any direction; the sidecar file is the whole interface between them.**
 
-**OMP is unverified.** The monitor reads an `omp` seat's sidecar the same way, and an omp seat is named
-from `OPENRIG_SESSION_NAME` because it has no `PI_CODING_AGENT_DIR`. Nothing here establishes that OMP
-loads Pi extensions with the same API (`getContextUsage`, `turn_end`); OMP is not installed in the
-environment this was built and proved on. If it never does, the seat simply stays `unknown`, which is
-what the missing-sidecar rule is for.
+**OMP is unverified.** The monitor reads an `omp` seat's sidecar the same way. The runner sets
+`PI_CODING_AGENT_DIR` for omp seats too (`buildPiChildEnv` in `adapters/pi-runner-protocol.ts`), so an
+omp seat is named from its agent directory like a Pi one, with `OPENRIG_SESSION_NAME` as the fallback.
+What is **not** established here is that OMP loads Pi extensions with the same API (`getContextUsage`,
+`turn_end`); OMP is not installed in the environment this was built and proved on. If it never does, the
+seat simply stays `unknown`, which is what the missing-sidecar rule is for.
 
 ### Automatic provisioning is not built
 
@@ -145,6 +150,11 @@ OpenRig's managed compaction sends Claude's `/compact` keystrokes to a seat. It 
 runtime being `claude-code`, so **a Pi seat's sample — however high and however fresh — can never
 trigger OpenRig's managed compaction on that seat**. Pi compacts on its own terms. The gate is covered
 by a test that fails if the runtime filter is removed.
+
+One practical consequence of that filter: sending `/compact` to a Pi seat as a message **never compacts
+it**. The Pi runner intercepts only `/abort` and `/followup`, so `/compact` arrives as a stray prompt
+for the model rather than a command — which is exactly why the runtime filter has to be the thing that
+stops managed compaction, and not any hope that a Pi seat can be talked out of one by text.
 
 One deliberate exception, so the wording here is not over-broad: an **opt-in** context-usage threshold
 watch (`policies/context-usage-threshold.ts`, registered by hand) performs `action: "send"` against its

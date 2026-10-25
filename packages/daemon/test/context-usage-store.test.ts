@@ -156,6 +156,35 @@ describe("ContextUsageStore", () => {
     expect(usage.reason).toBe("parse_error");
   });
 
+  // A sidecar that reports "no reading right now" is well-formed, not malformed. Pi writes exactly
+  // this shape after a compaction, so blaming the writer with parse_error is wrong; it is an honest
+  // absence. Still unknown, never zero.
+  it("a present context_window with a null used_percentage is no_data, not parse_error", () => {
+    const usage = store.normalizeSample({
+      session_id: "x",
+      context_window: {
+        context_window_size: 262144,
+        used_percentage: null,
+        remaining_percentage: null,
+        total_input_tokens: null,
+      },
+    } as any);
+    expect(usage.availability).toBe("unknown");
+    expect(usage.reason).toBe("no_data");
+    expect(usage.usedPercentage).toBeNull();
+    expect(usage.fresh).toBe(false);
+  });
+
+  // The other side of the line: a context_window that is not an object at all is a malformed file
+  // and stays parse_error.
+  it("a malformed context_window stays parse_error", () => {
+    for (const bad of ["not-an-object", 42, null]) {
+      const usage = store.normalizeSample({ session_id: "x", context_window: bad } as any);
+      expect(usage.availability).toBe("unknown");
+      expect(usage.reason).toBe("parse_error");
+    }
+  });
+
   // T4: Stale sample -> fresh=false but values retained
   it("stale sample has fresh=false but retains persisted values", () => {
     const stale = {
