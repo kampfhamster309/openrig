@@ -313,10 +313,10 @@ jqis "and the tick itself is archived, not dropped from the history" "$WORK/del-
   '[.rows[].type] | last' "snapshot.created"
 
 echo "== delete: a read that did not reach the end of the stream is not a clean read"
-# Each case below answers the guard's completeness test `watermark <= through` the same way a stream
-# that truly ended at the archived window does -- which is the answer the old `live == archived`
-# comparison gave -- and in each, rows past the window were never read, so nothing here earns the
-# conclusion "and every one of them was a tick".
+# Each case below lets the guard finish its read and still leaves rows past the window unexamined --
+# which is the direction the old `live == archived` comparison happened to refuse, and the one direction
+# this guard must not get wrong. Nothing here earns the conclusion "and every row past the window was a
+# tick".
 #   (a) The daemon restarted between two pages of the guard's own read. The reset page carries no
 #   rows, ends the read, and reports `through` equal to the watermark; only `lastScanned` and
 #   `coverage.status` say that the rest of the window was never scanned.
@@ -344,6 +344,15 @@ run_dispatch delete-window-never-past FAKE_WATERMARK_EVENTS=40 FAKE_PAGED_STALE=
 eq "delete refuses when the paged read never got past the archived watermark" 1 "$RC"
 if grep -q "events(cannot be read to its end)" "$WORK/delete-window-never-past.err"; then ok "and says it could not read the stream to its end"
 else bad "and says it could not read the stream to its end (got: $(head -c 200 "$WORK/delete-window-never-past.err"))"; fi
+
+#   (d) A page scanned a row and did not return it. `withheld` counts a record over the size cap and a
+#   transition id that conflicts between the active and archive tables. The row sits somewhere past the
+#   archive and was never classified, yet every other field on the page still says "complete", so the
+#   count is the only evidence there is.
+run_dispatch delete-withheld-row FAKE_LIVE_TAIL=snapshot.created FAKE_WITHHELD=1 -- delete DEMO --dir "$WORK/del-moved"
+eq "delete refuses when a page withheld a row it had scanned" 1 "$RC"
+if grep -q "events(cannot be read to its end)" "$WORK/delete-withheld-row.err"; then ok "and says it could not read the stream to its end"
+else bad "and says it could not read the stream to its end (got: $(head -c 200 "$WORK/delete-withheld-row.err"))"; fi
 
 # A watermark that is not a number cannot bound a read, so nothing past it can be classified. The
 # conservative answer is the one an unreadable stream already gets: refuse, and say so.

@@ -71,14 +71,29 @@ in_err "and the start's own line still is" "handed DEMO to orch-lead@demo-rig"
 
 echo "== a create that really failed is still a loud failure"
 # The same note is printed before the daemon is even asked, so filtering it must not be the same thing as
-# swallowing the error that follows it.
+# swallowing the error that follows it. And on a create that produced no id the note is not noise: the CLI
+# says a missing row does not rule out a pending commit, so that request id is the only handle for
+# reconciling one. Re-running `start` instead mints a second id, and maybe a second row for the team.
 run_start create-failed FAKE_QUEUE_CREATE=fail
 eq "start exits non-zero when the row was never created" 1 "$RC"
 in_err "it says the create failed, with its exit code" "queue create failed (exit 2)"
 in_err "and the CLI's own reason is still on the screen" "destination_unknown"
 in_err "with kubectl's line beside it, as it arrives" "command terminated with exit code 2"
-not_in_err "and only the request note was dropped" "Queue create request ID"
-not_in_err "so a row that does not exist was never written to the StatefulSet" "openrig.dev/qitem=qitem-handed-over-1"
+in_err "and the request id survives, because it is the handle to reconcile this create" "Queue create request ID"
+not_in_err "so no row was written to the StatefulSet" "openrig.dev/qitem=qitem-handed-over-1"
+
+echo "== a create whose stdout is not JSON is a loud failure too, not a silent death"
+# `set -euo pipefail` is on, and the create's output is buffered in files rather than streamed live. A jq
+# that chokes on a stdout that is not JSON ends the script where it stands, and then nothing the CLI said
+# is ever printed: the presenter sees a start that stopped after "waiting for t-demo-0 to be Ready" and no
+# reason at all. The old code streamed stderr live, so the error stayed visible even then.
+run_start create-garbage FAKE_QUEUE_CREATE=garbage
+eq "start exits non-zero when stdout is not the JSON it expected" 1 "$RC"
+in_err "it says the create failed, with its exit code" "queue create failed (exit 1)"
+in_err "and the CLI's own reason is on the screen" "econnreset"
+in_err "and so is what arrived where the id was due" "Error: daemon unreachable"
+in_err "and the request id survives, because this create still has to be reconciled" "Queue create request ID"
+not_in_err "so no row was written to the StatefulSet" "openrig.dev/qitem=qitem-handed-over-1"
 
 printf '\n%s passed, %s failed\n' "$PASS" "$FAILED"
 [ "$FAILED" -eq 0 ] || exit 1

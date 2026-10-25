@@ -891,18 +891,30 @@ cmd_start() {
     session=$(lead_session "$slug" "$rig" "$lead")
     [ -n "$session" ] || die "no seat '$lead' in rig $rig (use --lead <logicalId>)"
     brief_with_contract "$slug" "$brief" | inpod_stdin "$slug" sh -c "cat > $WORK/brief.md"
-    # `rig queue create` prints a request-identity note to stderr on every success: it is a request id and
-    # explicitly not a commit receipt, which is why the CLI puts it on stderr rather than in the JSON. The
-    # dispatcher already reads the real id from --json on stdout, so on stage that note is three lines of
-    # noise on every single start. Drop exactly that line and keep everything else the CLI said: a create
-    # that failed still shows its error, and one that returned no id still shows all of it.
+    # `rig queue create` prints a request-identity note to stderr on every success, before it even asks the
+    # daemon: it is a request id and explicitly not a commit receipt, which is why the CLI puts it on
+    # stderr rather than in the JSON. On success the dispatcher already holds the real id from stdout, so
+    # on stage that note is three lines of noise on every single start -- drop exactly that line and keep
+    # everything else the CLI said. On a create that did NOT come back with an id the note is the opposite
+    # of noise: the CLI prints it because a missing row does not rule out a pending commit, and that id is
+    # the only handle for reconciling one. Dropping it there too would leave the operator's natural move --
+    # re-run `start` -- free to mint a second id, and possibly a second row for the team.
+    # And nothing in this block may abort on its own. The file runs under `set -e`, the create's output is
+    # buffered in these two files rather than streamed live, and a jq that chokes on a truncated stdout
+    # would end `start` before one line of the failure was shown: a quieter failure than the one being
+    # fixed. So jq cannot fail the script, and the captured output is printed before the files go away.
     qitem_out=$(mktemp) qitem_err=$(mktemp)
     qitem_rc=0
     inpod "$slug" rig queue create --source "dispatcher@$NS" --destination "$session" \
       --tags "ticket:$slug" --summary "$(annotation "$sts" ticket-key): $(head -n1 "$brief" | sed 's/^#* *//' | cut -c1-100)" \
       --body-file "$WORK/brief.md" --json >"$qitem_out" 2>"$qitem_err" || qitem_rc=$?
-    qitem=$(jq -r '.qitemId // .qitem.qitemId // empty' "$qitem_out" 2>/dev/null)
-    grep -v '^Queue create request ID: ' "$qitem_err" >&2 || true
+    qitem=$(jq -r '.qitemId // .qitem.qitemId // empty' "$qitem_out" 2>/dev/null || true)
+    if [ -n "$qitem" ]; then
+      grep -v '^Queue create request ID: ' "$qitem_err" >&2 || true
+    else
+      cat "$qitem_err" >&2 || true
+      if [ -s "$qitem_out" ]; then cat "$qitem_out" >&2 || true; fi
+    fi
     rm -f "$qitem_out" "$qitem_err"
     if [ -z "$qitem" ]; then
       [ "$qitem_rc" = 0 ] || die "queue create failed (exit $qitem_rc)"
@@ -1813,6 +1825,14 @@ live_activity_after() { # live_activity_after <slug> <events|transitions> <after
     w=$(jq -r '.page.retainedHighWatermark // ""' <<<"$page"); [ -n "$w" ] && wm=$w
     w=$(jq -r '.page.lastScanned // ""' <<<"$page"); [ -n "$w" ] && scanned=$w
     w=$(jq -r '.coverage.status // ""' <<<"$page"); [ -n "$w" ] && coverage=$w
+    # A page can scan a row and still not return it: `withheld` counts a record over the size cap and a
+    # transition id that conflicts between the active and archive tables. Such a row is never classified
+    # above, and the page still reads as complete -- `lastScanned` reached `through`, the watermark equals
+    # `through`, coverage is only `partial` -- so this count is the only thing that says a row sitting
+    # somewhere past the archive went unexamined. Rows nobody could read are not rows that did not happen.
+    w=$(jq -r '.page.withheld // 0' <<<"$page")
+    case "$w" in ''|*[!0-9]*) w=0 ;; esac
+    [ "$w" = 0 ] || return 2
     pages=$((pages + 1))
     [ "$(jq -r '.page.hasMore' <<<"$page")" = true ] || break
     next=$(jq -r '.page.nextCursor // ""' <<<"$page")

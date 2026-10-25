@@ -13,7 +13,7 @@
 # FAKE_STS_EXISTS, FAKE_FAIL_STS_LIST, FAKE_FAIL_STS_GET, FAKE_FAIL_POD_LIST, FAKE_STS_LIST2,
 # FAKE_POD_LIST2,
 # FAKE_EVENTS, FAKE_EVENTS2, FAKE_EVENTS3, FAKE_EVENTS_SEEN, FAKE_EVENTS_FAIL, FAKE_RUN_TAG,
-# FAKE_LIVE_TAIL, FAKE_LIVE_TAIL_TICKS, FAKE_RESET_PAGE, FAKE_PAGED_STALE.
+# FAKE_LIVE_TAIL, FAKE_LIVE_TAIL_TICKS, FAKE_RESET_PAGE, FAKE_PAGED_STALE, FAKE_WITHHELD.
 #
 # With FAKE_HUB_HOME set, calls aimed at the hub pod stop being recorded answers and become real work
 # on a real directory -- see "the hub's own side" below. FAKE_NPM_ROOT says where the `yaml` stand-in
@@ -59,6 +59,21 @@ sts_named_exists() { # <name>
 # caller that merges the two streams sees it beside the command's JSON. The dispatcher has to parse
 # around it; without this line the fake is more polite than kubectl and hides that.
 kfail() { printf 'command terminated with exit code %s\n' "$1" >&2; exit "$1"; }
+
+# A page that scanned rows and did not return them: `withheld` counts a record over the size cap and a
+# transition id that conflicts between the active and archive tables. The page still looks complete --
+# `lastScanned` reaches `through`, the watermark equals it, coverage is only `partial` -- so the count is
+# the only thing that says a row sitting somewhere in the window went unexamined.
+withhold() {
+  if [ "${FAKE_WITHHELD:-0}" = 1 ]; then
+    jq -c '.page.withheld = 1
+           | .coverage = (.coverage | .status = "partial"
+                          | .gapCount = ((.gapCount // 0) + 1)
+                          | .gaps = (.gaps + [{code: "record_byte_limit"}]))'
+  else
+    cat
+  fi
+}
 
 # One telemetry stream. The archive opens a history with `--start retained` and then follows the
 # cursor. A read with neither asks for the CURRENT window and gets no rows back, which is exactly how
@@ -131,14 +146,14 @@ telemetry() {
         fix events-page2.json | jq -c --arg t "$FAKE_LIVE_TAIL" --arg wm "$ev_wm" --argjson n "$ev_ticks" \
           '.rows += ([range(4; 4 + $n) | {seq: (. | tostring), rigId: "demo-rig", nodeId: "n-1", type: "snapshot.created", createdAt: "2026-10-23T20:31:00Z"}]
                     + [{seq: ((4 + $n) | tostring), rigId: "demo-rig", nodeId: "n-1", type: $t, createdAt: "2026-10-23T20:31:00Z"}])
-           | .page.through = $wm | .page.lastScanned = $wm | .page.retainedHighWatermark = $wm'
+           | .page.through = $wm | .page.lastScanned = $wm | .page.retainedHighWatermark = $wm' | withhold
       else
         # The window this page belongs to closed at seq 3, but the stream's own end is whatever the
         # case says it is: when that is further on, rows exist past the window and no read reaches them.
         # FAKE_PAGED_STALE is the opposite lie: the paged read reports a window AND a watermark still
         # sitting at the archived number, though the cheap latest read said the stream had moved.
         fix events-page2.json | jq -c --arg wm "$ev_wm" --arg stale "${FAKE_PAGED_STALE:-0}" \
-          '.page.retainedHighWatermark = (if $stale == "1" then .page.through else $wm end)'
+          '.page.retainedHighWatermark = (if $stale == "1" then .page.through else $wm end)' | withhold
       fi ;;
     transitions:) fix transitions-page1.json ;;
     transitions:CURSOR-T1) fix transitions-page2.json ;;
@@ -391,6 +406,13 @@ serve() {
           if [ "${FAKE_QUEUE_CREATE:-ok}" = fail ]; then
             printf '{"error":"destination_unknown","detail":"no such session for the destination"}\n' >&2
             kfail 2
+          elif [ "${FAKE_QUEUE_CREATE:-ok}" = garbage ]; then
+            # A create whose stdout is not the JSON at all: `kubectl exec` dropped mid-stream, or the CLI
+            # wrote prose where the id was due. The reader must not die on it, and the failure must still
+            # be the loudest thing on the screen.
+            printf 'Error: daemon unreachable\n'
+            printf '{"error":"econnreset","detail":"the stream ended before the row was written"}\n' >&2
+            kfail 1
           fi
           printf '{"qitemId":"qitem-handed-over-1","state":"pending"}\n' ;;
         "queue resolve")

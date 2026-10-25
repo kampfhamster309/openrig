@@ -75,9 +75,12 @@ An hour before, in a plain terminal:
    If DEMO-A's lead puts its question on its **own screen** instead of on the queue — Claude Code's
    question dialog, a permission prompt — nobody can answer it, and the recorded run waited the full 20
    minutes for a row that was never coming. `prepare.sh` now reads what the pod's daemon already reports
-   and stops in about 30 seconds instead, naming the seat and printing the four hand steps: look at the
-   pane, press `Esc` in it so nothing is chosen, send the seat one message pointing at step 1 of its
-   brief, re-run. About a minute of your time, and the re-run re-checks rather than starting a second team.
+   and stops by itself instead: **within a few minutes, not 20.** Plan on that, not on seconds — it wants
+   two consecutive readings of the same seat, and the daemon keeps calling a seat `running` for up to five
+   minutes after a dialog opened, so a faster stop than that is not measured yet. It names the seat and
+   prints the four hand steps: look at the pane, press `Esc` in it with one command so nothing is chosen,
+   send the seat one message pointing at step 1 of its brief, re-run. About a minute of your time, and the
+   re-run re-checks rather than starting a second team.
 2. Start the port-forward it printed: `kubectl -n $NS port-forward pod/hub-0 17433:7433 &`
 3. Start the hub TUI it printed, in the window you will present:
    `OPENRIG_HOME=$HOME/.openrig-hub-view OPENRIG_URL=http://127.0.0.1:17433 node "$CLIENT/tui/dist/main.js" --url http://127.0.0.1:17433`
@@ -130,9 +133,12 @@ Claude Code lead. It keeps working after the command returns, which is the point
   third team is coming up" and move on; it will be there for step 5.
 - The pod is Ready and the seat just stops: it is waiting on a dialog in its own pane, which reaches
   nobody. `$D status DEMO-C --json | jq '.[0].seats'` says `needs_input`, and
-  `kubectl -n $NS exec t-demo-c-0 -c daemon -- rig capture <seat> --lines 40` shows it. Press `Esc` in
-  that pane so nothing is chosen, then `rig send` the seat back to its brief. Its brief now says the
-  question goes on the queue, so this should not happen.
+  `kubectl -n $NS exec t-demo-c-0 -c daemon -- rig capture <seat> --lines 40` shows it. One command puts
+  `Esc` in that pane so nothing is chosen, with nothing to attach to:
+  `kubectl -n $NS exec t-demo-c-0 -c daemon -- tmux send-keys -t '=<seat>' Escape` (`tmux ls` in the pod
+  names the session if that one is not it — a seat that has had a successor is filed under another name).
+  Then `rig send` the seat back to its brief. Its brief now says the question goes on the queue, so this
+  should not happen.
 
 ---
 

@@ -196,11 +196,20 @@ dialog_recovery() { # <ticket> <session>
   local slug session ask
   slug=$(demo_ticket "$1" | tr '[:upper:]' '[:lower:]')
   session=$2
-  ask='Read step 1 of your brief. The question goes on the queue with rig queue block --on human@host, not on your own screen: nobody is watching this pane, so a dialog there never reaches the human. Press Esc so no option is chosen, then park the row.'
+  # Worded for a person who has just cancelled the dialog, not for the seat. The seat could not press Esc
+  # itself -- its turn was suspended inside the tool call -- so by the time it can read this the dialog is
+  # gone, and the only thing left to do is put the question where the talk can answer it.
+  ask='Your question dialog was cancelled, so nothing was chosen. Read step 1 of your brief: the question goes on the queue with rig queue block --on human@host, not on your own screen -- nobody is watching this pane, so a dialog there never reaches the human. Park the row there.'
   printf 'Recover it by hand, in about a minute:\n'
   printf '  1. see what it is waiting on:\n     %s -n %s exec t-%s-0 -c daemon -- rig capture %s --lines 40\n' \
     "$KUBECTL" "$NS" "$slug" "$session"
-  printf '  2. press Esc in that pane so nothing is chosen (tmux ls inside the pod names the sessions):\n     %s -n %s exec -it t-%s-0 -c daemon -- tmux ls\n' \
+  # One command, not a lesson in tmux: `send-keys Escape` puts the key in the pane without anyone having
+  # to attach to it and risk leaving an attached client behind. The `=` asks for an exact session name.
+  printf '  2. press Esc in that pane, so nothing is chosen -- one command, nothing to attach to:\n     %s -n %s exec t-%s-0 -c daemon -- tmux send-keys -t '\''=%s'\'' Escape\n' \
+    "$KUBECTL" "$NS" "$slug" "$session"
+  # The name a seat is filed under in tmux is the daemon's, and a seat that has had a successor is filed
+  # under another one, so say where to read the real name rather than pretend this one always matches.
+  printf '       if tmux says there is no such session, this names it: %s -n %s exec t-%s-0 -c daemon -- tmux ls\n' \
     "$KUBECTL" "$NS" "$slug"
   printf '  3. point the seat back at its brief:\n     %s -n %s exec t-%s-0 -c daemon -- rig send %s %s\n' \
     "$KUBECTL" "$NS" "$slug" "$session" "$(printf '%q' "$ask")"
@@ -209,24 +218,29 @@ dialog_recovery() { # <ticket> <session>
 
 # Wait for a team to park its question on the human, and stop early when it is not going to because it
 # asked the wrong place. One reading of a dialog does not stop a run: a prompt the seat clears between two
-# polls would kill a healthy team, so this wants the same seat reporting it twice in a row, DEMO_WAIT_POLL
-# apart. A detection that never fires costs exactly what it costs today -- the full wait, then a message
-# that names the possibility -- so it cannot break a run that is going well. Sets DEMO_DIALOG_SESSION to
-# the seat it stopped on. -> 0 parked, 1 timed out, 2 sitting at a dialog
+# polls would kill a healthy team, so this wants ONE seat reporting a dialog on two consecutive polls --
+# not merely two polls that each saw some seat at one, which is why the previous poll's whole list is kept
+# rather than a flag. A detection that never fires costs exactly what it costs today -- the full wait,
+# then a message that names the possibility -- so it cannot break a run that is going well. Sets
+# DEMO_DIALOG_SESSION to the one seat it stopped on, always a single name: the recovery prints it into
+# commands, where a two-line name would break every one of them. -> 0 parked, 1 timed out, 2 at a dialog
 DEMO_DIALOG_SESSION=""
 wait_team_parks() { # <ticket>
-  local ticket=$1 deadline=$((SECONDS + DEMO_WAIT_SECONDS)) seen=0 session
+  local ticket=$1 deadline=$((SECONDS + DEMO_WAIT_SECONDS)) prev="" session repeat
   DEMO_DIALOG_SESSION=""
   while :; do
     if team_asks_human "$ticket"; then return 0; fi
     session=$(team_dialog_sessions "$ticket")
-    if [ -n "$session" ]; then
+    # The seat present in BOTH this poll and the last one. Two different seats on two polls are two
+    # readings of the run, not two readings of one dialog, and must not stop a healthy team.
+    repeat=$(comm -12 <(printf '%s\n' "$prev" | LC_ALL=C sort) \
+      <(printf '%s\n' "$session" | LC_ALL=C sort) | head -n1)
+    if [ -n "$repeat" ]; then
       # shellcheck disable=SC2034  # prepare.sh reads this after the call; it sources this file.
-      if [ "$seen" = 1 ]; then DEMO_DIALOG_SESSION=$session; return 2; fi
-      seen=1
-    else
-      seen=0
+      DEMO_DIALOG_SESSION=$repeat
+      return 2
     fi
+    prev=$session
     [ "$SECONDS" -lt "$deadline" ] || return 1
     sleep "$DEMO_WAIT_POLL"
   done

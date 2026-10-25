@@ -202,7 +202,63 @@ in_err "pressing Esc so that nothing is chosen" "press Esc in that pane"
 in_err "one message back to the brief" "rig send orch-lead@demo-one"
 in_err "and a re-run, which re-checks rather than starting a second team" "re-run this script"
 in_err "and it says plainly why this is a stop, not a warning" "until the talk is over"
+in_err "and step 2 is one command that presses the key, not a lesson in tmux" "tmux send-keys -t '=orch-lead@demo-one' Escape"
+in_err "and it says where to read the session name if that one is not it" "if tmux says there is no such session"
+not_in_err "and the message to the seat does not ask it to press Esc, which it cannot do from inside the dialog" "option"
+in_err "but tells it the dialog was already cancelled for it" "cancelled"
 not_in_err "and it did not sit out the timeout to say something vaguer" "never parked a question"
+
+# The "one seat, twice" rule, tested on the function itself, poll by poll. It cannot be driven from the
+# cluster side: the wait loop makes two status reads per poll (the parked-row check and the dialog check),
+# so a seat sequence served by the fake lands on an offset the test does not control. Here the sequence IS
+# the polls. Seat X on one poll and seat Y on the next is two readings of the run, not two readings of one
+# dialog -- the old check only remembered that SOME seat had reported a dialog on the previous poll, so it
+# stopped the run and named Y after a single reading of it.
+PARKS="$WORK/parks.sh"
+cat > "$PARKS" <<'PARKS_EOF'
+# $1 = one seat name per poll; an empty line means nobody is at a dialog on that poll.
+seq_file=$1
+# shellcheck disable=SC1090
+source "$DEMO_LIB" >/dev/null 2>&1
+team_asks_human() { return 1; }
+team_dialog_sessions() {
+  local n s
+  n=$(( $(cat "$seq_file.n" 2>/dev/null || printf 0) + 1 ))
+  printf '%s' "$n" > "$seq_file.n"
+  s=$(sed -n "${n}p" "$seq_file")
+  if [ -n "$s" ]; then printf '%s\n' "$s"; fi
+}
+rc=0; wait_team_parks DEMO-A || rc=$?
+printf 'rc=%s session=%s\n' "$rc" "$DEMO_DIALOG_SESSION"
+PARKS_EOF
+run_parks() { # run_parks <seat|seat|...> -- one field per poll, empty field = no dialog -> RC and OUT
+  printf '%s\n' "$1" | tr '|' '\n' > "$WORK/polls"
+  rm -f "$WORK/polls.n"
+  OUT=$(DEMO_LIB="$DEMO/demo-common.sh" DEMO_WAIT_SECONDS=2 DEMO_WAIT_POLL=0 bash "$PARKS" "$WORK/polls")
+  RC=$?
+}
+
+run_parks "orch-lead@demo-one|orch-lead@demo-one|"
+eq "one seat at a dialog on two consecutive polls stops the run, naming it" "rc=2 session=orch-lead@demo-one" "$OUT"
+
+run_parks "orch-lead@demo-one|build@demo-one|"
+eq "a different seat on the next poll is not the same seat twice" "rc=1 session=" "$OUT"
+
+run_parks "orch-lead@demo-one||orch-lead@demo-one|"
+eq "a dialog that clears between polls does not stop the run when the seat comes back" "rc=1 session=" "$OUT"
+
+run_parks "|orch-lead@demo-one|orch-lead@demo-one|"
+eq "and it still stops once one seat holds it across a pair, after a quiet poll" "rc=2 session=orch-lead@demo-one" "$OUT"
+
+# Two seats at a dialog at once still has to name exactly one of them: the recovery prints that name into
+# four commands, and a two-line name breaks every one of them.
+new_state
+sed -i 's/^open_DEMO_A=.*/open_DEMO_A=none/' "$DEMO_FAKE_STATE"
+printf 'seats_DEMO_A=[{"session":"orch-lead@demo-one","status":"running","activity":"needs_input"},{"session":"build@demo-one","status":"running","activity":"needs_input"}]\n' >> "$DEMO_FAKE_STATE"
+run_prepare
+eq "two seats at a dialog stop the run on one of them" 1 "$RC"
+in_err "and it names one seat, on one line" "its seat build@demo-one is sitting at a question dialog"
+in_err "and the command it prints is well-formed, not split by a two-line name" "rig capture build@demo-one --lines 40"
 
 # One reading of a dialog is not enough to stop a run for: a prompt the seat clears between two polls
 # would kill a healthy team. The same seat reporting it twice in a row is one dialog still waiting.
