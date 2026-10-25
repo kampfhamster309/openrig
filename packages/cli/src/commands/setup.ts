@@ -82,6 +82,51 @@ export interface SetupDeps {
   recordProviders?: (value: string) => void;
 }
 
+/** The runtimes OpenRig can run seats with. `--install` names these; `--providers` names only the kernel ones. */
+export type SetupRuntime = "claude" | "codex" | "pi";
+
+interface RuntimeInfo {
+  runtime: SetupRuntime;
+  stepId: string;
+  label: string;
+  /** Read-only probe: a version call, never a launch. */
+  probe: string;
+  npmPackage: string;
+  /** The one question an installing agent asks about a missing runtime. */
+  question: string;
+  /** Only Claude Code and Codex can boot the kernel (kernel-boot.ts selects from these two). */
+  kernel: boolean;
+  failReason: string;
+}
+
+const RUNTIME_ORDER: readonly SetupRuntime[] = ["claude", "codex", "pi"];
+
+const RUNTIMES: Record<SetupRuntime, RuntimeInfo> = {
+  claude: {
+    runtime: "claude", stepId: "claude_install", label: "Claude Code", probe: "claude --version",
+    npmPackage: "@anthropic-ai/claude-code", question: "Install Claude Code for OpenRig seats?", kernel: true,
+    failReason: "Claude Code seats need the Claude CLI; a project on another runtime can use its own readiness result.",
+  },
+  codex: {
+    runtime: "codex", stepId: "codex_install", label: "Codex", probe: "codex --version",
+    npmPackage: "@openai/codex", question: "Install Codex for OpenRig seats?", kernel: true,
+    failReason: "Codex seats need the Codex CLI installed on this machine.",
+  },
+  pi: {
+    runtime: "pi", stepId: "pi_install", label: "Pi", probe: "pi --version",
+    npmPackage: "@earendil-works/pi-coding-agent", question: "Install Pi for OpenRig seats?", kernel: false,
+    failReason: "Pi seats need the Pi CLI installed on this machine.",
+  },
+};
+
+/** Pi's model and provider live in Pi's own config; OpenRig never signs Pi in and must not imply it does. */
+const PI_PRESENT_MESSAGE = "Pi available. Pi's model and provider are configured in Pi (for example its models.json), not by OpenRig.";
+
+const RUNTIME_STEP_IDS = new Map<string, RuntimeInfo>(RUNTIME_ORDER.map((r) => [RUNTIMES[r].stepId, RUNTIMES[r]]));
+
+/** `--providers` is the kernel choice, so it can name these two and never Pi. */
+const isKernelRuntime = (runtime: SetupRuntime): boolean => RUNTIMES[runtime].kernel;
+
 const ROUTER_LINE_KEY = "skills.router_line.enabled";
 
 function readRouterLineAnswer(store: Pick<ConfigStore, "resolveWithSource">): Pick<RouterLinePreview, "answer" | "by"> {
@@ -152,6 +197,7 @@ const CORE_STEP_IDS = [
   "claude_auth",
   "codex_install",
   "codex_auth",
+  "pi_install",
   "tmux_config",
   "verify",
 ];
@@ -453,20 +499,140 @@ function recordProvidersStep(deps: SetupDeps, chosen: readonly SetupProvider[]):
   };
 }
 
-export async function runSetup(deps: SetupDeps, opts: { dryRun?: boolean; full?: boolean; policy?: string; specPath?: string; herdr?: boolean; ghostty?: boolean; providers?: readonly SetupProvider[]; doctorDeps?: DoctorDeps; routerLine?: "yes" | "no" }): Promise<SetupResult> {
+/** `--install`: the runtimes the person explicitly said yes to (`claude`, `codex`, `pi`, or `all`). */
+export function parseSetupInstalls(value: string): SetupRuntime[] | { error: string } {
+  const names = value.split(",").map((name) => name.trim().toLowerCase()).filter(Boolean);
+  const chosen = new Set<SetupRuntime>();
+  for (const name of names) {
+    if (name === "all") RUNTIME_ORDER.forEach((runtime) => chosen.add(runtime));
+    else if (name === "claude" || name === "codex" || name === "pi") chosen.add(name);
+    else return { error: `Unknown runtime '${name}' in --install: use claude, codex, pi, or all.` };
+  }
+  if (chosen.size === 0) return { error: "--install needs claude, codex, pi, or all." };
+  return RUNTIME_ORDER.filter((runtime) => chosen.has(runtime));
+}
+
+/** Read-only: is the runtime's CLI on PATH? A failed version probe reads as absent. */
+function runtimePresent(deps: SetupDeps, info: RuntimeInfo): boolean {
+  try {
+    deps.exec(info.probe);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * One runtime's install step, in the Ghostty shape: present passes, missing is offered, and only a
+ * runtime the person chose is installed. A missing runtime nobody chose is `skipped`, never a failure.
+ */
+function runtimeInstallStep(deps: SetupDeps, info: RuntimeInfo, install: boolean): SetupStep {
+  if (runtimePresent(deps, info)) {
+    return { id: info.stepId, status: "pass", message: info.runtime === "pi" ? PI_PRESENT_MESSAGE : `${info.label} available.` };
+  }
+  if (!install) {
+    return {
+      id: info.stepId,
+      status: "skipped",
+      message: `Installing agent: ask once, '${info.question}'`,
+      fixHint: `On Yes, rerun rig setup with --install ${info.runtime}, preserving earlier choices such as --no-herdr and --providers (names combine: --install ${info.runtime},codex). That runs \`npm install -g ${info.npmPackage}\`. On No, pass nothing: a runtime you did not choose is never a failure. The person types no command.`,
+    };
+  }
+  try {
+    installCommand(deps, `npm install -g ${info.npmPackage}`);
+    if (!runtimePresent(deps, info)) throw new Error(`the installer returned but \`${info.probe}\` still does not answer`);
+    return { id: info.stepId, status: "applied", message: `Installed ${info.label} with npm.` };
+  } catch (err) {
+    return {
+      id: info.stepId,
+      status: "fail",
+      message: `Failed to install ${info.label}: ${(err as Error).message}`,
+      reason: info.failReason,
+      fixHint: `Install ${info.label} with \`npm install -g ${info.npmPackage}\`, then rerun rig setup.`,
+    };
+  }
+}
+
+/** The dry-run plan line for one runtime: found, would install, or would offer. */
+function dryRuntimeInstallMessage(info: RuntimeInfo, opts: { present: boolean; install: boolean; byProviders: boolean }): string {
+  if (opts.present) return `Dry run: found ${info.label}; nothing to install.`;
+  if (opts.install) {
+    const chosen = opts.byProviders ? `--providers ${info.runtime}` : `--install ${info.runtime}`;
+    return `Dry run: ${info.label} is missing and was chosen with ${chosen}, so it would be installed with \`npm install -g ${info.npmPackage}\`.`;
+  }
+  return `Dry run: ${info.label} is missing; it would be offered, not installed. To choose it: rig setup --install ${info.runtime}.`;
+}
+
+/**
+ * The kernel consequence, said at setup time rather than at daemon start. The kernel boots from Claude
+ * Code or Codex only, so a Pi-only machine is ready for seats yet has no kernel (kernel-boot.ts).
+ */
+function kernelRuntimeStep(present: ReadonlySet<SetupRuntime>, providers: readonly SetupProvider[] | undefined, dryRun = false): SetupStep {
+  const prefix = dryRun ? "Dry run: " : "";
+  const kernel = RUNTIME_ORDER.filter((runtime) => RUNTIMES[runtime].kernel && present.has(runtime)).map((runtime) => RUNTIMES[runtime].label);
+  if (kernel.length === 0) {
+    return {
+      id: "kernel_runtime",
+      status: dryRun ? "skipped" : "warn",
+      message: `${prefix}only Pi is present, so setup is ready, but the kernel will not start: it needs Claude Code or Codex.`,
+      reason: "Kernel boot selects a Claude Code or Codex variant; Pi runs project seats only.",
+      fixHint: "Start without the kernel with `rig daemon start --no-kernel`, or set OPENRIG_NO_KERNEL=1. For a kernel, install one: rig setup --install claude (or codex).",
+    };
+  }
+  const names = kernel.join(" and ");
+  return {
+    id: "kernel_runtime",
+    status: dryRun ? "skipped" : "pass",
+    message: `${prefix}the kernel can start with ${names}.`,
+    ...(providers
+      ? { reason: `provider.selected is saved as ${providersValue(providers)}, so the kernel's first boot uses that.` }
+      : { reason: "provider.selected is not set, so the kernel's first boot uses every signed-in provider that is present." }),
+  };
+}
+
+/** None of the three present: the one case that is not ready. Exactly one clear failure says what to install. */
+function noRuntimeStep(): SetupStep {
+  return {
+    id: "runtime_present",
+    status: "fail",
+    message: "No OpenRig runtime is installed: Claude Code, Codex and Pi are all missing.",
+    reason: "OpenRig needs at least one of Claude Code, Codex or Pi to run seats.",
+    fixHint: "Install at least one, then rerun rig setup: rig setup --install claude (or codex, or pi; names combine, for example --install claude,pi).",
+  };
+}
+
+export async function runSetup(deps: SetupDeps, opts: { dryRun?: boolean; full?: boolean; policy?: string; specPath?: string; herdr?: boolean; ghostty?: boolean; providers?: readonly SetupProvider[]; installs?: readonly SetupRuntime[]; doctorDeps?: DoctorDeps; routerLine?: "yes" | "no" }): Promise<SetupResult> {
   const profile = opts.full ? "full" : "core";
   const platform = deps.platform ?? process.platform;
   const runtimeConfig = [...BASE_RUNTIME_CONFIG_DISCLOSURE];
   const stepIds = opts.full ? [...CORE_STEP_IDS, ...FULL_EXTRA_STEP_IDS] : [...CORE_STEP_IDS];
   const steps: SetupStep[] = [];
-  // No --providers: both are checked, as before. With it, only the chosen ones.
+  // No --providers: both kernel providers are checked, as before. With it, only the chosen ones.
   const selected = (provider: SetupProvider) => !opts.providers || opts.providers.includes(provider);
+  // A runtime is installed only on an explicit choice: --install, or naming a kernel provider in --providers.
+  const installChosen = (runtime: SetupRuntime) =>
+    (opts.installs?.includes(runtime) ?? false) || (isKernelRuntime(runtime) && !!opts.providers?.includes(runtime as SetupProvider));
 
   if (opts.dryRun) {
+    // Detection is a read-only version probe, so the plan can say what was found. Nothing is installed, written or launched.
+    const found = new Set<SetupRuntime>();
+    for (const runtime of RUNTIME_ORDER) {
+      if (isKernelRuntime(runtime) && !selected(runtime as SetupProvider)) continue;
+      if (runtimePresent(deps, RUNTIMES[runtime])) found.add(runtime);
+    }
     for (const id of stepIds) {
       const provider = (["claude", "codex"] as const).find((p) => id === `${p}_install` || id === `${p}_auth`);
       if (provider && !selected(provider)) {
         steps.push(notSelectedSteps(provider, opts.providers!).find((step) => step.id === id)!);
+        continue;
+      }
+      const info = RUNTIME_STEP_IDS.get(id);
+      if (info) {
+        if (id === info.stepId) {
+          steps.push({ id, status: "skipped", message: dryRuntimeInstallMessage(info, { present: found.has(info.runtime), install: installChosen(info.runtime), byProviders: isKernelRuntime(info.runtime) && !!opts.providers?.includes(info.runtime as SetupProvider) }) });
+        } else {
+          steps.push({ id, status: "skipped", message: found.has(info.runtime) ? `Dry run: ${info.label} sign-in would be checked.` : `Dry run: skipped, ${info.label} is not installed.` });
+        }
         continue;
       }
       const platformSkip = id === "herdr_install" && opts.herdr === false ? "Skipped: herdr installation declined (--no-herdr)."
@@ -478,6 +644,8 @@ export async function runSetup(deps: SetupDeps, opts: { dryRun?: boolean; full?:
         : platform !== "darwin" ? NON_DARWIN_DRY_RUN_SKIPS[id] : undefined;
       steps.push({ id, status: "skipped", message: platformSkip ?? `Dry run: ${id} would be attempted.` });
     }
+    if (found.size === 0) steps.push({ ...noRuntimeStep(), status: "skipped" });
+    else steps.push(kernelRuntimeStep(found, opts.providers, true));
     if (opts.policy !== undefined) {
       steps.push({ id: "policy_record", status: "skipped", message: `Dry run: would record permission_policy for '${opts.policy}'.` });
     }
@@ -546,63 +714,31 @@ export async function runSetup(deps: SetupDeps, opts: { dryRun?: boolean; full?:
     : installHerdr(deps, platform));
   steps.push(installGhostty(deps, platform, opts.ghostty));
 
-  // 4. Claude Code runtime
-  if (!selected("claude")) steps.push(...notSelectedSteps("claude", opts.providers!));
-  else {
-    let claudeInstalled = false;
-    try {
-      deps.exec("claude --version");
-      claudeInstalled = true;
-      steps.push({ id: "claude_install", status: "pass", message: "Claude Code available." });
-    } catch {
-      try {
-        installCommand(deps, "npm install -g @anthropic-ai/claude-code");
-        deps.exec("claude --version");
-        claudeInstalled = true;
-        steps.push({ id: "claude_install", status: "applied", message: "Installed Claude Code with npm." });
-      } catch (err) {
-        steps.push({
-          id: "claude_install",
-          status: "fail",
-          message: `Failed to install Claude Code: ${(err as Error).message}`,
-          reason: "Claude Code seats need the Claude CLI; a Codex-only project can use its own runtime readiness result.",
-          fixHint: "Install Claude Code with `npm install -g @anthropic-ai/claude-code`.",
-        });
-      }
+  // 4. The runtimes: Claude Code, Codex and Pi. Each is checked, a missing one is offered, and only a
+  //    runtime the person chose is installed. One present is enough for setup to be ready.
+  const present = new Set<SetupRuntime>();
+  let installFailed = false;
+  for (const runtime of RUNTIME_ORDER) {
+    const info = RUNTIMES[runtime];
+    if (isKernelRuntime(runtime) && !selected(runtime as SetupProvider)) {
+      steps.push(...notSelectedSteps(runtime as SetupProvider, opts.providers!));
+      continue;
     }
-
-    const { name: claudeName, fix: claudeFix, ...claudeAuth } = checkClaudeAuth(deps, claudeInstalled);
-    steps.push({ id: claudeName, ...claudeAuth, ...(claudeFix ? { fixHint: claudeFix } : {}) });
+    const step = runtimeInstallStep(deps, info, installChosen(runtime));
+    steps.push(step);
+    if (step.status === "pass" || step.status === "applied") present.add(runtime);
+    if (step.status === "fail") installFailed = true;
+    // Sign-in is checked only for a runtime that is here. Pi has no sign-in check in OpenRig.
+    if (runtime === "claude" || runtime === "codex") {
+      const check = runtime === "claude" ? checkClaudeAuth(deps, present.has(runtime)) : checkCodexAuth(deps, present.has(runtime));
+      const { name, fix, ...rest } = check;
+      steps.push({ id: name, ...rest, ...(fix ? { fixHint: fix } : {}) });
+    }
   }
 
-  // 5. Codex runtime
-  if (!selected("codex")) steps.push(...notSelectedSteps("codex", opts.providers!));
-  else {
-    let codexInstalled = false;
-    try {
-      deps.exec("codex --version");
-      codexInstalled = true;
-      steps.push({ id: "codex_install", status: "pass", message: "Codex available." });
-    } catch {
-      try {
-        installCommand(deps, "npm install -g @openai/codex");
-        deps.exec("codex --version");
-        codexInstalled = true;
-        steps.push({ id: "codex_install", status: "applied", message: "Installed Codex with npm." });
-      } catch (err) {
-        steps.push({
-          id: "codex_install",
-          status: "fail",
-          message: `Failed to install Codex: ${(err as Error).message}`,
-          reason: "Codex seats need the Codex CLI installed on this machine.",
-          fixHint: "Install Codex with `npm install -g @openai/codex`.",
-        });
-      }
-    }
-
-    const { name: codexName, fix: codexFix, ...codexAuth } = checkCodexAuth(deps, codexInstalled);
-    steps.push({ id: codexName, ...codexAuth, ...(codexFix ? { fixHint: codexFix } : {}) });
-  }
+  // None present is the one case that is not ready; a failed install the person asked for already says so.
+  if (present.size === 0 && !installFailed) steps.push(noRuntimeStep());
+  if (present.size > 0) steps.push(kernelRuntimeStep(present, opts.providers));
 
   // 6. tmux config
   const TMUX_CONF = `${process.env["HOME"] ?? "~"}/.tmux.conf`;
@@ -686,7 +822,7 @@ export async function runSetup(deps: SetupDeps, opts: { dryRun?: boolean; full?:
     const doctorDeps = opts.doctorDeps;
     // Reuse the post-install facts above; do not repeat login probes during verification.
     const providerChecks = steps
-      .filter((step) => ["claude_install", "claude_auth", "codex_install", "codex_auth"].includes(step.id))
+      .filter((step) => ["claude_install", "claude_auth", "codex_install", "codex_auth", "pi_install"].includes(step.id))
       .map(({ id, status, fixHint, ...check }) => ({
         name: id, status: status === "applied" ? "pass" as const : status,
         ...check, ...(fixHint ? { fix: fixHint } : {}),
@@ -866,7 +1002,8 @@ export function setupCommand(depsOverride?: SetupDeps): Command {
     .option("--no-herdr", "Skip the default herdr installation; the OpenRig view can use plain tmux")
     .option("--ghostty", "Install Ghostty on macOS after the person accepts the offer")
     .option("--no-ghostty", "Decline Ghostty; Terminal.app remains available on macOS")
-    .option("--providers <list>", "The person's provider choice: claude, codex, or both. One not chosen is skipped (not installed or checked), never failed")
+    .option("--providers <list>", "The person's kernel provider choice: claude, codex, or both. One not chosen is skipped (not installed or checked), never failed. A chosen one that is missing IS installed, so this flag never names Pi; use --install for that")
+    .option("--install <list>", "Install a missing runtime the person chose: claude, codex, pi, or all. Without it setup only checks and offers runtimes, and installs nothing")
     .option("--policy <name>", `Record a deliberate permission-policy choice into an existing spec (${POLICY_CHOICES.join("|")})`)
     .option("--spec <path>", "Existing rig spec (file or directory) to record the --policy choice into")
     .option("--router-line <answer>", "The person's yes or no on the one line (plus OpenRig's markers) OpenRig can add to shared guidance files; saved as skills.router_line.enabled. No answer is never a yes")
@@ -876,10 +1013,16 @@ tmux scrollback:
   To keep more:  rig config set terminal.history_limit 50000   then rerun  rig setup
   A running tmux server keeps its old limit until it restarts or you run
   tmux source-file ~/.tmux.conf; before tmux 3.7 that changes new panes only.`)
-    .action(async (opts: { dryRun?: boolean; json?: boolean; full?: boolean; herdr?: boolean; ghostty?: boolean; providers?: string; policy?: string; spec?: string; routerLine?: string }) => {
+    .action(async (opts: { dryRun?: boolean; json?: boolean; full?: boolean; herdr?: boolean; ghostty?: boolean; providers?: string; install?: string; policy?: string; spec?: string; routerLine?: string }) => {
       const providers = opts.providers === undefined ? undefined : parseSetupProviders(opts.providers);
       if (providers && "error" in providers) {
         console.error(providers.error);
+        process.exitCode = 1;
+        return;
+      }
+      const installs = opts.install === undefined ? undefined : parseSetupInstalls(opts.install);
+      if (installs && "error" in installs) {
+        console.error(installs.error);
         process.exitCode = 1;
         return;
       }
@@ -891,7 +1034,7 @@ tmux scrollback:
       }
       const deps = depsOverride ?? defaultDeps();
       const doctorDeps = opts.dryRun ? undefined : buildDefaultDoctorDeps(deps);
-      const result = await runSetup(deps, { dryRun: opts.dryRun, full: opts.full, policy: opts.policy, specPath: opts.spec, herdr: opts.herdr, ghostty: opts.ghostty, providers, doctorDeps, routerLine });
+      const result = await runSetup(deps, { dryRun: opts.dryRun, full: opts.full, policy: opts.policy, specPath: opts.spec, herdr: opts.herdr, ghostty: opts.ghostty, providers, installs, doctorDeps, routerLine });
 
       if (opts.json) {
         console.log(JSON.stringify({ ...result, nextSteps: goldenPathNextSteps() }, null, 2));
@@ -914,8 +1057,10 @@ tmux scrollback:
         if (step.fixHint) console.log(`       Fix: ${step.fixHint}`);
       }
       if (!providers) {
-        console.log("\n  Providers: setup installs and checks both Claude Code and Codex. If the person chose one, pass it,");
-        console.log("  for example rig setup --providers claude; the other then reads not selected instead of failed.");
+        console.log("\n  Runtimes: setup checks Claude Code, Codex and Pi, and installs nothing you did not ask for.");
+        console.log("  A missing runtime is offered, never installed. To take one, rerun with --install claude|codex|pi (names combine,");
+        console.log("  for example rig setup --install claude,pi). One of the three present is enough to be ready; none present is not.");
+        console.log("  --providers is the narrower kernel choice (claude, codex): it records provider.selected and installs a chosen missing one.");
       }
 
       // OPR.0.3.3.04.2 (AC-1): the canonical ordered golden path. `rig setup` is

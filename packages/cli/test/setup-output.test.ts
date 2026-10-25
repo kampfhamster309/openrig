@@ -90,7 +90,8 @@ describe("setup conversation handoff output", () => {
           }
         }
         if (mode === "dry-run") {
-          expect(deps.exec).not.toHaveBeenCalled();
+          // The plan reports what was found, so the only commands are the read-only runtime version probes.
+          expect(deps.exec.mock.calls.map(([cmd]) => String(cmd)).sort()).toEqual(["claude --version", "codex --version", "pi --version"]);
           expect(deps.writeFile).not.toHaveBeenCalled();
           expect(deps.mkdirp).not.toHaveBeenCalled();
           expect(fetch).not.toHaveBeenCalled();
@@ -139,14 +140,28 @@ describe("the installer's setup boundary", () => {
   });
 
   it("a real failure beside a sign-in: exit 1, both listed", async () => {
+    // The person asked for Codex with --install, so a failed install is a real failure, not an offer.
     const r = await run((cmd) => {
       if (cmd === "claude auth status") throw new Error("Not logged in");
       if (cmd === "codex --version" || cmd === "npm install -g @openai/codex") throw new Error("npm ERR! network");
       return ok(cmd);
-    });
+    }, ["--install", "codex"]);
     expect(r.exitCode).toBe(1);
     expect(r.attention).toContain("claude_auth:");
     expect(r.attention).toContain("codex_install:");
+  });
+
+  it("a runtime that was not asked for is offered, not failed: exit 1 only for the sign-in", async () => {
+    const r = await run((cmd) => {
+      if (cmd === "claude auth status") throw new Error("Not logged in");
+      if (cmd === "codex --version" || cmd === "pi --version") throw new Error("command not found");
+      return ok(cmd);
+    });
+    expect(r.exitCode).toBe(1);
+    expect(r.attention).toContain("claude_auth:");
+    expect(r.attention).not.toContain("codex_install:");
+    expect(r.output).toContain("ask once, 'Install Codex for OpenRig seats?'");
+    expect(r.output).toContain("ask once, 'Install Pi for OpenRig seats?'");
   });
 
   it("ready: exit 0 and Setup complete", async () => {
