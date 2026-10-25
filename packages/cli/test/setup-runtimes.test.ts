@@ -323,7 +323,8 @@ describe("rig setup checks three runtimes and offers what is missing", () => {
       const nonePlan = await runSetup(none.deps, { dryRun: true, installs: ["pi"] });
       expect(step(nonePlan, "runtime_present")).toBeUndefined();
       expect(step(nonePlan, "kernel_runtime")?.message).toContain("no kernel runtime");
-      expect(step(nonePlan, "kernel_runtime")?.message).toContain("(after the runtimes chosen with --install)");
+      // Pi is not a kernel runtime, so the plan says nothing about the flag that added it.
+      expect(step(nonePlan, "kernel_runtime")?.message).not.toContain("--install");
       expect(installCommands(none.commands)).toEqual([]);
       expect(none.commands.sort()).toEqual([PROBES.claude, PROBES.codex, PROBES.pi]);
 
@@ -331,9 +332,15 @@ describe("rig setup checks three runtimes and offers what is missing", () => {
       const piOnly = fixture({ pi: true });
       const piPlan = await runSetup(piOnly.deps, { dryRun: true, installs: ["claude"] });
       expect(step(piPlan, "kernel_runtime")?.message).toContain("kernel runtime found: Claude Code");
-      expect(step(piPlan, "kernel_runtime")?.message).toContain("(after the runtimes chosen with --install)");
+      expect(step(piPlan, "kernel_runtime")?.message).toContain("(Claude Code with --install claude).");
       expect(installCommands(piOnly.commands)).toEqual([]);
       expect(piOnly.commands.sort()).toEqual([PROBES.claude, PROBES.codex, PROBES.pi]);
+
+      // The same runtime chosen by naming it in --providers is credited to that flag, not to --install.
+      const byProviders = fixture({ pi: true });
+      const providerPlan = await runSetup(byProviders.deps, { dryRun: true, providers: ["claude"] });
+      expect(step(providerPlan, "kernel_runtime")?.message).toContain("(Claude Code with --providers claude).");
+      expect(step(providerPlan, "kernel_runtime")?.message).not.toContain("--install");
     });
 
     it("carries the Pi-only kernel note and the none-present case as plan steps, not failures", async () => {

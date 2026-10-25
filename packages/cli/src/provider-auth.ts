@@ -123,11 +123,11 @@ export function checkCodexAuth(deps: ProviderAuthDeps, installed: boolean): Prov
   }
 }
 
-/** Read-only checks: neither installs a CLI nor starts a login or agent session. */
 /**
  * `rig doctor`'s runtime checks, under the rule `rig setup` uses: a runtime that is missing is
  * offered, not a failure, and only a machine with none of the three is unhealthy. Sign-in checks are
- * unchanged and run only for a runtime that is present; Pi has no sign-in check in OpenRig.
+ * unchanged and run only for a runtime that is present; Pi has no sign-in check in OpenRig. The whole
+ * function is read-only: it neither installs a CLI nor starts a login or an agent session.
  */
 export function checkProviderReadiness(deps: ProviderAuthDeps): ProviderCheck[] {
   const checks: ProviderCheck[] = [];

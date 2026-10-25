@@ -565,16 +565,27 @@ function dryRuntimeInstallMessage(info: RuntimeInfo, opts: { present: boolean; i
  * Code or Codex only, so a machine with neither has no kernel even when it is ready for Pi seats.
  * The wording claims only what was probed: it reports a runtime as found, never as able to start (its
  * sign-in is a separate step), and it never asserts readiness, because another step may have failed.
+ * `chosen` names, per runtime, the flag a dry run would credit for adding it; a runtime the person chose
+ * with `--providers` is never described as an `--install`.
  */
-function kernelRuntimeStep(present: ReadonlySet<SetupRuntime>, providers: readonly SetupProvider[] | undefined, dryRun = false, afterInstall = false): SetupStep {
+function kernelRuntimeStep(
+  present: ReadonlySet<SetupRuntime>,
+  providers: readonly SetupProvider[] | undefined,
+  dryRun = false,
+  chosen: ReadonlyMap<SetupRuntime, "install" | "providers"> = new Map(),
+): SetupStep {
   const prefix = dryRun ? "Dry run: " : "";
-  const suffix = dryRun && afterInstall ? " (after the runtimes chosen with --install)" : "";
+  // Only a kernel runtime the plan added says anything here, so the note belongs in the found sentence.
+  const added = RUNTIME_ORDER.filter((runtime) => RUNTIMES[runtime].kernel && chosen.has(runtime));
+  const suffix = added.length === 0
+    ? ""
+    : ` (${added.map((runtime) => `${RUNTIMES[runtime].label} with --${chosen.get(runtime)} ${runtime}`).join(", ")})`;
   const kernel = RUNTIME_ORDER.filter((runtime) => RUNTIMES[runtime].kernel && present.has(runtime)).map((runtime) => RUNTIMES[runtime].label);
   if (kernel.length === 0) {
     return {
       id: "kernel_runtime",
       status: dryRun ? "skipped" : "warn",
-      message: `${prefix}no kernel runtime (Claude Code or Codex) is available, so the kernel will not start; Pi seats can still run.${suffix}`,
+      message: `${prefix}no kernel runtime (Claude Code or Codex) is available, so the kernel will not start; Pi seats can still run.`,
       reason: "Kernel boot selects a Claude Code or Codex variant; Pi runs project seats only.",
       fixHint: "Start without the kernel with `rig daemon start --no-kernel`, or set OPENRIG_NO_KERNEL=1. For a kernel, install one: rig setup --install claude (or codex).",
     };
@@ -626,8 +637,13 @@ export async function runSetup(deps: SetupDeps, opts: { dryRun?: boolean; full?:
     // The plan decides readiness and the kernel note the way the run will: what is found, plus what an
     // explicit choice would install. Otherwise the plan contradicts the run it is supposed to predict.
     const planned = new Set(found);
+    const chosenBy = new Map<SetupRuntime, "install" | "providers">();
     for (const runtime of RUNTIME_ORDER) {
-      if (checked(runtime) && installChosen(runtime)) planned.add(runtime);
+      if (!checked(runtime) || !installChosen(runtime)) continue;
+      planned.add(runtime);
+      if (!found.has(runtime)) {
+        chosenBy.set(runtime, isKernelRuntime(runtime) && !!opts.providers?.includes(runtime as SetupProvider) ? "providers" : "install");
+      }
     }
     for (const id of stepIds) {
       const provider = (["claude", "codex"] as const).find((p) => id === `${p}_install` || id === `${p}_auth`);
@@ -654,7 +670,7 @@ export async function runSetup(deps: SetupDeps, opts: { dryRun?: boolean; full?:
       steps.push({ id, status: "skipped", message: platformSkip ?? `Dry run: ${id} would be attempted.` });
     }
     if (planned.size === 0) steps.push({ ...noRuntimeStep(), status: "skipped" });
-    else steps.push(kernelRuntimeStep(planned, opts.providers, true, planned.size !== found.size));
+    else steps.push(kernelRuntimeStep(planned, opts.providers, true, chosenBy));
     if (opts.policy !== undefined) {
       steps.push({ id: "policy_record", status: "skipped", message: `Dry run: would record permission_policy for '${opts.policy}'.` });
     }
