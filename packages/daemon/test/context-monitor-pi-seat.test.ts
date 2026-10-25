@@ -241,4 +241,47 @@ describe("ContextMonitor with a Pi seat", () => {
     expect(send).toHaveBeenCalledTimes(1);
     expect(send.mock.calls[0]?.[1]).toContain("compaction");
   });
+
+  it("a failed Pi seat whose runner reports ready is normalised to ready (F2)", async () => {
+    // Including pi/omp in getEligibleSessions also runs normalizeStartupStatus for them for the
+    // first time. This pins that behaviour, which was previously unannounced: the Pi readiness
+    // checker was registered but no Pi seat ever reached it.
+    const now = Date.parse("2026-10-02T12:00:00Z");
+    vi.spyOn(Date, "now").mockReturnValue(now);
+
+    const failed = seedSeat("pi", "dev.probe@pi-startup-failed");
+    const alreadyReady = seedSeat("pi", "dev.probe@pi-startup-ready", "dev.other");
+    const idOf = (name: string) =>
+      db.prepare("SELECT id FROM sessions WHERE session_name = ?").get(name) as { id: string };
+    db.prepare("UPDATE sessions SET startup_status = 'failed' WHERE session_name = ?").run(failed.sessionName);
+    db.prepare("UPDATE sessions SET startup_status = 'ready' WHERE session_name = ?").run(alreadyReady.sessionName);
+
+    const checkReady = vi.fn(async () => ({ ready: true }));
+    // The checker record is a private structural type on the constructor; derive it rather than
+    // name a module that does not export it.
+    const startupCheckers = { pi: { checkReady } } as unknown as
+      NonNullable<ConstructorParameters<typeof ContextMonitor>[4]>;
+    const startupMonitor = new ContextMonitor(db, store, undefined, undefined, startupCheckers);
+
+    await startupMonitor.pollOnce();
+
+    // Only the seat that needed it was probed — a ready seat is never re-probed, and the checker
+    // holds no database lock while observing the runtime.
+    expect(checkReady).toHaveBeenCalledTimes(1);
+    expect(checkReady.mock.calls[0]?.[0]).toMatchObject({ tmuxSession: failed.sessionName });
+
+    const statusOf = (name: string) =>
+      (db.prepare("SELECT startup_status FROM sessions WHERE session_name = ?").get(name) as { startup_status: string })
+        .startup_status;
+    expect(statusOf(failed.sessionName)).toBe("ready");
+    expect(statusOf(alreadyReady.sessionName)).toBe("ready");
+
+    // A runner that is not ready leaves the recorded status alone: the checker never demotes.
+    checkReady.mockResolvedValueOnce({ ready: false });
+    db.prepare("UPDATE sessions SET startup_status = 'failed' WHERE session_name = ?").run(failed.sessionName);
+    await startupMonitor.pollOnce();
+    expect(statusOf(failed.sessionName)).toBe("failed");
+
+    startupMonitor.stop();
+  });
 });
