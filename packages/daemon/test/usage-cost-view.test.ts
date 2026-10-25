@@ -159,6 +159,17 @@ describe("computeCostView", () => {
       window: { nativeSessionId: "019a-thread", asOf: "2026-10-13T10:04:00.000Z" }, tokens: { input: 5000, output: 400 } });
   });
 
+  it("a Pi-sourced context sample is no cost method: it says so, and invents no dollar figure", () => {
+    // The consumer that filters on `source` must not read a Pi sample as a Claude one. Pi's own cost
+    // comes from its persisted session entries (the pi_usage_entries path below), not from a
+    // context sidecar, so the honest answer here is "this sample carries no cost".
+    samples.appendContextSample({ nodeId: "n3", seatSession: "dev-pi@r", source: "pi_context_usage_json", sampledAt: "2026-10-13T10:04:00.000Z",
+      totalInputTokens: 61440, totalOutputTokens: null, usedPercentage: 30.72, nativeSessionId: "pi-native-1", clientCostEstimateUsd: null }, "2026-10-13T10:04:00.000Z");
+    const [seat] = computeCostView(db, { nowIso: NOW }).seats;
+    expect(seat).toEqual({ seatSession: "dev-pi@r", runtime: null, status: "unknown",
+      reason: "samples from source pi_context_usage_json carry no cost" });
+  });
+
   it("the route serves the view, filtered by seat; an empty series is an empty list", async () => {
     claude(samples, "2026-10-13T10:00:00.000Z", "s1", 0.4);
     const app = telemetryRoutes({ db: () => db, nowIso: () => NOW });

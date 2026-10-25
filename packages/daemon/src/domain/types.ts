@@ -1519,10 +1519,19 @@ export type ContextUnknownReason =
   | "stale_generation"
   | "no_data";
 
+/** The provenance of a context sample: who wrote the sidecar or event it came from. */
+export type ContextUsageSource =
+  | "claude_statusline_json"
+  | "codex_token_count_jsonl"
+  | "pi_context_usage_json";
+
 export interface ContextUsage {
   availability: ContextAvailability;
   reason: ContextUnknownReason | null;
-  source: "claude_statusline_json" | "codex_token_count_jsonl" | null;
+  /** Which writer produced the sample. A Pi or OMP seat's sidecar is written by the Pi-side
+   *  extension (pi-openrig-context), not by a Claude status line, and consumers may branch on this
+   *  value - keep the Claude literal reserved for Claude's own collector. */
+  source: ContextUsageSource | null;
   usedPercentage: number | null;
   remainingPercentage: number | null;
   contextWindowSize: number | null;

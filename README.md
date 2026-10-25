@@ -249,9 +249,11 @@ native session identity to the configured OpenRig daemon's `/api/activity/hooks`
 endpoint, using its activity token. That payload excludes prompt text and tool
 arguments. Claude's collector writes context/token usage, session/transcript-path
 metadata and available rate-limit data to the instance's `state/context-usage`
-and `state/provider-usage`. Provider and selected MCP connections have their own
-data flows. Daemon plugin initialization also checks the OpenRig plugin release
-endpoint on GitHub.
+and `state/provider-usage`. Every runtime's context reading, the sidecar contract
+behind them, and how a Pi seat gets one: [Context usage
+sources](docs/reference/context-usage-sources.md). Provider and selected MCP
+connections have their own data flows. Daemon plugin initialization also checks the
+OpenRig plugin release endpoint on GitHub.
 
 Managed launches supply `HOME`, `CODEX_HOME` and `OPENRIG_*` identity/connection
 variables. Claude uses `--permission-mode acceptEdits` and defaults to the classic
