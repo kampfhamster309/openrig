@@ -62,6 +62,7 @@ Each step is explained in [docs/setup.md](docs/setup.md).
 | `dispatcher/` | `rig-dispatch`, `team.env` (the environment every team pod gets), and tests that run without a cluster. |
 | `create-secrets.sh` | Creates the Secrets interactively. |
 | `single-host/` | Optional: one long-lived host driven by hand. |
+| `demo/` | A 15-minute live demo of the whole flow on a small cluster: [RUNSHEET.md](demo/RUNSHEET.md), `prepare.sh`, `cleanup.sh`, the team briefs and the repository they work on. |
 | `docs/` | The documentation above. |
 
 ## Tests
@@ -70,7 +71,8 @@ Each step is explained in [docs/setup.md](docs/setup.md).
 bash deploy/kubernetes/dispatcher/test/archive-test.sh
 bash deploy/kubernetes/dispatcher/test/watch-test.sh
 bash deploy/kubernetes/dispatcher/test/hub-sync-test.sh
+bash deploy/kubernetes/demo/test/demo-scripts-test.sh
 ```
 
-All three use a fake `kubectl` and need no cluster. The OpenRig tests for the fleet reads, CLI and TUI are
+All four use a fake `kubectl` and need no cluster. The OpenRig tests for the fleet reads, CLI and TUI are
 listed in [docs/reference.md](docs/reference.md#tests).
