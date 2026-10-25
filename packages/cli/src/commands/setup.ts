@@ -10,7 +10,7 @@ import { runDoctorChecks, type DoctorDeps } from "./doctor.js";
 import { resolveDaemonPath } from "../daemon-lifecycle.js";
 import { ConfigStore } from "../config-store.js";
 import { buildTmuxControlFailure, probeTmuxControl } from "../tmux-health.js";
-import { checkClaudeAuth, checkCodexAuth } from "../provider-auth.js";
+import { checkClaudeAuth, checkCodexAuth, PI_PRESENT_MESSAGE } from "../provider-auth.js";
 import { describeSkillRouterFootprint } from "@openrig/daemon/router-line";
 
 export interface SetupStep {
@@ -89,7 +89,7 @@ interface RuntimeInfo {
   runtime: SetupRuntime;
   stepId: string;
   label: string;
-  /** Read-only probe: a version call, never a launch. */
+  /** A version call: no install, no OpenRig write. Never a launch. */
   probe: string;
   npmPackage: string;
   /** The one question an installing agent asks about a missing runtime. */
@@ -118,9 +118,6 @@ const RUNTIMES: Record<SetupRuntime, RuntimeInfo> = {
     failReason: "Pi seats need the Pi CLI installed on this machine.",
   },
 };
-
-/** Pi's model and provider live in Pi's own config; OpenRig never signs Pi in and must not imply it does. */
-const PI_PRESENT_MESSAGE = "Pi available. Pi's model and provider are configured in Pi (for example its models.json), not by OpenRig.";
 
 const RUNTIME_STEP_IDS = new Map<string, RuntimeInfo>(RUNTIME_ORDER.map((r) => [RUNTIMES[r].stepId, RUNTIMES[r]]));
 
@@ -512,7 +509,7 @@ export function parseSetupInstalls(value: string): SetupRuntime[] | { error: str
   return RUNTIME_ORDER.filter((runtime) => chosen.has(runtime));
 }
 
-/** Read-only: is the runtime's CLI on PATH? A failed version probe reads as absent. */
+/** OpenRig's own sense of read-only: a version call, no install and no OpenRig write. */
 function runtimePresent(deps: SetupDeps, info: RuntimeInfo): boolean {
   try {
     deps.exec(info.probe);
@@ -565,25 +562,27 @@ function dryRuntimeInstallMessage(info: RuntimeInfo, opts: { present: boolean; i
 
 /**
  * The kernel consequence, said at setup time rather than at daemon start. The kernel boots from Claude
- * Code or Codex only, so a Pi-only machine is ready for seats yet has no kernel (kernel-boot.ts).
+ * Code or Codex only, so a machine with neither has no kernel even when it is ready for Pi seats.
+ * The wording claims only what was probed: it reports a runtime as found, never as able to start (its
+ * sign-in is a separate step), and it never asserts readiness, because another step may have failed.
  */
-function kernelRuntimeStep(present: ReadonlySet<SetupRuntime>, providers: readonly SetupProvider[] | undefined, dryRun = false): SetupStep {
+function kernelRuntimeStep(present: ReadonlySet<SetupRuntime>, providers: readonly SetupProvider[] | undefined, dryRun = false, afterInstall = false): SetupStep {
   const prefix = dryRun ? "Dry run: " : "";
+  const suffix = dryRun && afterInstall ? " (after the runtimes chosen with --install)" : "";
   const kernel = RUNTIME_ORDER.filter((runtime) => RUNTIMES[runtime].kernel && present.has(runtime)).map((runtime) => RUNTIMES[runtime].label);
   if (kernel.length === 0) {
     return {
       id: "kernel_runtime",
       status: dryRun ? "skipped" : "warn",
-      message: `${prefix}only Pi is present, so setup is ready, but the kernel will not start: it needs Claude Code or Codex.`,
+      message: `${prefix}no kernel runtime (Claude Code or Codex) is available, so the kernel will not start; Pi seats can still run.${suffix}`,
       reason: "Kernel boot selects a Claude Code or Codex variant; Pi runs project seats only.",
       fixHint: "Start without the kernel with `rig daemon start --no-kernel`, or set OPENRIG_NO_KERNEL=1. For a kernel, install one: rig setup --install claude (or codex).",
     };
   }
-  const names = kernel.join(" and ");
   return {
     id: "kernel_runtime",
     status: dryRun ? "skipped" : "pass",
-    message: `${prefix}the kernel can start with ${names}.`,
+    message: `${prefix}kernel runtime found: ${kernel.join(" and ")}${suffix}.`,
     ...(providers
       ? { reason: `provider.selected is saved as ${providersValue(providers)}, so the kernel's first boot uses that.` }
       : { reason: "provider.selected is not set, so the kernel's first boot uses every signed-in provider that is present." }),
@@ -612,17 +611,27 @@ export async function runSetup(deps: SetupDeps, opts: { dryRun?: boolean; full?:
   // A runtime is installed only on an explicit choice: --install, or naming a kernel provider in --providers.
   const installChosen = (runtime: SetupRuntime) =>
     (opts.installs?.includes(runtime) ?? false) || (isKernelRuntime(runtime) && !!opts.providers?.includes(runtime as SetupProvider));
+  // A runtime --providers leaves out is not checked, unless --install names it anyway: an explicit
+  // yes is never dropped. provider.selected still records only --providers, the kernel providers.
+  const checked = (runtime: SetupRuntime) =>
+    !isKernelRuntime(runtime) || selected(runtime as SetupProvider) || !!opts.installs?.includes(runtime);
 
   if (opts.dryRun) {
-    // Detection is a read-only version probe, so the plan can say what was found. Nothing is installed, written or launched.
+    // Detection is a version call (no install, no OpenRig write), so the plan can say what was found.
     const found = new Set<SetupRuntime>();
     for (const runtime of RUNTIME_ORDER) {
-      if (isKernelRuntime(runtime) && !selected(runtime as SetupProvider)) continue;
+      if (!checked(runtime)) continue;
       if (runtimePresent(deps, RUNTIMES[runtime])) found.add(runtime);
+    }
+    // The plan decides readiness and the kernel note the way the run will: what is found, plus what an
+    // explicit choice would install. Otherwise the plan contradicts the run it is supposed to predict.
+    const planned = new Set(found);
+    for (const runtime of RUNTIME_ORDER) {
+      if (checked(runtime) && installChosen(runtime)) planned.add(runtime);
     }
     for (const id of stepIds) {
       const provider = (["claude", "codex"] as const).find((p) => id === `${p}_install` || id === `${p}_auth`);
-      if (provider && !selected(provider)) {
+      if (provider && !checked(provider)) {
         steps.push(notSelectedSteps(provider, opts.providers!).find((step) => step.id === id)!);
         continue;
       }
@@ -644,8 +653,8 @@ export async function runSetup(deps: SetupDeps, opts: { dryRun?: boolean; full?:
         : platform !== "darwin" ? NON_DARWIN_DRY_RUN_SKIPS[id] : undefined;
       steps.push({ id, status: "skipped", message: platformSkip ?? `Dry run: ${id} would be attempted.` });
     }
-    if (found.size === 0) steps.push({ ...noRuntimeStep(), status: "skipped" });
-    else steps.push(kernelRuntimeStep(found, opts.providers, true));
+    if (planned.size === 0) steps.push({ ...noRuntimeStep(), status: "skipped" });
+    else steps.push(kernelRuntimeStep(planned, opts.providers, true, planned.size !== found.size));
     if (opts.policy !== undefined) {
       steps.push({ id: "policy_record", status: "skipped", message: `Dry run: would record permission_policy for '${opts.policy}'.` });
     }
@@ -720,7 +729,7 @@ export async function runSetup(deps: SetupDeps, opts: { dryRun?: boolean; full?:
   let installFailed = false;
   for (const runtime of RUNTIME_ORDER) {
     const info = RUNTIMES[runtime];
-    if (isKernelRuntime(runtime) && !selected(runtime as SetupProvider)) {
+    if (!checked(runtime)) {
       steps.push(...notSelectedSteps(runtime as SetupProvider, opts.providers!));
       continue;
     }

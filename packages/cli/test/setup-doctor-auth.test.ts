@@ -84,14 +84,32 @@ describe("setup and doctor provider facts", () => {
     expect(check?.message).toBe(result.steps.find((step) => step.id === "codex_auth")?.message);
   });
 
-  it("reports missing CLIs without installing or attempting authentication", () => {
+  it("reports missing CLIs as an offer, not a failure, without installing or attempting authentication", () => {
     const { doctor, commands } = fixture({ missingCli: ["claude", "codex"] });
     const { checks } = runDoctorChecks(doctor);
     for (const name of ["claude", "codex"]) {
-      expect(checks.find((check) => check.name === `${name}_install`)?.status).toBe("fail");
+      // A runtime the person does not use is not a doctor failure, and Pi is present on this machine.
+      expect(checks.find((check) => check.name === `${name}_install`)?.status).toBe("warn");
+      expect(checks.find((check) => check.name === `${name}_install`)?.fix).toContain(`rig setup --install ${name}`);
       expect(checks.find((check) => check.name === `${name}_auth`)?.status).toBe("skipped");
     }
+    expect(checks.find((check) => check.name === "pi_install")?.status).toBe("pass");
+    expect(checks.find((check) => check.name === "runtime_present")).toBeUndefined();
     expect(commands.filter((command) => /claude|codex|npm/.test(command))).toEqual(["claude --version", "codex --version"]);
+  });
+
+  it("fails doctor only when none of the three runtimes is present", () => {
+    const { doctor, commands } = fixture({ missingCli: ["claude", "codex", "pi"] });
+    const runtimeNames = ["claude_install", "claude_auth", "codex_install", "codex_auth", "pi_install", "runtime_present"];
+    const checks = runDoctorChecks(doctor).checks.filter((check) => runtimeNames.includes(check.name));
+    expect(checks.map((check) => [check.name, check.status])).toEqual([
+      ["claude_install", "warn"], ["claude_auth", "skipped"],
+      ["codex_install", "warn"], ["codex_auth", "skipped"],
+      ["pi_install", "warn"], ["runtime_present", "fail"],
+    ]);
+    expect(checks.find((check) => check.name === "runtime_present")?.fix).toContain("rig setup --install");
+    // Pi is probed, and it has no sign-in check of its own.
+    expect(commands.filter((command) => /claude|codex|pi|npm/.test(command))).toEqual(["claude --version", "codex --version", "pi --version"]);
   });
 
   it.each([false, true])("doctor login failure is visible and exits 1 (json=%s)", async (json) => {

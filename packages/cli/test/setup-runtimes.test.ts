@@ -137,9 +137,11 @@ describe("rig setup checks three runtimes and offers what is missing", () => {
 
       expect(step(result, "kernel_runtime")).toMatchObject({
         status: "warn",
-        message: expect.stringContaining("the kernel will not start: it needs Claude Code or Codex"),
+        message: expect.stringContaining("no kernel runtime (Claude Code or Codex) is available, so the kernel will not start"),
         fixHint: expect.stringContaining("rig daemon start --no-kernel"),
       });
+      // It says what was found, never that setup is ready: another step may have failed.
+      expect(step(result, "kernel_runtime")?.message).not.toMatch(/ready/);
       expect(step(result, "kernel_runtime")!.fixHint).toContain("OPENRIG_NO_KERNEL=1");
       // The kernel note is information, not a failure: Pi-only setup is ready.
       expect(result.ready).toBe(true);
@@ -150,7 +152,7 @@ describe("rig setup checks three runtimes and offers what is missing", () => {
       const result = await runSetup(deps, {});
 
       for (const runtime of RUNTIMES) expect(step(result, `${runtime}_install`)?.status).toBe("pass");
-      expect(step(result, "kernel_runtime")).toMatchObject({ status: "pass", message: expect.stringContaining("Claude Code and Codex") });
+      expect(step(result, "kernel_runtime")?.message).toContain("kernel runtime found: Claude Code and Codex");
       expect(RUNTIMES.map((r) => step(result, `${r}_install`)!.status)).toEqual(["pass", "pass", "pass"]);
       expect(installCommands(commands)).toEqual([]);
       expect(result.ready).toBe(true);
@@ -264,6 +266,21 @@ describe("rig setup checks three runtimes and offers what is missing", () => {
       expect(installCommands(commands)).toEqual([`npm install -g ${PACKAGES.claude}`, `npm install -g ${PACKAGES.pi}`]);
     });
 
+    it("--install naming a runtime --providers left out is honoured: the union, in the run and the plan", async () => {
+      const real = fixture({ codex: true });
+      const result = await runSetup(real.deps, { providers: ["codex"], installs: ["claude"] });
+
+      // The explicit yes is not silently dropped by the provider exclusion.
+      expect(step(result, "claude_install")?.status).toBe("applied");
+      expect(installCommands(real.commands)).toEqual([`npm install -g ${PACKAGES.claude}`]);
+      // provider.selected still records only --providers, the kernel providers.
+      expect((real.deps.recordProviders as ReturnType<typeof vi.fn>).mock.calls).toEqual([["codex"]]);
+
+      const plan = await runSetup(fixture({ codex: true }).deps, { dryRun: true, providers: ["codex"], installs: ["claude"] });
+      expect(step(plan, "claude_install")?.message).toContain("would be installed");
+      expect(step(plan, "claude_install")?.message).not.toContain("Not selected");
+    });
+
     it("a bare run records nothing, so the kernel's first boot uses every signed-in provider present", async () => {
       const recordProviders = vi.fn();
       const { deps } = fixture({ claude: true });
@@ -286,7 +303,7 @@ describe("rig setup checks three runtimes and offers what is missing", () => {
       expect(step(result, "codex_install")?.message).toContain("would be offered, not installed");
       expect(step(result, "codex_install")?.message).toContain("rig setup --install codex");
       expect(step(result, "pi_install")?.message).toContain("would be offered, not installed");
-      expect(step(result, "kernel_runtime")?.message).toContain("Dry run: the kernel can start with Claude Code");
+      expect(step(result, "kernel_runtime")?.message).toContain("Dry run: kernel runtime found: Claude Code");
       // Detection is the read-only version probe; nothing is installed.
       expect(commands.sort()).toEqual([PROBES.claude, PROBES.codex, PROBES.pi]);
     });
@@ -298,6 +315,25 @@ describe("rig setup checks three runtimes and offers what is missing", () => {
 
       const byProviders = await runSetup(fixture({}).deps, { dryRun: true, providers: ["claude"] });
       expect(step(byProviders, "claude_install")?.message).toContain("--providers claude");
+    });
+
+    it("counts a chosen install in the plan, so the plan matches the run it predicts", async () => {
+      // Nothing present + --install pi: the run would apply Pi and report no runtime_present, so neither may the plan.
+      const none = fixture({});
+      const nonePlan = await runSetup(none.deps, { dryRun: true, installs: ["pi"] });
+      expect(step(nonePlan, "runtime_present")).toBeUndefined();
+      expect(step(nonePlan, "kernel_runtime")?.message).toContain("no kernel runtime");
+      expect(step(nonePlan, "kernel_runtime")?.message).toContain("(after the runtimes chosen with --install)");
+      expect(installCommands(none.commands)).toEqual([]);
+      expect(none.commands.sort()).toEqual([PROBES.claude, PROBES.codex, PROBES.pi]);
+
+      // Pi only + --install claude: the run gets a kernel runtime, so the plan must not say it has none.
+      const piOnly = fixture({ pi: true });
+      const piPlan = await runSetup(piOnly.deps, { dryRun: true, installs: ["claude"] });
+      expect(step(piPlan, "kernel_runtime")?.message).toContain("kernel runtime found: Claude Code");
+      expect(step(piPlan, "kernel_runtime")?.message).toContain("(after the runtimes chosen with --install)");
+      expect(installCommands(piOnly.commands)).toEqual([]);
+      expect(piOnly.commands.sort()).toEqual([PROBES.claude, PROBES.codex, PROBES.pi]);
     });
 
     it("carries the Pi-only kernel note and the none-present case as plan steps, not failures", async () => {
