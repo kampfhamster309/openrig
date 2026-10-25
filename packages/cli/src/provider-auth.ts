@@ -10,11 +10,14 @@ export interface ProviderAuthDeps {
 
 export interface ProviderCheck {
   name: string;
-  status: "pass" | "fail" | "skipped";
+  status: "pass" | "warn" | "fail" | "skipped";
   message: string;
   reason?: string;
   fix?: string;
 }
+
+/** Pi's model and provider live in Pi's own config; OpenRig never signs Pi in and must not imply it does. */
+export const PI_PRESENT_MESSAGE = "Pi available. Pi's model and provider are configured in Pi (for example its models.json), not by OpenRig.";
 
 /** Issue #194 — how the Codex provider selected in `$CODEX_HOME/config.toml`
  *  authenticates. Only an explicit provider entry with
@@ -120,26 +123,43 @@ export function checkCodexAuth(deps: ProviderAuthDeps, installed: boolean): Prov
   }
 }
 
-/** Read-only checks: neither installs a CLI nor starts a login or agent session. */
+/**
+ * `rig doctor`'s runtime checks, under the rule `rig setup` uses: a runtime that is missing is
+ * offered, not a failure, and only a machine with none of the three is unhealthy. Sign-in checks are
+ * unchanged and run only for a runtime that is present; Pi has no sign-in check in OpenRig. The whole
+ * function is read-only: it neither installs a CLI nor starts a login or an agent session.
+ */
 export function checkProviderReadiness(deps: ProviderAuthDeps): ProviderCheck[] {
   const checks: ProviderCheck[] = [];
-  for (const [command, label, auth] of [
-    ["claude", "Claude Code", checkClaudeAuth],
-    ["codex", "Codex", checkCodexAuth],
-  ] as const) {
+  const runtimes = [
+    { command: "claude", label: "Claude Code", npmPackage: "@anthropic-ai/claude-code", auth: checkClaudeAuth },
+    { command: "codex", label: "Codex", npmPackage: "@openai/codex", auth: checkCodexAuth },
+    { command: "pi", label: "Pi", npmPackage: "@earendil-works/pi-coding-agent", auth: null },
+  ] as const;
+  let present = 0;
+  for (const { command, label, npmPackage, auth } of runtimes) {
     let installed = false;
     try {
       deps.exec(`${command} --version`);
       installed = true;
-      checks.push({ name: `${command}_install`, status: "pass", message: `${label} available.` });
+      present += 1;
+      checks.push({ name: `${command}_install`, status: "pass", message: command === "pi" ? PI_PRESENT_MESSAGE : `${label} available.` });
     } catch {
       checks.push({
-        name: `${command}_install`, status: "fail", message: `${label} not found.`,
-        reason: `${label} authentication cannot be checked until its CLI is installed.`,
-        fix: "Run `rig setup` to install the runtime, then rerun `rig doctor`.",
+        name: `${command}_install`, status: "warn", message: `${label} not found.`,
+        reason: `${label} is not installed. OpenRig needs at least one of Claude Code, Codex or Pi, so a runtime you do not use is not a failure.`,
+        fix: `Install it with \`rig setup --install ${command}\` (or \`npm install -g ${npmPackage}\`), then rerun \`rig doctor\`.`,
       });
     }
-    checks.push(auth(deps, installed));
+    if (auth) checks.push(auth(deps, installed));
+  }
+  if (present === 0) {
+    checks.push({
+      name: "runtime_present", status: "fail",
+      message: "No OpenRig runtime is installed: Claude Code, Codex and Pi are all missing.",
+      reason: "OpenRig needs at least one of Claude Code, Codex or Pi to run seats.",
+      fix: "Install at least one: rig setup --install claude (or codex, or pi; names combine), then rerun rig doctor.",
+    });
   }
   return checks;
 }

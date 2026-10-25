@@ -55,7 +55,8 @@ install_main() {
     '  [3/4] rig setup --dry-run' \
     "        Show the installed version's setup plan without applying it." \
     '  [4/4] rig setup' \
-    '        Checks both Claude Code and Codex; may install missing tools.' \
+    '        Checks Claude Code, Codex and Pi; one present is enough. A missing one is offered,' \
+    '        never installed: rig setup --install claude|codex|pi installs what you chose.' \
     '        Checks tmux and writes its defaults. rig setup installs herdr by default;' \
     '        an unavailable herdr install is a warning. Existing cmux settings stay unchanged.' \
     '        On macOS, an installing agent offers Ghostty; rig setup --ghostty attempts it after acceptance.' \

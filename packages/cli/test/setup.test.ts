@@ -183,11 +183,14 @@ describe("rig setup", () => {
     expect(exitCode).toBeUndefined(); // undefined means 0
   });
 
-  it("--dry-run does not make mutating exec calls", async () => {
+  it("--dry-run probes runtimes read-only and never installs or writes", async () => {
     const execSpy = vi.fn(() => "");
-    const deps = makeDeps({ exec: execSpy });
+    const writeSpy = vi.fn();
+    const deps = makeDeps({ exec: execSpy, writeFile: writeSpy });
     await runSetup(deps, { dryRun: true });
-    expect(execSpy).not.toHaveBeenCalled();
+    // The plan says what was found, so the only commands are the read-only version probes. Nothing installs.
+    expect(execSpy.mock.calls.map(([cmd]) => cmd).sort()).toEqual(["claude --version", "codex --version", "pi --version"]);
+    expect(writeSpy).not.toHaveBeenCalled();
   });
 
   it("--dry-run on linux reports the macOS-only steps as skipped with the real run's reasons", async () => {
@@ -415,7 +418,7 @@ describe("rig setup", () => {
     expect(gh?.status).toBe("pass");
   });
 
-  it("installs missing Claude Code with npm and verifies auth", async () => {
+  it("installs a missing Claude Code the person chose with --install, and verifies auth", async () => {
     let claudeInstalled = false;
     const deps = makeDeps({
       exec: (cmd: string) => {
@@ -438,7 +441,7 @@ describe("rig setup", () => {
       },
     });
 
-    const result = await runSetup(deps, {});
+    const result = await runSetup(deps, { installs: ["claude"] });
 
     const claudeInstall = result.steps.find((s) => s.id === "claude_install");
     expect(claudeInstall?.status).toBe("applied");
@@ -669,7 +672,7 @@ describe("rig setup", () => {
       },
     });
 
-    const result = await runSetup(deps, {});
+    const result = await runSetup(deps, { installs: ["claude", "codex"] });
 
     expect(result.ready).toBe(true);
     expect(seenTimeouts.get("npm install -g @anthropic-ai/claude-code")).toBe(300000);
@@ -985,7 +988,8 @@ describe("codex_auth — provider-aware Codex readiness (#194)", () => {
       codexInstalled: false,
     });
     const result = await runSetup(deps, {});
-    expect(result.steps.find((s) => s.id === "codex_install")?.status).toBe("fail");
+    // A missing runtime nobody asked for is an offer, not a failure; the sign-in check still cannot run.
+    expect(result.steps.find((s) => s.id === "codex_install")?.status).toBe("skipped");
     expect(codexAuthStep(result)?.status).toBe("skipped");
   });
 });
@@ -1013,10 +1017,16 @@ describe("--providers: a provider the person didn't choose reads not selected, n
     expect(result.ready).toBe(true);
   });
 
-  it("without --providers still installs and checks both, so the same machine reads failed for Codex", async () => {
-    const result = await runSetup(claudeOnlyMachine([]), {});
-    expect(result.steps.find((s) => s.id === "codex_install")?.status).toBe("fail");
-    expect(result.ready).toBe(false);
+  it("without --providers a missing Codex is offered, not installed, and setup stays ready", async () => {
+    const execs: string[] = [];
+    const result = await runSetup(claudeOnlyMachine(execs), {});
+    expect(result.steps.find((s) => s.id === "codex_install")).toMatchObject({
+      status: "skipped",
+      message: expect.stringContaining("ask once, 'Install Codex for OpenRig seats?'"),
+      fixHint: expect.stringContaining("--install codex"),
+    });
+    expect(execs.filter((cmd) => cmd.includes("npm install"))).toEqual([]);
+    expect(result.ready).toBe(true);
   });
 
   it("still reads failed for a provider the person chose", async () => {
@@ -1025,10 +1035,10 @@ describe("--providers: a provider the person didn't choose reads not selected, n
     expect(result.ready).toBe(false);
   });
 
-  it("names a provider left out in the dry-run plan", async () => {
+  it("names a provider left out in the dry-run plan, and what detection found for the rest", async () => {
     const result = await runSetup(makeDeps(), { dryRun: true, providers: ["codex"] });
     expect(result.steps.find((s) => s.id === "claude_install")?.message).toContain("Not selected");
-    expect(result.steps.find((s) => s.id === "codex_install")?.message).toContain("would be attempted");
+    expect(result.steps.find((s) => s.id === "codex_install")?.message).toContain("Dry run: found Codex");
   });
 
   it("records the choice as provider.selected, in a fixed order, so kernel boot can honour it", async () => {

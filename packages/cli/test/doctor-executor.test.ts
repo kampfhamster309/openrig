@@ -50,11 +50,12 @@ describe("doctor default executor", () => {
     const body = JSON.parse(vi.mocked(console.log).mock.calls[0]![0] as string);
     expect(body.checks.find((check: { name: string }) => check.name === "tmux").status).toBe("pass");
     const calls = fixture.exec.mock.calls as Array<[string, { timeout?: number }]>;
-    const prior = calls.filter(([command]) => !/^(claude|codex) /.test(command));
+    // Pi is a provider probe too, so it carries the same bound as Claude Code's and Codex's.
+    const prior = calls.filter(([command]) => !/^(claude|codex|pi) /.test(command));
     expect(prior.some(([command]) => command === "tmux list-sessions")).toBe(true);
     expect(prior.every(([,options]) => !Object.hasOwn(options, "timeout"))).toBe(true);
-    const auth = calls.filter(([command]) => /^(claude|codex) /.test(command));
-    expect(auth.map(([command]) => command)).toEqual(["claude --version", "claude auth status", "codex --version", "codex login status"]);
+    const auth = calls.filter(([command]) => /^(claude|codex|pi) /.test(command));
+    expect(auth.map(([command]) => command)).toEqual(["claude --version", "claude auth status", "codex --version", "codex login status", "pi --version"]);
     expect(auth.every(([,options]) => options.timeout === 30_000)).toBe(true);
   });
 
