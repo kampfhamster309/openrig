@@ -528,11 +528,13 @@ function runtimeInstallStep(deps: SetupDeps, info: RuntimeInfo, install: boolean
     return { id: info.stepId, status: "pass", message: info.runtime === "pi" ? PI_PRESENT_MESSAGE : `${info.label} available.` };
   }
   if (!install) {
+    // The "names combine" example has to name a SECOND runtime, so it never reads "--install codex,codex".
+    const companion = RUNTIME_ORDER.find((runtime) => runtime !== info.runtime) ?? info.runtime;
     return {
       id: info.stepId,
       status: "skipped",
       message: `Installing agent: ask once, '${info.question}'`,
-      fixHint: `On Yes, rerun rig setup with --install ${info.runtime}, preserving earlier choices such as --no-herdr and --providers (names combine: --install ${info.runtime},codex). That runs \`npm install -g ${info.npmPackage}\`. On No, pass nothing: a runtime you did not choose is never a failure. The person types no command.`,
+      fixHint: `On Yes, rerun rig setup with --install ${info.runtime}, preserving earlier choices such as --no-herdr and --providers (names combine: --install ${info.runtime},${companion}). That runs \`npm install -g ${info.npmPackage}\`. On No, pass nothing: a runtime you did not choose is never a failure. The person types no command.`,
     };
   }
   try {

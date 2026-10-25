@@ -87,6 +87,8 @@ describe("rig setup checks three runtimes and offers what is missing", () => {
           message: expect.stringContaining("ask once"),
           fixHint: expect.stringContaining(`--install ${runtime}`),
         });
+        // The "names combine" example shows a real combination, not "--install codex,codex".
+        expect(step(result, `${runtime}_install`)!.fixHint).not.toContain(`--install ${runtime},${runtime}`);
       }
       expect(installCommands(commands)).toEqual([]);
       const failures = result.steps.filter((s) => s.status === "fail");
