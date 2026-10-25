@@ -65,7 +65,7 @@ agent CLIs and OpenRig packed from this checkout. Its entrypoint runs the daemon
 ```bash
 docker login <registry>
 IMAGE=<registry>/<org>/openrig-host deploy/kubernetes/build-image.sh --push
-# the last line is the image reference, for example <registry>/<org>/openrig-host:0.7.0-4abf6df1f
+# the last line is the image reference, for example <registry>/<org>/openrig-host:0.7.0-44515b785
 ```
 
 - The tag is `<OpenRig version>-<short commit>`. If `packages/` or `deploy/kubernetes/image/` have
