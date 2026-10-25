@@ -202,8 +202,8 @@ and Pi and offers a missing one instead of installing it, as described below. A 
 `FAILED [n/4] <command or check> (exit <code>)`. Where a provider isn't signed in yet, step 4 ends that way and
 `rig setup` lists each sign-in under "Some steps need attention". If the only remaining failures are provider
 sign-ins, the install steps finished: sign in to each selected provider as below, then continue at
-[Start the kernel](#start-the-kernel-and-check-its-state). To install only what the selected providers need, go step
-by step instead:
+[Start the kernel](#start-the-kernel-and-check-its-state). To check only the providers you use (and install one if it is
+missing), go step by step instead:
 
 ### Choose your providers
 
@@ -228,7 +228,8 @@ missing one instead of installing it. Installation needs your choice: `rig setup
 --install claude` (or `codex`, or `pi`) installs what you name, and one of the three
 present is enough to be ready. Passing the person's provider choice,
 `rig setup --providers claude` (or `codex`), leaves the other out, so it reads not
-selected instead of failed, and installs a chosen provider that is missing. On
+selected instead of failed, and installs a chosen provider that is missing (`--install` adds to this choice rather than
+replacing it). On
 macOS it uses an existing Homebrew (it does not install Homebrew) to install a
 missing tmux (elsewhere tmux is checked, not installed). Herdr installs on
 macOS and Linux; pass `--no-herdr` to decline it. Setup also
@@ -943,8 +944,8 @@ same). **r** reads actual state again; **d** expands details.
 Explicit CLI daemon startup retains its automatic kernel behavior. The TUI
 starts the daemon with kernel auto-boot disabled so the user can select seats:
 
-- `rig setup` checks and verifies the runtimes (it installs only what `--install` names); it does not start the daemon
-  or the kernel.
+- `rig setup` checks and verifies the runtimes (it installs a runtime only when you name it, with `--install` or
+  `--providers`); it does not start the daemon or the kernel.
 - The kernel boots from Claude Code or Codex only. With just Pi installed, setup is ready and project seats run, but
   the kernel will not start: run `rig daemon start --no-kernel`, or set `OPENRIG_NO_KERNEL=1`.
 - Starting the daemon (`rig daemon start`, or implicitly via `rig up` or `rig context add`) is what

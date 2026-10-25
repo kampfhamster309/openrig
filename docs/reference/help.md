@@ -25,7 +25,8 @@ rig doctor --json
 
 Use the installed command's `--help` if an option is unavailable. Read the diagnostic findings; don't treat them as
 instructions to reset the machine. `rig doctor` checks Claude and Codex authentication using the same local checks
-as setup, including a configured Codex provider credential variable. A set variable does not prove that the provider accepts it or that managed
+as setup, including a configured Codex provider credential variable, and — like setup — it treats a runtime that is not
+installed as an offer rather than a failure, failing only when none of Claude Code, Codex or Pi is present. A set variable does not prove that the provider accepts it or that managed
 seats receive it. Doctor does not run an agent task: also inspect `rig ps --nodes --rig <rig>`. If the daemon is involved, `rig daemon status` and `rig daemon logs` show its state
 and recent output.
 
