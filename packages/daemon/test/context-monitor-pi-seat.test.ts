@@ -69,12 +69,12 @@ describe("ContextMonitor with a Pi seat", () => {
   }
 
   /** The real fixture, with `sampled_at` moved to `atMs` and the percentage set. */
-  function writePiSidecar(sessionName: string, atMs: number, usedPercentage = 30.72) {
+  function writePiSidecar(sessionName: string, atMs: number, usedPercentage = 31) {
     const raw = JSON.parse(readFileSync(join(__dirname, "fixtures", PI_SIDECAR_FIXTURE), "utf-8"));
     raw.session_name = sessionName;
     raw.sampled_at = new Date(atMs).toISOString();
     raw.context_window.used_percentage = usedPercentage;
-    raw.context_window.remaining_percentage = Number((100 - usedPercentage).toFixed(2));
+    raw.context_window.remaining_percentage = 100 - Math.round(usedPercentage);
     const file = sidecarPath(sessionName);
     mkdirSync(join(tmpDir, "state", "context-usage"), { recursive: true });
     writeFileSync(file, JSON.stringify(raw));
@@ -113,8 +113,12 @@ describe("ContextMonitor with a Pi seat", () => {
 
     expect(usage.availability).toBe("known");
     expect(usage.source).toBe("pi_context_usage_json");
-    expect(usage.usedPercentage).toBe(30.72);
-    expect(usage.remainingPercentage).toBe(69.28);
+    // The writer rounds: Pi's float percent becomes a whole number, as Claude's and Codex's writers
+    // deliver it, because OpenRig prints this value as written. The exact figure stays in
+    // currentUsage, which is provenance rather than a display value.
+    expect(usage.usedPercentage).toBe(31);
+    expect(usage.remainingPercentage).toBe(69);
+    expect(JSON.parse(String(usage.currentUsage)).percent).toBe(30.72);
     expect(usage.contextWindowSize).toBe(200000);
     expect(usage.totalInputTokens).toBe(61440);
     expect(usage.totalOutputTokens).toBeNull();
@@ -141,7 +145,7 @@ describe("ContextMonitor with a Pi seat", () => {
 
     const usage = store.getForNode(node.id, sessionName);
     expect(usage.availability).toBe("known");
-    expect(usage.usedPercentage).toBe(30.72);
+    expect(usage.usedPercentage).toBe(31);
     expect(usage.source).toBe("pi_context_usage_json");
     expect(usage.fresh).toBe(true);
     // A Pi seat gets no Claude collector: OpenRig writes nothing into a seat's Pi agent directory.
@@ -175,7 +179,7 @@ describe("ContextMonitor with a Pi seat", () => {
     await monitor.pollOnce();
     const usage = store.getForNode(node.id, sessionName);
     expect(usage.availability).toBe("known");
-    expect(usage.usedPercentage).toBe(30.72);
+    expect(usage.usedPercentage).toBe(31);
   });
 
   it("marks a Pi sample stale by the same freshness rule as a Claude one", async () => {
