@@ -136,7 +136,7 @@ export function checkProviderReadiness(deps: ProviderAuthDeps): ProviderCheck[] 
       checks.push({
         name: `${command}_install`, status: "fail", message: `${label} not found.`,
         reason: `${label} authentication cannot be checked until its CLI is installed.`,
-        fix: "Run `rig setup` to install the runtime, then rerun `rig doctor`.",
+        fix: `Run \`rig setup --install ${command}\` to install it, then rerun \`rig doctor\`.`,
       });
     }
     checks.push(auth(deps, installed));

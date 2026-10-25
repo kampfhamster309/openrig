@@ -84,8 +84,9 @@ rig setup --providers claude
 ```
 
 Use `codex` or `both` in place of `claude` to match the coding agents you use. Add `--dry-run` first to see the plan without changing anything. Setup does four things:
-- it checks Node.js, tmux and your sign-in;
-- it installs a missing tmux (with Homebrew on macOS, if you have it) or the coding agent you chose;
+- it checks Node.js, tmux, your sign-in, and which coding agents are installed (Claude Code, Codex, Pi);
+- it installs a missing tmux (with Homebrew on macOS, if you have it); a missing coding agent is offered, not
+  installed — `rig setup --install claude` (or `codex`, or `pi`) installs the one you choose;
 - it installs Herdr, a terminal workspace app the OpenRig view can use, unless you add `--no-herdr`;
 - it adds an OpenRig block to `~/.tmux.conf` (mouse support and longer scrollback).
 
@@ -177,7 +178,7 @@ curl -fsSL https://openrig.dev/install.sh | sh
 ```
 
 It checks Node.js and npm, installs the latest `@openrig/cli`, then runs `rig setup`. It doesn't know which coding agent
-you use, so it checks and may install both. For just one, use steps 1 and 2. If a sign-in is missing, setup reports
+you use, so it checks Claude Code, Codex and Pi and installs none of them; it offers the missing ones. For just one, use steps 1 and 2. If a sign-in is missing, setup reports
 it as the step to finish: sign in, then continue at step 3.
 
 ## What these words mean

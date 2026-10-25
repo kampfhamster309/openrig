@@ -48,9 +48,9 @@ together in that home; it needs its own working sign-in and doesn't relocate `~/
 > **What OpenRig changes on your machine**
 > - **Install:** `@openrig/cli` goes in globally with npm.
 > - **Setup:** `rig setup` adds an OpenRig block to `~/.tmux.conf`. It can install tmux (with Homebrew on macOS), and
->   Herdr unless you pass `--no-herdr`. Plain `rig setup`, which is what the one-command install runs, checks both
->   Claude Code and Codex and may install a missing one; `rig setup --providers claude` (or `codex`) limits it to
->   yours.
+>   Herdr unless you pass `--no-herdr`. Plain `rig setup`, which is what the one-command install runs, checks Claude
+>   Code, Codex and Pi and offers a missing one instead of installing it; `rig setup --install claude` (or `codex`,
+>   or `pi`) installs what you choose. One of the three present is enough.
 > - **Starting OpenRig, for the coding agent you use** (paths are the usual defaults):
 >   - Codex: hooks, workspace trust and team-selected config fragments (including MCP) in the selected
 >     `CODEX_HOME/config.toml`, default `~/.codex/config.toml`. These affect other Codex sessions using that home.
@@ -197,8 +197,8 @@ curl -fsSL https://raw.githubusercontent.com/mvschwarz/openrig/v0.7.0/scripts/in
 The same command without `--dry-run`,
 `curl -fsSL https://raw.githubusercontent.com/mvschwarz/openrig/v0.7.0/scripts/install.sh | sh`, installs the
 latest published `@openrig/cli` with `npm install -g`,
-runs the Node.js and SQLite check, then `rig setup --dry-run` and `rig setup`. `rig setup` checks both Claude Code and
-Codex and may install a missing one, as described below. A failed step prints
+runs the Node.js and SQLite check, then `rig setup --dry-run` and `rig setup`. `rig setup` checks Claude Code, Codex
+and Pi and offers a missing one instead of installing it, as described below. A failed step prints
 `FAILED [n/4] <command or check> (exit <code>)`. Where a provider isn't signed in yet, step 4 ends that way and
 `rig setup` lists each sign-in under "Some steps need attention". If the only remaining failures are provider
 sign-ins, the install steps finished: sign in to each selected provider as below, then continue at
@@ -223,9 +223,12 @@ The other provider's CLI/login is optional. Herdr is installed by default unless
 you decline it; cmux remains optional. Do not copy credentials
 or start repeated sign-in attempts. Recheck the selected login after the user
 completes it. `rig setup --dry-run` previews the broader setup; applying
-`rig setup` checks **both** harnesses and installs a missing one with npm, unless
-you pass the person's choice: `rig setup --providers claude` (or `codex`) leaves
-the other out, so it reads not selected instead of failed. On
+`rig setup` checks **all three** runtimes — Claude Code, Codex and Pi — and offers a
+missing one instead of installing it. Installation needs your choice: `rig setup
+--install claude` (or `codex`, or `pi`) installs what you name, and one of the three
+present is enough to be ready. Passing the person's provider choice,
+`rig setup --providers claude` (or `codex`), leaves the other out, so it reads not
+selected instead of failed, and installs a chosen provider that is missing. On
 macOS it uses an existing Homebrew (it does not install Homebrew) to install a
 missing tmux (elsewhere tmux is checked, not installed). Herdr installs on
 macOS and Linux; pass `--no-herdr` to decline it. Setup also
@@ -940,8 +943,10 @@ same). **r** reads actual state again; **d** expands details.
 Explicit CLI daemon startup retains its automatic kernel behavior. The TUI
 starts the daemon with kernel auto-boot disabled so the user can select seats:
 
-- `rig setup` installs/verifies the runtime; it does not start the daemon or the
-  kernel.
+- `rig setup` checks and verifies the runtimes (it installs only what `--install` names); it does not start the daemon
+  or the kernel.
+- The kernel boots from Claude Code or Codex only. With just Pi installed, setup is ready and project seats run, but
+  the kernel will not start: run `rig daemon start --no-kernel`, or set `OPENRIG_NO_KERNEL=1`.
 - Starting the daemon (`rig daemon start`, or implicitly via `rig up` or `rig context add`) is what
   boots the kernel rig in the background.
 - Starting it from bare `rig` prepares no agents automatically. The TUI offers
