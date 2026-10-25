@@ -68,7 +68,10 @@ An hour before, in a plain terminal:
 1. `cd <this directory> && ./prepare.sh`
    It checks the cluster, applies the kit, lowers the stall threshold to 3 minutes, starts DEMO-A and
    DEMO-B one at a time, and waits until A is waiting for a human and B is done. It prints the next two
-   commands when it is finished. Expect a few minutes; it is starting two pods and two agents.
+   commands when it is finished. Plan on **about eight and a half minutes** — it is starting two pods and
+   two agents, and rehearsal 1 measured 8m27s. (Rehearsal 2 finished in about two minutes only because it
+   re-used the queue rows an earlier attempt had already created; that is not the timing to plan a talk
+   around.)
 2. Start the port-forward it printed: `kubectl -n $NS port-forward pod/hub-0 17433:7433 &`
 3. Start the hub TUI it printed, in the window you will present:
    `OPENRIG_HOME=$HOME/.openrig-hub-view OPENRIG_URL=http://127.0.0.1:17433 node "$CLIENT/tui/dist/main.js" --url http://127.0.0.1:17433`
@@ -161,7 +164,8 @@ per team — and with `--nodes -A` that block is a **JSON array** of the team's 
 at the `logicalId`/`sessionStatus` pair instead of reading it aloud. `usage top` is the one that prints as
 a table and labels each seat row with its `[host]`.
 
-**And this is where the stall is true.** `DEMO-A` parked its question an hour ago, it holds open work,
+**And this is where the stall is true.** `DEMO-A` has been parked on you since before the talk — comfortably
+past the 3-minute threshold, which is the only promise this step makes — it holds open work,
 and a parked row makes no queue transitions — which is exactly what the hub counts as progress. Show it
 as a number now, while it holds:
 
@@ -207,37 +211,41 @@ runs. Without it, say "the next fleet read will say 1" and move on.
 
 ## 3. Answer the team, as a human — 3 min
 
-From the TUI, on the NEEDS YOU row (PULSE, `tab pulse`):
-
-```
-answer <qitem> Use '<words> <lines>' (B)
-```
-
-A row the fleet read showed on another host is routed there, so this answers DEMO-A's row on `t-demo-a`
-from the hub. Or from the shell:
+Type this. It is the form the talk uses:
 
 ```bash
-$D answer DEMO-A "$Q_A" "Use '<words> <lines>' (B)" | jq -c '{verb: .verb, state: .state}'
+$D answer DEMO-A "$Q_A" "Use '<words> <lines>' (B)" | jq -c '{verb: .verb, qitem: .qitemId, state: .closedQitem.state}'
 ```
+
+`$D answer` resolves the row **through the hub** with no seat env, so the CLI declares the seatless human and
+the audit row names `human@host` with the hub as origin — which is the whole claim of this step. The `jq`
+keeps three fields off a payload that is otherwise several hundred lines of JSON on a projector: the verb,
+the row it acted on, and the state the answer moved it to. That state is **`in-progress`**, not `closed` —
+the answer hands the row back into the team's hands, and rehearsal 2's own archive shows exactly that
+transition (`blocked → in-progress`, actor `human@host`).
+
+Do not ask that line for the decision text. `closedQitem.resolution` is a real field, but the resolve verb
+never writes it, so it reads `null` over an answer that landed perfectly well. The audit read below is where
+the decision text and its origin host are proved.
+
+The TUI can answer the same row — PULSE prints `→ answer here: answer <qitem> <decision>` right under the
+NEEDS YOU line, and a row the fleet read showed on another host is routed there. **This rehearsal did not
+exercise that path**, and it is a different identity path: the TUI posts as itself and the hub re-stamps the
+actor from its own derived identity, so nobody has yet seen which actor it records. Say "the TUI can do this
+too" and leave it there — do not bet step 3's claim on an unexercised path.
 
 Type one of the two literal orders, with the letter that names it. The team takes the words literally:
 in the rehearsal an answer that quoted option A's order under option B's letter came back as a re-park
 saying "those conflict: A = …; B = … Which do you want?" — which is the team being right, and a wasted
-minute on stage. The `jq` is there because `answer` prints the whole queue row, which is several hundred
-lines of JSON on a projector; it keeps the verb and the state the row closed to. Do not ask that line for
-the decision text: rehearsal 2 found `answer`'s JSON has no `closedQitem` in it at all — the word appears
-nowhere in `rig-dispatch` — so `{reason: .closedQitem.resolution}` printed `null` over a resolve that had
-worked. The audit read below is where the decision text and its origin host are proved. Piping costs you
-`answer`'s exit code, which is the thing that tells you the hub path was
+minute on stage. Piping costs you `answer`'s exit code, which is the thing that tells you the hub path was
 refused — with `set -o pipefail` in your shell it still fails the line, otherwise read the output.
 
-Then show what the team now has, and who it thinks it came from:
+Then show what the team now has, and who it thinks it came from. **Type this one on a single line** — it is
+nested quoting inside a `kubectl exec`, and it is the one command on the sheet that a paste which rewraps
+lines can break:
 
 ```bash
-kubectl -n $NS exec t-demo-a-0 -c daemon -- sh -c \
-  'curl -fsS -H "Authorization: Bearer $(cat "$HOME/.openrig/terminal-token")" \
-   "http://127.0.0.1:7433/api/mission-control/audit?qitem_id='"$Q_A"'&limit=5"' |
-  jq '.rows[] | {verb: .actionVerb, reason, origin: .auditNotes.openrig_relay.from_host}'
+kubectl -n $NS exec t-demo-a-0 -c daemon -- sh -c 'curl -fsS -H "Authorization: Bearer $(cat "$HOME/.openrig/terminal-token")" "http://127.0.0.1:7433/api/mission-control/audit?qitem_id='"$Q_A"'&limit=5"' | jq '.rows[] | {verb: .actionVerb, reason, origin: .auditNotes.openrig_relay.from_host}'
 ```
 
 **Audience sees.** The answer lands, and the audit row says `resolve`, carries the decision text, and
@@ -249,7 +257,9 @@ not as some bot poking the pod.
   inside the pod, which records the lead instead of a human. Say so out loud — the fallback is the
   designed behaviour — and check the hub with `$D hub-sync --dry-run`.
 - The audit read comes back empty: the row is there but not first. Raise `limit=5` to `limit=20`.
-- The TUI's `answer` refuses: use the `$D answer` line; it does the same thing through the hub.
+- The audit read answers `curl: (3) URL using bad/illegal format or missing URL` and the shell sits at `>`:
+  the paste broke the nested quoting, not the cluster. `Ctrl-C` and type the command on one line.
+- The TUI's `answer` refuses: use the `$D answer` line above; it is the form this step is built on.
 
 ---
 
@@ -261,7 +271,9 @@ $D watch DEMO-A --timeout 300; echo "exit $?"
 
 **Audience sees.** The event stream: the queue item moving, then the status read that names the phase,
 then the verdict. Say what the codes mean: **0** done, **3** it needs a human, **1** any other failure,
-**4** out of time — so the same command works as a build step, not just as a show.
+**4** out of time — so the same command works as a build step, not just as a show. A
+`command terminated with exit code 143` printed just before `exit 0` is `watch` closing its own in-pod
+reader with SIGTERM; it is the stream being shut down cleanly, not a failure, so say that as it goes by.
 
 **If it does not appear.**
 - Nothing for a minute: the stream is quiet, which is normal and is not the end. The backstop status
