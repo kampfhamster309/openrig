@@ -11,7 +11,7 @@ seat gets one.
 | `claude-code` | OpenRig's status-line collector, provisioned into the seat's working directory | `claude_statusline_json` | `state/context-usage/<seat>.json` |
 | `codex` | Codex itself, in its own rollout log | `codex_token_count_jsonl` | the seat's Codex thread, not a sidecar |
 | `stub` | OpenRig's stub runtime, writing its own sidecar | `claude_statusline_json` | `state/context-usage/<seat>.json` |
-| `pi` | the Pi-side extension `pi-openrig-context`, installed into the seat | `pi_context_usage_json` | `state/context-usage/<seat>.json` |
+| `pi` | the optional Pi extension `pi-openrig-context`, if you add it to the seat | `pi_context_usage_json` | `state/context-usage/<seat>.json` |
 | `omp` | the same extension, **if** OMP loads Pi's extension API — unverified, see below | `pi_context_usage_json` | `state/context-usage/<seat>.json` |
 
 The label is chosen from the seat's runtime, never guessed from the file: the sidecar format is
@@ -85,23 +85,28 @@ What the reader makes of it:
 ## Giving a Pi seat its reading
 
 OpenRig reads the sidecar; it does not create it. For `runtime: pi` and `runtime: omp` the writer is
-the Pi-side extension, and OpenRig never writes into a seat's Pi agent directory
-([rig-spec.md](rig-spec.md), "Pi": OpenRig creates the seat's Pi directories and copies nothing into
-them). So the extension is installed the way Pi extensions are installed, not by OpenRig.
+the Pi extension [pi-openrig-context](https://github.com/kampfhamster309/pi-openrig-context), a
+separate repository. It is an optional customization, like a `models.json` for a local model: you add
+it to the seats where you want a reading. OpenRig does not ship it, does not install it, and never
+writes into a seat's Pi agent directory ([rig-spec.md](rig-spec.md), "Pi": OpenRig creates the seat's
+Pi directories and copies nothing into them). OpenRig does not depend on the extension's repository in
+any direction; the sidecar file is the whole interface between them.
 
 The seat's own Pi directory is `$OPENRIG_HOME/state/pi/<seat>/agent`, so its extensions directory is
 `$OPENRIG_HOME/state/pi/<seat>/agent/extensions`. A seat that loads the extension writes its own
-sidecar at session start, after each model call and after each compaction; a seat that does not
-simply has no reading, and shows `? —`.
+sidecar at session start, after each model call and after each compaction. A seat without it has no
+reading and shows `? —`.
 
 **A managed seat does not read `~/.pi/agent`.** Each one runs with
 `PI_CODING_AGENT_DIR=$OPENRIG_HOME/state/pi/<seat>/agent`, so installing into `~/.pi/agent` reaches
-only your own plain Pi sessions — never an OpenRig seat. Pi's own mechanism does reach a seat when you
+only your own plain Pi sessions, never an OpenRig seat. Pi's own mechanism does reach a seat when you
 point it at that seat's directory:
 
 ```bash
+git clone https://github.com/kampfhamster309/pi-openrig-context
+
 # one OpenRig seat, Pi's own install mechanism (preferred)
-PI_CODING_AGENT_DIR="$OPENRIG_HOME/state/pi/<seat>/agent" pi install /path/to/pi-openrig-context
+PI_CODING_AGENT_DIR="$OPENRIG_HOME/state/pi/<seat>/agent" pi install ./pi-openrig-context
 
 # the same seat, by copying the file
 install -m 0644 pi-openrig-context/extensions/openrig-context-usage.ts \
@@ -111,17 +116,17 @@ install -m 0644 pi-openrig-context/extensions/openrig-context-usage.ts \
 pi --extension ./pi-openrig-context/extensions/openrig-context-usage.ts
 ```
 
-**A team pod has no working route yet, and none is claimed here.** The kit is not part of the image: it
-is the `openrig-kit` ConfigMap, which kustomize generates from files committed under
-`deploy/kubernetes/kit` (`kustomization.yaml` lists each `pi-extensions` key, for instance
-`openrig-heartbeat.ts=kit/pi-extensions/openrig-heartbeat.ts`), and the entrypoint copies
-`$OPENRIG_KIT_DIR/pi-extensions/*.ts` from that mount. So carrying the extension to a pod means adding
-a `pi-extensions/` entry to that ConfigMap, and that needs two things which **do not exist today**:
-(a) a published location for the extension — it is currently a local repository with no remote — and
-(b) the kustomization entry pointing at a copy fetched from there. The alternative, committing a copy
-into the kit, is the second source of truth this page argues against. Which of these to take is part of
-the same operator decision as automatic provisioning below. **OpenRig does not depend on the
-extension's repository in any direction; the sidecar file is the whole interface between them.**
+**In a team pod** the extension goes the way `kit/pi/models.json` and the heartbeat extension go: the
+kit is the `openrig-kit` ConfigMap, which kustomize generates from files under `deploy/kubernetes/kit`,
+and the entrypoint copies `$OPENRIG_KIT_DIR/pi-extensions/*.ts` into each Pi seat. To add it, copy
+`extensions/openrig-context-usage.ts` into your kit's `pi-extensions/` and add a line next to the
+heartbeat's in `kustomization.yaml`:
+
+```yaml
+      - openrig-context-usage.ts=kit/pi-extensions/openrig-context-usage.ts
+```
+
+The kit in this repository does not carry a copy, so there is no second source of truth to keep in step.
 
 **OMP is unverified.** The monitor reads an `omp` seat's sidecar the same way. The runner sets
 `PI_CODING_AGENT_DIR` for omp seats too (`buildPiChildEnv` in `adapters/pi-runner-protocol.ts`), so an
@@ -129,21 +134,6 @@ omp seat is named from its agent directory like a Pi one, with `OPENRIG_SESSION_
 What is **not** established here is that OMP loads Pi extensions with the same API (`getContextUsage`,
 `turn_end`); OMP is not installed in the environment this was built and proved on. If it never does, the
 seat simply stays `unknown`, which is what the missing-sidecar rule is for.
-
-### Automatic provisioning is not built
-
-OpenRig provisions a Claude Code seat's collector for it. Doing the same for a Pi seat — writing the
-extension into each seat's Pi extensions directory at launch — would need:
-
-- a copy of the extension inside the OpenRig package, or a fetch of it at launch, and a decision
-  about which it is (a vendored copy is a second source of truth; a fetch is a network dependency at
-  seat launch and an update path);
-- an update and removal story for seats whose extension is stale or no longer wanted;
-- a change to the documented stance that OpenRig copies nothing into a seat's Pi agent directory, and
-  to the trust question that stance avoids (an extension runs inside the seat with its permissions);
-- a rule for seats the daemon did not launch (adopted and claimed seats).
-
-That is a product decision, not an implementation detail, so it is left unmade here.
 
 ## The compaction boundary
 
