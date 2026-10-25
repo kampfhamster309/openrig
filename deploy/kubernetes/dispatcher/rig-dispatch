@@ -886,15 +886,28 @@ cmd_start() {
   sts=$(sts_json "$slug")
   if [ -z "$(annotation "$sts" qitem)" ]; then
     [ -n "$brief" ] && [ -f "$brief" ] || die "--brief-file is required to hand over the ticket"
-    local rig session qitem
+    local rig session qitem qitem_out qitem_err qitem_rc
     rig=$(annotation "$sts" rig)
     session=$(lead_session "$slug" "$rig" "$lead")
     [ -n "$session" ] || die "no seat '$lead' in rig $rig (use --lead <logicalId>)"
     brief_with_contract "$slug" "$brief" | inpod_stdin "$slug" sh -c "cat > $WORK/brief.md"
-    qitem=$(inpod "$slug" rig queue create --source "dispatcher@$NS" --destination "$session" \
+    # `rig queue create` prints a request-identity note to stderr on every success: it is a request id and
+    # explicitly not a commit receipt, which is why the CLI puts it on stderr rather than in the JSON. The
+    # dispatcher already reads the real id from --json on stdout, so on stage that note is three lines of
+    # noise on every single start. Drop exactly that line and keep everything else the CLI said: a create
+    # that failed still shows its error, and one that returned no id still shows all of it.
+    qitem_out=$(mktemp) qitem_err=$(mktemp)
+    qitem_rc=0
+    inpod "$slug" rig queue create --source "dispatcher@$NS" --destination "$session" \
       --tags "ticket:$slug" --summary "$(annotation "$sts" ticket-key): $(head -n1 "$brief" | sed 's/^#* *//' | cut -c1-100)" \
-      --body-file "$WORK/brief.md" --json | jq -r '.qitemId // .qitem.qitemId // empty')
-    [ -n "$qitem" ] || die "queue create returned no qitem id"
+      --body-file "$WORK/brief.md" --json >"$qitem_out" 2>"$qitem_err" || qitem_rc=$?
+    qitem=$(jq -r '.qitemId // .qitem.qitemId // empty' "$qitem_out" 2>/dev/null)
+    grep -v '^Queue create request ID: ' "$qitem_err" >&2 || true
+    rm -f "$qitem_out" "$qitem_err"
+    if [ -z "$qitem" ]; then
+      [ "$qitem_rc" = 0 ] || die "queue create failed (exit $qitem_rc)"
+      die "queue create returned no qitem id"
+    fi
     annotate "$slug" qitem "$qitem"
     annotate "$slug" lead "$lead"
     log "handed $ticket to $session as $qitem"

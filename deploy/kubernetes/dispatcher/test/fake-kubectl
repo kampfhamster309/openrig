@@ -148,6 +148,10 @@ pod_sh() {
     *result.json*)
       # `cat ... 2>/dev/null; true` prints nothing when the file is absent, and still exits 0.
       [ "${FAKE_NO_RESULT:-0}" = 1 ] || fix result.json ;;
+    *"cat >"*)
+      # The brief write: the dispatcher pipes the file in on stdin and the pod takes it. Consume it, or
+      # the writer is left holding a pipe nobody reads and the handover never finishes.
+      cat >/dev/null ;;
     *"npm root"*) printf '/usr/lib/node_modules\n' ;;
     *) nope "pod shell: $script" ;;
   esac
@@ -340,6 +344,16 @@ serve() {
           printf '{"qitemId":"qitem-a","state":"%s","blockedOn":%s}\n' \
             "${FAKE_SHOW_STATE:-blocked}" \
             "$(if [ -n "$blocked" ]; then printf '"%s"' "$blocked"; else printf 'null'; fi)" ;;
+        "queue create")
+          # The real CLI writes a request-identity note to stderr on EVERY create, before it even asks the
+          # daemon -- so it is there on a create that then fails as well. The dispatcher reads the id from
+          # stdout; `start` must not put this in front of an audience, and must not lose a real failure.
+          printf 'Queue create request ID: qitem-20260101000000-0123456789abcdef (not proof of persistence). At the same endpoint and OPENRIG_HOME, run: rig queue show qitem-20260101000000-0123456789abcdef --full --json. If retrying, repeat the same create with --id qitem-20260101000000-0123456789abcdef.\n' >&2
+          if [ "${FAKE_QUEUE_CREATE:-ok}" = fail ]; then
+            printf '{"error":"destination_unknown","detail":"no such session for the destination"}\n' >&2
+            kfail 2
+          fi
+          printf '{"qitemId":"qitem-handed-over-1","state":"pending"}\n' ;;
         "queue resolve")
           # The hub's forwarded answer, or the team pod's own. FAKE_ANSWER picks which outcome the
           # test is exercising: ok, a routing failure only the hub can hit (it is the one passing
@@ -478,8 +492,14 @@ done
 case "${rest[0]:-}" in
   delete)
     # `kubectl delete` on the way out: succeed quietly; the test asserts on the calls it saw.
-    : ;;
-  get)
+    ;;
+  wait)
+    # `wait --for=condition=Ready pod/...`: the pod fixtures already answer Ready or not-Ready, and a
+    # test picks which with FAKE_POD_READY.
+    ;;
+  annotate)
+    # `annotate --overwrite statefulset ...`: recorded in the call log, which is what the test reads.
+    : ;;  get)
     case "${rest[1]:-}" in
       statefulset|statefulsets)
         # `status --all` and `watch --all` list the teams by label instead of naming one, which is a
@@ -529,6 +549,10 @@ case "${rest[0]:-}" in
           elif [ -n "${FAKE_STS_CREATED:-}" ]; then
             # FAKE_STS_CREATED stands in for a re-dispatched ticket: same slug, newer pod.
             fix statefulset.json | jq -c --arg c "$FAKE_STS_CREATED" '.metadata.creationTimestamp = $c'
+          elif [ "${FAKE_STS_NO_QITEM:-0}" = 1 ]; then
+            # A team that is up but has never been handed its ticket: this is the state `start` does the
+            # handover in, and the only one where `rig queue create` runs at all.
+            fix statefulset.json | jq -c 'del(.metadata.annotations["openrig.dev/qitem"])'
           else
             fix statefulset.json
           fi
