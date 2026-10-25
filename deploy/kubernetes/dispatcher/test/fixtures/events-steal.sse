@@ -1,0 +1,6 @@
+id: 1
+data: {"type":"queue.updated","qitemId":"qitem-b","fromState":"in-progress","toState":"blocked","closureReason":null,"closureTarget":null,"actorSession":"dev.build@demo","summary":"a decision is owed"}
+
+id: 2
+data: {"type":"queue.updated","qitemId":"qitem-a","fromState":"in-progress","toState":"done","closureReason":"handed_off_to","closureTarget":"dispatcher@openrig","actorSession":"dev.build@demo","summary":"build the thing"}
+

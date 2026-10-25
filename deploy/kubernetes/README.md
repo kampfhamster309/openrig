@@ -23,6 +23,7 @@ operator machine                       cluster (namespace openrig)
 | [docs/reference.md](docs/reference.md) | Every command, flag, variable, route, setting and metric. |
 | [docs/troubleshooting.md](docs/troubleshooting.md) | Symptoms, causes and fixes. |
 | [HUB-TEST.md](HUB-TEST.md) | The first test of the hub on a real cluster, with evidence (historical). |
+| [demo/RUNSHEET.md](demo/RUNSHEET.md) | The 15-minute live demo: the run sheet, the scripts that prepare and clean up the cluster, the three briefs, and the small repository the teams work on. |
 
 ## Quick start
 

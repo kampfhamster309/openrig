@@ -1,0 +1,26 @@
+version: "0.2"
+name: demo-one
+summary: >
+  One seat: a single Claude Code lead that takes the ticket, does the work itself and writes the
+  result. The point is the size, not the shape -- one seat per team is what lets several teams run
+  at once on a small cluster. Started with
+  `rig-dispatch start <ticket> --spec /etc/openrig-kit/rig-one.yaml`.
+# Nobody sits at these terminals to answer permission prompts, and the pod is the sandbox:
+# it holds no Git push credentials and only the secrets in its Secret.
+permission_policy: builtin:yolo
+non_interruptive: true
+
+# The dispatcher hands the ticket to `orch.lead`, so the one seat is the lead. It has no peers: a
+# brief for a team this size has to be worked and checked by the seat that received it, and the
+# dispatcher's completion contract is written for a team that has a reviewer to ask.
+pods:
+  - id: orch
+    label: Orchestration
+    members:
+      - id: lead
+        agent_ref: "path:/usr/local/lib/node_modules/@openrig/cli/daemon/specs/agents/orchestration/orchestrator"
+        runtime: claude-code
+        profile: default
+        cwd: /home/openrig/work/project
+    edges: []
+edges: []

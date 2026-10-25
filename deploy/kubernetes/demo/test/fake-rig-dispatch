@@ -1,0 +1,84 @@
+#!/usr/bin/env bash
+# fake-rig-dispatch -- the dispatcher as the demo scripts see it, for test/demo-scripts-test.sh.
+#
+# Same state file as ./fake-kubectl, so a test can say "DEMO-A is waiting for a human" and then watch
+# what the script does about it. It records every call, applies the state changes a real start or
+# delete would make, and fails where a real dispatcher would: `collect` fails when the pod is gone, and
+# a start without the flags the demo needs would not have produced the team the run sheet promises.
+#
+# `status --json` carries the queue row's state in `.open[]` as well as the phase, because the phase is
+# derived from the result file and the demo scripts must not depend on that: a seat that wrote
+# `needs-human` while parked has a phase of `result:needs-human` and a queue row that is `blocked`, and
+# only the row says "waiting for a human".
+: "${DEMO_FAKE_STATE:?fake-rig-dispatch: no state file}"
+: "${DEMO_FAKE_CALLS:?fake-rig-dispatch: no call log}"
+printf 'rig-dispatch %s\n' "$*" >> "$DEMO_FAKE_CALLS"
+
+# shellcheck disable=SC1090
+. "$DEMO_FAKE_STATE"
+teams=${teams:-}
+
+set_state() { # <key> <value> -- rewrite one line of the state file, or add it
+  if grep -q "^$1=" "$DEMO_FAKE_STATE"; then sed -i "s|^$1=.*|$1=$2|" "$DEMO_FAKE_STATE"
+  else printf '%s=%s\n' "$1" "$2" >> "$DEMO_FAKE_STATE"; fi
+}
+
+cmd=${1:-}; shift || true
+case "$cmd" in
+  status)
+    ticket=${1:-}
+    key="phase_$(printf '%s' "$ticket" | tr '[:lower:]-' '[:upper:]_')"
+    phase=$(sed -n "s/^$key=//p" "$DEMO_FAKE_STATE" | tail -n1)
+    [ -n "$phase" ] || phase=absent
+    # The queue row, separately from the phase. `none` means the team holds no open item at all.
+    okey="open_$(printf '%s' "$ticket" | tr '[:lower:]-' '[:upper:]_')"
+    ostate=$(sed -n "s/^$okey=//p" "$DEMO_FAKE_STATE" | tail -n1)
+    if [ -z "$ostate" ] || [ "$ostate" = none ]; then open='[]'
+    else open="[{\"qitemId\":\"qitem-$ticket\",\"state\":\"$ostate\",\"destination\":\"orch.lead@$(printf '%s' "$ticket" | tr '[:upper:]' '[:lower:]')\"}]"; fi
+    # The seats, because a repair has to be addressed to a running one. A team that closed its row and
+    # stopped still has a running seat at an idle prompt -- that is the state the rehearsal measured.
+    skey="seats_$(printf '%s' "$ticket" | tr '[:lower:]-' '[:upper:]_')"
+    seats=$(sed -n "s/^$skey=//p" "$DEMO_FAKE_STATE" | tail -n1)
+    [ -n "$seats" ] || seats='[{"session":"orch-lead@demo-one","status":"running"}]'
+    printf '[{"slug":"%s","phase":"%s","open":%s,"seats":%s}]\n' \
+      "$(printf '%s' "$ticket" | tr '[:upper:]' '[:lower:]')" "$phase" "$open" "$seats"
+    ;;
+  start)
+    ticket=${1:-}
+    brief=""
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --brief-file) brief=${2:-}; shift 2 ;;
+        *) shift ;;
+      esac
+    done
+    [ -f "$brief" ] || { printf 'fake-rig-dispatch: start %s had no readable --brief-file (%s)\n' "$ticket" "$brief" >&2; exit 1; }
+    slug=$(printf '%s' "$ticket" | tr '[:upper:]' '[:lower:]')
+    case " $teams " in *" t-$slug "*) : ;; *) teams="$teams t-$slug" ;; esac
+    set_state teams "\"$teams\""
+    ;;
+  collect)
+    [ "${collect_fails:-0}" = 1 ] && { echo "fake-rig-dispatch: the team pod is not reachable" >&2; exit 1; }
+    exit 0 ;;
+  delete)
+    if [ "${FAKE_DELETE_NOOP:-0}" = 1 ]; then echo "fake-rig-dispatch: delete refused" >&2; exit 1; fi
+    slug=$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')
+    out=""
+    for t in $teams; do [ "$t" = "t-$slug" ] || out="$out $t"; done
+    set_state teams "\"${out# }\""
+    # A real `delete` clears the Secret and the volumes too, and it does it whether or not the
+    # StatefulSet was still there -- which is exactly the residue path cleanup depends on.
+    out=""
+    for s in ${secrets:-}; do [ "$s" = "t-$slug" ] || out="$out $s"; done
+    set_state secrets "\"${out# }\""
+    out=""
+    for p in ${pvcs:-}; do case "$p" in *"-t-$slug-"*) : ;; *) out="$out $p" ;; esac; done
+    set_state pvcs "\"${out# }\""
+    ;;
+  hub-sync)
+    [ "${FAKE_HUBSYNC_NOOP:-0}" = 1 ] && exit 0
+    set_state hosts 0; set_state bearers 0; set_state bindings 0; set_state subs 0
+    ;;
+  report|answer|watch|wait|archive) exit 0 ;;
+  *) printf 'fake-rig-dispatch: unhandled: %s\n' "$cmd" >&2; exit 1 ;;
+esac
