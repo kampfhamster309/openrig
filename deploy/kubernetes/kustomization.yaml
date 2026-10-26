@@ -13,7 +13,7 @@ resources:
 images:
   - name: openrig-host
     newName: ghcr.io/kampfhamster309/openrig-host
-    newTag: 0.7.1-f1b1a20c2
+    newTag: 0.7.2-b8eca34c8
 configMapGenerator:
   # Flat keys; the pods' volume items lay them out as /etc/openrig-kit/<path>.
   - name: openrig-kit
