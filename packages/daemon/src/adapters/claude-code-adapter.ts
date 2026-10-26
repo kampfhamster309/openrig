@@ -1,5 +1,6 @@
 import { withManagedRestoreReads, type RestoreReadPolicy } from "../domain/managed-restore-read-access.js";
 import { operationalLaunchArgs } from "./kernel-authority.js";
+import { claudeSeatTokenFallbackNotice } from "../domain/claude-seat-token.js";
 import nodePath from "node:path";
 import fs from "node:fs";
 import { createHash, randomUUID } from "node:crypto";
@@ -16,7 +17,7 @@ import type { ProjectionPlan, ProjectionEntry } from "../domain/projection-plann
 import { assessNativeResumeProbe } from "../domain/native-resume-probe.js";
 import { resumeProbeEvidence } from "../domain/native-resume-probe-evidence.js";
 import { resolveReadinessTimeoutMs } from "../domain/readiness-timeout.js";
-import { subtreeNamesClaudeExecutable, claudeCommandSessionToken, listNativeProcesses, observeClaudeDelivery, observeClaudePaneProcess, observeClaudePaneRuntime, observeCodexPaneProcess, verifyClaudePaneProcess, verifyCodexPaneProcess, verifyPaneIdleShell, witnessedClaudeVersionLabel, type ClaudeLaunchedProcess, type NativeProcessLister, type VersionLabelWitnessWait } from "../domain/native-process-lineage.js";
+import { subtreeNamesClaudeExecutable, claudeCommandSessionToken, listNativeProcesses, observeClaudeDelivery, observeClaudePaneProcess, observeClaudePaneRuntime, observeCodexPaneProcess, verifyClaudePaneProcess, verifyCodexPaneProcess, verifyPaneIdleShell, type ClaudeLaunchedProcess, type NativeProcessLister } from "../domain/native-process-lineage.js";
 import { isPerSeatRoleGuidance, mergeManagedBlock, perSeatRoleSkipWarning, DEFAULT_CLAUDE_MANAGED_BLOCK_FILE, type ClaudeManagedBlockFile } from "../domain/managed-blocks.js";
 import { claudeResumeLaunchEnv, claudeResumeLaunchPrefix } from "./claude-resume-launch.js";
 import { shellQuote } from "./shell-quote.js";
@@ -65,7 +66,6 @@ export class ClaudeCodeAdapter implements RuntimeAdapter {
   private nodeExecutable: string;
   private autoDriveProviderPrompts: boolean;
   private listProcesses?: NativeProcessLister;
-  private resolvePermissionMode?: (nodeId: string) => string | undefined;
   private readinessTimeoutMs?: number;
   private autoLaunches = new Map<string, { binding: NodeBinding; token: string; freshInPlace?: boolean; executable?: string; scriptLaunch?: boolean; fingerprint?: string; process?: ClaudeLaunchedProcess }>();
   readonly claudeManagedLaunch?: ClaudeManagedLaunch;
@@ -89,9 +89,6 @@ export class ClaudeCodeAdapter implements RuntimeAdapter {
     nodeExecutable?: string;
     autoDriveProviderPrompts?: boolean;
     listProcesses?: NativeProcessLister;
-    /** #86 — the seat's persisted managed permission mode (NativePermissionStore.resolve), undefined when
-     *  unmanaged; throws when it can't be read. Absent → every seat counts as managed for the version-label witness. */
-    resolvePermissionMode?: (nodeId: string) => string | undefined;
     /** Bound on a slow resume's wait, from the launch (default: runtime.readiness_timeout_seconds). */
     readinessTimeoutMs?: number;
     claudeManagedLaunch?: ClaudeManagedLaunch;
@@ -115,7 +112,6 @@ export class ClaudeCodeAdapter implements RuntimeAdapter {
     this.nodeExecutable = deps.nodeExecutable ?? process.execPath;
     this.autoDriveProviderPrompts = deps.autoDriveProviderPrompts ?? false;
     this.listProcesses = deps.listProcesses;
-    this.resolvePermissionMode = deps.resolvePermissionMode;
     this.readinessTimeoutMs = deps.readinessTimeoutMs;
     this.claudeManagedLaunch = deps.claudeManagedLaunch;
     this.activityRelayPath = deps.activityRelayPath ?? null;
@@ -286,6 +282,24 @@ export class ClaudeCodeAdapter implements RuntimeAdapter {
             pane: binding.runtimeSwitchFrom.pane, generation: binding.runtimeSwitchFrom.generation } } : {}) }, binding.permissionMode);
       } catch (error) { return { ok: false, error: (error as Error).message }; }
     }
+    // A seat's own subscription token: the managed launch carries it; the classic launch gets its step in the staged
+    // subshell. A launch that can't apply it still starts, and says so.
+    const seatToken = managed ? null : this.claudeManagedLaunch?.seatTokenLaunch?.(binding.nodeId) ?? null;
+    const tokenWarnings: string[] = [...(managed?.warnings ?? seatToken?.warnings ?? [])];
+    const session = binding.tmuxSession;
+    const sendClassic = async (cmd: string) => {
+      if (!this.seatLaunchEnvironment) {
+        if (seatToken) tokenWarnings.push(this.claudeManagedLaunch?.tokenNotApplied?.(binding.nodeId, seatToken.ref, "this launch path can't run the token step") ?? claudeSeatTokenFallbackNotice(seatToken.ref, "this launch path can't run the token step"));
+        return this.tmux.sendText(session, cmd);
+      }
+      const staged = await this.seatLaunchEnvironment.command(session, cmd, { nodeId: binding.nodeId, generation: binding.launchGeneration,
+        runtime: this.runtime, ...(seatToken ? { claudeTokenStep: seatToken.step } : {}) });
+      if (seatToken && !staged.includes(seatToken.step)) {
+        tokenWarnings.push(this.claudeManagedLaunch?.tokenNotApplied?.(binding.nodeId, seatToken.ref, "the seat's pane shell can't run the token step") ?? claudeSeatTokenFallbackNotice(seatToken.ref, "the seat's pane shell can't run the token step"));
+      }
+      return this.tmux.sendShellCommand(session, staged, undefined, { sourceInPane: true });
+    };
+    const launchNotes = () => (tokenWarnings.length ? { warnings: [...tokenWarnings] } : {});
     const posture = claudePostureFlag(process.env, binding.launchPosture, binding.permissionMode);
     const appliedLaunch = observeClaudePermission(posture);
     const permissionArgs = (nativeSessionId: string) => withManagedRestoreReads(operationalLaunchArgs(this.runtime, binding), {
@@ -337,9 +351,7 @@ export class ClaudeCodeAdapter implements RuntimeAdapter {
         // the codex fork path) — a hostile id must not leave --resume.
         : `${rendererPrefix}claude ${permissionMode}${modelArg}${effortArg}${advisorArg}${additionArg} --resume ${shellQuote(parentId)} --fork-session --session-id ${forkSessionId} --name ${opts.name}`;
       const textResult = managed ? await this.tmux.sendShellCommand(binding.tmuxSession, cmd, managed.assertCurrent)
-        : this.seatLaunchEnvironment
-          ? await this.tmux.sendShellCommand(binding.tmuxSession, await this.seatLaunchEnvironment.command(binding.tmuxSession, cmd, { nodeId: binding.nodeId, generation: binding.launchGeneration, runtime: this.runtime }), undefined, { sourceInPane: true })
-          : await this.tmux.sendText(binding.tmuxSession, cmd);
+        : await sendClassic(cmd);
       if (!textResult.ok) {
         return { ok: false, error: `Failed to send launch command: ${textResult.message}` };
       }
@@ -349,7 +361,7 @@ export class ClaudeCodeAdapter implements RuntimeAdapter {
       }
       // As with a fresh launch, nothing is read back from Claude's session files: a same-name
       // file can belong to an earlier occupant or another seat sharing the config directory.
-      return { ok: true, resumeToken: forkSessionId, resumeType: "claude_id", appliedLaunch };
+      return { ok: true, resumeToken: forkSessionId, resumeType: "claude_id", appliedLaunch, ...launchNotes() };
     }
 
     const generatedSessionId = opts.resumeToken ? null : this.sessionIdFactory();
@@ -362,9 +374,7 @@ export class ClaudeCodeAdapter implements RuntimeAdapter {
       : `${rendererPrefix}claude ${permissionMode}${modelArg}${effortArg}${advisorArg}${additionArg} --session-id ${generatedSessionId} --name ${opts.name}`;
 
     const textResult = managed ? await this.tmux.sendShellCommand(binding.tmuxSession, cmd, managed.assertCurrent)
-      : this.seatLaunchEnvironment
-          ? await this.tmux.sendShellCommand(binding.tmuxSession, await this.seatLaunchEnvironment.command(binding.tmuxSession, cmd, { nodeId: binding.nodeId, generation: binding.launchGeneration, runtime: this.runtime }), undefined, { sourceInPane: true })
-          : await this.tmux.sendText(binding.tmuxSession, cmd);
+      : await sendClassic(cmd);
     if (!textResult.ok) {
       return { ok: false, error: `Failed to send launch command: ${textResult.message}` };
     }
@@ -384,12 +394,12 @@ export class ClaudeCodeAdapter implements RuntimeAdapter {
       // The process readiness pinned first, if it observed one: the caller records it, not a later read.
       const launchedProcess = launch.process ? { launchedProcess: { ...launch.process } } : {};
       if (!verification.ok) return { ...verification, ...launchedProcess };
-      return { ok: true, resumeToken: opts.resumeToken, resumeType: "claude_id", appliedLaunch, ...launchedProcess };
+      return { ok: true, resumeToken: opts.resumeToken, resumeType: "claude_id", appliedLaunch, ...launchedProcess, ...launchNotes() };
     }
 
     // Fresh launches already have an explicit --session-id. A same-name file
     // can belong to another seat sharing the Claude config directory.
-    return { ok: true, resumeToken: generatedSessionId!, resumeType: "claude_id", appliedLaunch };
+    return { ok: true, resumeToken: generatedSessionId!, resumeType: "claude_id", appliedLaunch, ...launchNotes() };
   }
 
   async checkReady(binding: NodeBinding, options?: ReadinessOptions): Promise<ReadinessResult> {
@@ -434,13 +444,6 @@ export class ClaudeCodeAdapter implements RuntimeAdapter {
 
   // -- Private helpers --
 
-  /** #86: only a launch binding carries permissionMode, so the seat's persisted selection decides for every other
-   *  caller. Unmanaged needs both to say so; a missing or unreadable selection counts as managed. */
-  private isUnmanaged(binding: NodeBinding): boolean {
-    if (binding.permissionMode !== undefined || !this.resolvePermissionMode) return false;
-    try { return this.resolvePermissionMode(binding.nodeId) === undefined; } catch { return false; }
-  }
-
   /** A fresh in-place launch keeps the retiree's scrollback. Qualify a history-based ready result
    * with the current frame, only for the exact launch that requested it. Unavailable observations
    * retain the old admission (including its ambiguity); visible gates and conflicting identity do not. */
@@ -479,16 +482,9 @@ export class ClaudeCodeAdapter implements RuntimeAdapter {
     return withIdentity.status === "resumed" && occupant !== "absent" ? historyProbe : current;
   }
 
-  private async assessManagedProbe(binding: NodeBinding, paneCommand: string | null, paneContent: string, options?: ReadinessOptions, witnessWait?: VersionLabelWitnessWait) {
+  private async assessManagedProbe(binding: NodeBinding, paneCommand: string | null, paneContent: string, options?: ReadinessOptions) {
     const input = { runtime: "claude-code", paneCommand, paneContent };
     const probe = assessNativeResumeProbe(input);
-    // #86: an unmanaged native install's version label reads as `claude` once its OS executable is witnessed. The
-    // witness runs only when the label would change the result; a managed seat keeps its exact proof below.
-    const asClaude = assessNativeResumeProbe({ ...input, paneCommand: "claude" });
-    if (probe.status !== "resumed" && asClaude.status === "resumed" && this.isUnmanaged(binding) && binding.tmuxSession
-      && await witnessedClaudeVersionLabel(paneCommand, { target: binding.tmuxSession, tmux: this.tmux, listProcesses: this.listProcesses }, witnessWait)) {
-      return asClaude;
-    }
     // Headerless managed launches (including bypass mode) use the same readiness
     // precedence as resume. This candidate result is returned only after the
     // exact launch identity below is proved; screen text alone is insufficient.
@@ -608,13 +604,11 @@ export class ClaudeCodeAdapter implements RuntimeAdapter {
     const checkEvery = 5;
     let attempts = windowAttempts;
     let slowStart = false;
-    // #86: one record per wait; after an actual path-read timeout the rest of this wait skips the witness.
-    const witnessWait: VersionLabelWitnessWait = { pathReadTimedOut: false };
 
     for (let attempt = 0; attempt < attempts; attempt++) {
       const paneCommand = await this.tmux.getPaneCommand(tmuxSession);
       const paneContent = (await this.tmux.capturePaneContent(tmuxSession, 40)) ?? "";
-      const probe = await this.assessManagedProbe(binding, paneCommand, paneContent, undefined, witnessWait);
+      const probe = await this.assessManagedProbe(binding, paneCommand, paneContent);
 
       if (probe.code === "no_conversation_found") {
         return {
@@ -701,7 +695,7 @@ export class ClaudeCodeAdapter implements RuntimeAdapter {
 
     const finalCommand = await this.tmux.getPaneCommand(tmuxSession);
     const finalContent = (await this.tmux.capturePaneContent(tmuxSession, 40)) ?? "";
-    const finalProbe = await this.assessManagedProbe(binding, finalCommand, finalContent, undefined, witnessWait);
+    const finalProbe = await this.assessManagedProbe(binding, finalCommand, finalContent);
 
     if (finalProbe.status === "resumed") {
       return { ok: true };
