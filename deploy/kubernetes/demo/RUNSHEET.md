@@ -32,7 +32,7 @@ yours is the **TUI** you start in step 2, and it talks to the hub's routes: a cl
 automatically the hub's build — in rehearsal 1 `@openrig/cli@0.7.0` on npm was a different commit from the
 image, and it had no `usage top --all-hosts` at all.
 
-Build it from the commit the hub image tag names (the tag is `0.7.1-<sha>`), in a scratch worktree:
+Build it from the commit the hub image tag names (the tag is `0.7.2-<sha>`), in a scratch worktree:
 
 ```bash
 git -C <an openrig checkout> worktree add --detach "$HOME/tmp/openrig-hub-build" <the sha the tag names>
